@@ -1,7 +1,15 @@
 // Package orchestrator runs the aidev agent pipeline as an explicit state
-// machine. v0.1 only models three real states (scouting, critiquing, done)
-// plus the terminal error/killed states; later milestones add architect,
-// implementer, tester, and reviewer transitions.
+// machine. v0.1 shipped three real states (scouting, critiquing, await_user)
+// plus terminal error/killed states.
+//
+// v0.2a extends the machine with:
+//
+//   - StateArchitecting — the Architect is producing sketches
+//   - StateSketchesReady — sketches are ready for the developer to review
+//
+// The machine is still linear: every run goes scout -> critic -> await_user,
+// and a subsequent Continue() call transitions await_user -> architecting ->
+// sketches_ready. Killed and errored runs terminate from any state.
 //
 // The orchestrator never talks to LLMs directly — it owns a Router and hands
 // the right Provider to each agent via the agents package. This keeps
@@ -20,18 +28,20 @@ import (
 	"github.com/aisu-ai/aidev/internal/repo"
 )
 
-// State is the orchestrator's finite state. Every Step() call moves from
-// one State to the next or returns an error.
+// State is the orchestrator's finite state. Every transition moves from one
+// State to the next or pushes an Event with an error.
 type State string
 
 const (
-	StateInit       State = "init"
-	StateScouting   State = "scouting"
-	StateCritiquing State = "critiquing"
-	StateAwaitUser  State = "await_user"
-	StateDone       State = "done"
-	StateKilled     State = "killed"
-	StateError      State = "error"
+	StateInit           State = "init"
+	StateScouting       State = "scouting"
+	StateCritiquing     State = "critiquing"
+	StateAwaitUser      State = "await_user"
+	StateArchitecting   State = "architecting"
+	StateSketchesReady  State = "sketches_ready"
+	StateDone           State = "done"
+	StateKilled         State = "killed"
+	StateError          State = "error"
 )
 
 // Event names every externally observable thing the orchestrator does. The
@@ -43,27 +53,60 @@ type Event struct {
 	Err     error
 }
 
-// Orchestrator owns the pipeline state for a single issue.
+// Orchestrator owns the pipeline state for a single issue. Its zero value is
+// NOT usable — construct via New().
 type Orchestrator struct {
 	cfg    *config.Config
 	router *llm.Router
 	gh     *github.Client
 
-	state   State
-	ctx     *agents.Context
-	critic  *agents.Critic
-	scout   *agents.Scout
-	critRpt *agents.Report
+	state     State
+	ctx       *agents.Context
+	scout     *agents.Scout
+	critic    *agents.Critic
+	architect *agents.Architect
+	critRpt   *agents.Report
+
+	// sketchCount is the N the Architect uses when it runs. It is set by
+	// New via the sketchCount config field and may be overridden at runtime
+	// via SetSketchCount before Continue() is called.
+	sketchCount int
+}
+
+// Option configures the orchestrator at construction time.
+type Option func(*Orchestrator)
+
+// WithSketchCount sets the number of sketches the Architect should produce.
+// n <= 0 falls back to agents.DefaultSketchCount.
+func WithSketchCount(n int) Option {
+	return func(o *Orchestrator) {
+		if n <= 0 {
+			n = agents.DefaultSketchCount
+		}
+		o.sketchCount = n
+	}
 }
 
 // New builds an Orchestrator from loaded config. It constructs the Router
-// and the Scout/Critic agents up front so that any misconfiguration surfaces
-// before the TUI starts rendering.
-func New(cfg *config.Config) (*Orchestrator, error) {
+// and every agent up front so that any misconfiguration surfaces before the
+// TUI starts rendering.
+func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	router, err := llm.NewRouter(cfg)
 	if err != nil {
 		return nil, err
 	}
+	o := &Orchestrator{
+		cfg:         cfg,
+		router:      router,
+		gh:          github.NewClient(),
+		state:       StateInit,
+		ctx:         &agents.Context{},
+		sketchCount: agents.DefaultSketchCount,
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	scout, err := agents.NewScout(router)
 	if err != nil {
 		return nil, err
@@ -72,15 +115,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Orchestrator{
-		cfg:    cfg,
-		router: router,
-		gh:     github.NewClient(),
-		state:  StateInit,
-		scout:  scout,
-		critic: critic,
-		ctx:    &agents.Context{},
-	}, nil
+	architect, err := agents.NewArchitect(router, o.sketchCount)
+	if err != nil {
+		return nil, err
+	}
+	o.scout = scout
+	o.critic = critic
+	o.architect = architect
+	return o, nil
 }
 
 // Router exposes the router so the TUI can display provider health.
@@ -89,15 +131,25 @@ func (o *Orchestrator) Router() *llm.Router { return o.router }
 // State returns the current state.
 func (o *Orchestrator) State() State { return o.state }
 
-// AgentContext returns the current shared agent context (may contain zero
-// values if pipeline has not progressed).
+// AgentContext returns the current shared agent context. May contain zero
+// values if the pipeline has not progressed through the relevant phase.
 func (o *Orchestrator) AgentContext() *agents.Context { return o.ctx }
 
 // CriticReport returns the last Critic report, if any.
 func (o *Orchestrator) CriticReport() *agents.Report { return o.critRpt }
 
+// SketchCount returns the N the Architect will use when Continue() is called.
+func (o *Orchestrator) SketchCount() int { return o.sketchCount }
+
+// CostPreview returns the Architect's pre-flight cost estimate for the
+// currently configured sketch count. The TUI uses this to render "N sketches,
+// ~X tokens, ~Y seconds" before the user approves.
+func (o *Orchestrator) CostPreview() agents.CostEstimate {
+	return agents.EstimateCost(o.sketchCount)
+}
+
 // LoadIssue pulls the issue identified by URL and seeds the agent context
-// with it. Must be called before Scout.
+// with it. Must be called before Run.
 func (o *Orchestrator) LoadIssue(ctx context.Context, url string) error {
 	owner, repoName, num, err := github.ParseURL(url)
 	if err != nil {
@@ -149,10 +201,10 @@ func (o *Orchestrator) LoadRepo(root string) error {
 	return nil
 }
 
-// Run executes the v0.1 pipeline: scout -> critic -> await user. It emits
-// one Event per state transition on the returned channel and closes the
-// channel when the pipeline terminates (either at await_user, done, killed,
-// or error).
+// Run executes the first pass of the pipeline: scout -> critic -> await user.
+// It emits one Event per state transition on the returned channel and closes
+// the channel when the first pass terminates (at await_user, killed, or
+// error). Call Continue() to drive the second pass (architect -> sketches).
 func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 	out := make(chan Event, 8)
 	go func() {
@@ -189,9 +241,64 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 		}
 		o.critRpt = rpt
 
-		// v0.1 terminates here and awaits the human's verdict.
+		// First pass terminates here and awaits the human's verdict.
 		o.state = StateAwaitUser
 		out <- Event{State: o.state, Message: "Critic recommends: " + rpt.Recommendation}
 	}()
 	return out
+}
+
+// Continue runs the Architect stage. Must be called after Run() has
+// transitioned to StateAwaitUser; the TUI typically calls it when the user
+// presses the approve key. The returned channel emits architecting events
+// and closes when sketches are ready (or the run errors).
+//
+// Calling Continue from any state other than StateAwaitUser returns a
+// channel that immediately emits an error event and closes.
+func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
+	out := make(chan Event, 4)
+	go func() {
+		defer close(out)
+
+		if o.state != StateAwaitUser {
+			o.state = StateError
+			out <- Event{
+				State: o.state,
+				Err: fmt.Errorf("orchestrator: Continue called from state %q, expected await_user", o.state),
+			}
+			return
+		}
+
+		o.state = StateArchitecting
+		preview := agents.EstimateCost(o.sketchCount)
+		out <- Event{
+			State: o.state,
+			Message: fmt.Sprintf("Architect generating %d sketches (~%d tokens, ~%ds)...",
+				preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds),
+		}
+
+		sketches, err := o.architect.Run(ctx, o.ctx)
+		if err != nil {
+			o.state = StateError
+			out <- Event{State: o.state, Err: err}
+			return
+		}
+		o.ctx.Sketches = sketches
+
+		o.state = StateSketchesReady
+		out <- Event{
+			State: o.state,
+			Message: fmt.Sprintf("Architect produced %d sketches. Review them and pick one.", len(sketches)),
+		}
+	}()
+	return out
+}
+
+// Kill transitions the orchestrator to StateKilled. It is safe to call from
+// any non-terminal state and idempotent once terminal.
+func (o *Orchestrator) Kill() {
+	if o.state == StateDone || o.state == StateKilled || o.state == StateError {
+		return
+	}
+	o.state = StateKilled
 }

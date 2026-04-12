@@ -2,11 +2,13 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 )
 
@@ -43,28 +45,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Tab):
 			m.focus = (m.focus + 1) % numPanes
 		case key.Matches(msg, m.keys.Run):
-			if m.events == nil {
+			if m.phase == phaseIdle {
 				m.status = "Running Scout..."
 				cmd = m.runPipelineCmd()
 				return m, cmd
 			}
 		case key.Matches(msg, m.keys.Approve):
-			if m.pipelineDone {
-				m.status = "Approved: the Architect agent will take over in the next milestone."
+			if m.phase == phaseAwaitUser {
+				m.status = "Starting Architect..."
+				cmd = m.continuePipelineCmd()
+				return m, cmd
+			}
+			if m.phase == phaseSketches {
+				m.status = "Sketch acceptance is a v0.3 feature (Implementer not yet wired). Pick one manually for now."
 			}
 		case key.Matches(msg, m.keys.Kill):
-			if m.pipelineDone {
+			if m.phase == phaseAwaitUser || m.phase == phaseSketches {
+				m.orch.Kill()
+				m.phase = phaseKilled
 				m.status = "Killed. No implementation will proceed."
+				m.events = nil
 			}
 		}
 
 	case eventMsg:
 		m.applyEvent(msg.ev)
-		cmd = waitForEvent(m.events)
+		if m.events != nil {
+			cmd = waitForEvent(m.events)
+		}
 		return m, cmd
 
 	case eventsClosedMsg:
-		m.pipelineDone = true
 		m.events = nil
 	}
 
@@ -105,27 +116,67 @@ func (m *Model) applyEvent(ev orchestrator.Event) {
 	if ev.Err != nil {
 		m.lastErr = ev.Err
 		m.status = "Error: " + ev.Err.Error()
+		m.phase = phaseErrored
 		return
 	}
 	switch ev.State {
 	case orchestrator.StateScouting:
+		m.phase = phaseRunning
 		m.status = ev.Message
 	case orchestrator.StateCritiquing:
 		ctx := m.orch.AgentContext()
 		if ctx.ScoutReport != "" {
 			m.scoutVP.SetContent(ctx.ScoutReport)
 		}
+		m.phase = phaseRunning
 		m.status = ev.Message
 	case orchestrator.StateAwaitUser:
 		if rpt := m.orch.CriticReport(); rpt != nil {
 			m.criticVP.SetContent(rpt.Markdown)
 		}
-		m.status = ev.Message + "  —  press 'a' to approve, 'k' to kill."
-		m.pipelineDone = true
+		m.phase = phaseAwaitUser
+		preview := m.orch.CostPreview()
+		m.status = fmt.Sprintf("%s  —  press 'a' to approve (Architect: %d sketches, ~%d tokens, ~%ds), 'k' to kill.",
+			ev.Message, preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds)
+	case orchestrator.StateArchitecting:
+		m.phase = phaseArchitect
+		m.status = ev.Message
+	case orchestrator.StateSketchesReady:
+		m.showingSketches = true
+		m.phase = phaseSketches
+		m.criticVP.SetContent(renderSketches(m.orch.AgentContext().Sketches))
+		m.status = ev.Message + "  —  'k' to kill, 'q' to quit."
 	case orchestrator.StateError:
 		if ev.Err != nil {
 			m.lastErr = ev.Err
 			m.status = "Error: " + ev.Err.Error()
 		}
+		m.phase = phaseErrored
 	}
+}
+
+// renderSketches concatenates the Architect's sketches into one scrollable
+// Markdown document for the pane to display. We keep it unopinionated about
+// layout: the sketch headings are already "## Sketch N: Title" which
+// renders as section breaks.
+func renderSketches(sketches []agents.Sketch) string {
+	if len(sketches) == 0 {
+		return "Architect produced no sketches."
+	}
+	var b strings.Builder
+	for i, s := range sketches {
+		if i > 0 {
+			b.WriteString("\n\n---\n\n")
+		}
+		b.WriteString(s.Markdown)
+	}
+	return b.String()
+}
+
+// formatIdleStatus produces the initial status line shown before the user
+// presses 'r'. It exposes the cost preview up front so the user knows what
+// the default Architect run would cost if the pipeline ends up running it.
+func formatIdleStatus(n, tokens, seconds int) string {
+	return fmt.Sprintf("Press 'r' to run Scout + Critic.  (If approved, Architect will produce %d sketches: ~%d tokens, ~%ds)",
+		n, tokens, seconds)
 }

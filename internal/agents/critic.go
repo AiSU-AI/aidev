@@ -96,10 +96,14 @@ and say what evidence would move you.`
 		return nil, fmt.Errorf("critic: %w", err)
 	}
 
-	return &Report{
+	rpt := &Report{
 		Markdown:       resp.Content,
 		Recommendation: extractRecommendation(resp.Content),
-	}, nil
+	}
+	// Stash the Markdown on the shared Context so downstream agents
+	// (Architect) can quote it without reaching into the orchestrator.
+	cc.CriticReport = rpt.Markdown
+	return rpt, nil
 }
 
 // extractRecommendation returns the one-word verdict from the tail of the
