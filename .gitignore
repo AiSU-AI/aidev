@@ -1,0 +1,7 @@
+/bin/
+/dist/
+/aidev
+*.log
+.env
+.env.local
+.aidev-cache/

@@ -1,0 +1,40 @@
+# Model tier configuration for aidev.
+#
+# aidev routes each agent role to a model tier. Small/fast tiers run locally
+# via Ollama; large/deep tiers call a cloud provider (Claude).
+#
+# Override with environment variables:
+#   AIDEV_OLLAMA_URL   - override ollama endpoint (default http://localhost:11434)
+#   ANTHROPIC_API_KEY  - required for the large tier
+
+tiers:
+  small:
+    provider: ollama
+    model: qwen2.5-coder:7b
+    endpoint: http://localhost:11434
+    max_tokens: 2048
+    temperature: 0.2
+
+  medium:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    endpoint: http://localhost:11434
+    max_tokens: 4096
+    temperature: 0.2
+
+  large:
+    provider: anthropic
+    model: claude-opus-4-6
+    max_tokens: 8192
+    temperature: 0.3
+
+# Role -> tier routing. Roles that need deep reasoning (critic, architect)
+# use the large tier. Roles that summarize or extract facts (scout) can use
+# the small local tier for speed and cost.
+routing:
+  scout: small
+  critic: large
+  architect: large
+  implementer: medium
+  reviewer: medium
+  tester: small
