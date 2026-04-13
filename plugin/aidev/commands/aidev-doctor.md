@@ -1,5 +1,6 @@
 ---
 description: Run the aidev precondition audit
+allowed-tools: Bash(aidev:*)
 ---
 
 Run aidev's environment doctor and summarise the result for the user.
