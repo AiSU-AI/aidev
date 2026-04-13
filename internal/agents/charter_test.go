@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"path/filepath"
@@ -229,5 +230,53 @@ func toString(v interface{}) string {
 		return x.Error()
 	default:
 		return ""
+	}
+}
+
+// lineReadingInterviewer is a minimal Interviewer that reads from an
+// arbitrary io.Reader (not os.Stdin), so we can unit-test multi-word
+// answer handling without needing a real TTY. It mirrors the
+// line-reading logic in StdinInterviewer but skips the TTY check.
+type lineReadingInterviewer struct {
+	reader *bufio.Reader
+}
+
+func (l *lineReadingInterviewer) Ask(prompt string) (string, error) {
+	line, err := l.reader.ReadString('\n')
+	if err != nil && err.Error() != "EOF" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// TestInterviewerReadsWholeMultiWordLines is the regression test for
+// the Fscanln bug — StdinInterviewer used to read only the first
+// whitespace-delimited token of a multi-word answer, pushing the rest
+// of the sentence into the next question. The fix is to read a whole
+// line via bufio.Reader. This test drives the fixed implementation
+// with a canned multi-question transcript.
+func TestInterviewerReadsWholeMultiWordLines(t *testing.T) {
+	transcript := "AiSU is a data governance and access tool\n" +
+		"Business executives and professionals\n" +
+		"correctness\n" +
+		"web UI, any public-facing consumer product\n" +
+		"\n"
+	interviewer := &lineReadingInterviewer{reader: bufio.NewReader(strings.NewReader(transcript))}
+	c := &Charter{Interviewer: interviewer}
+	answers, err := c.askAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"purpose":      "AiSU is a data governance and access tool",
+		"users":        "Business executives and professionals",
+		"constraint":   "correctness",
+		"out_of_scope": "web UI, any public-facing consumer product",
+		"overrides":    "",
+	}
+	for k, v := range want {
+		if answers[k] != v {
+			t.Errorf("answer[%q] = %q, want %q", k, answers[k], v)
+		}
 	}
 }

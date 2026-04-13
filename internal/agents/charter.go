@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -45,7 +46,7 @@ func NewCharter(router *llm.Router, inter Interviewer) (*Charter, error) {
 		return nil, err
 	}
 	if inter == nil {
-		inter = StdinInterviewer{}
+		inter = &StdinInterviewer{}
 	}
 	return &Charter{Provider: p, Interviewer: inter}, nil
 }
@@ -216,34 +217,47 @@ func (c *Charter) writeCharter(repoRoot, md string) (string, error) {
 //
 // Ask fails fast if stdin isn't a TTY. This guards against the
 // 'slash command invokes aidev charter via !shell execution and aidev
-// hangs forever waiting for stdin' failure mode — without this check,
-// `fmt.Fscanln` on a non-TTY stdin blocks indefinitely. Callers that
-// need a non-interactive path should use Charter.RunWithAnswers with a
+// hangs forever waiting for stdin' failure mode. Callers that need a
+// non-interactive path should use Charter.RunWithAnswers with a
 // pre-collected map instead of this interviewer.
-type StdinInterviewer struct{}
+//
+// Implementation note: this uses bufio.Reader.ReadString('\n') to
+// read whole lines — NOT fmt.Fscanln, which reads whitespace-delimited
+// tokens and silently tokenises a multi-word answer into the first
+// word only, leaving the rest of the sentence in stdin to pollute the
+// next question. That bug produced garbage charters when users typed
+// answers containing spaces (i.e. almost all answers). A single
+// bufio.Reader is held on the struct so answers with embedded tabs,
+// colons, or other shell-special characters survive.
+type StdinInterviewer struct {
+	reader *bufio.Reader
+}
 
-// Ask prints the prompt to stderr and reads a single line from stdin.
+// Ask prints the prompt to stderr and reads a full line from stdin.
 // Returns an error immediately if stdin is not a TTY.
-func (StdinInterviewer) Ask(prompt string) (string, error) {
+func (s *StdinInterviewer) Ask(prompt string) (string, error) {
 	// Non-TTY stdin means this process was invoked from a script, a
 	// pipe, or a tool like Claude Code's `!` shell execution. None of
 	// those have a user to type answers. Fail fast instead of
-	// hanging on fmt.Fscanln.
+	// blocking on ReadString.
 	if fi, err := os.Stdin.Stat(); err == nil {
 		if (fi.Mode() & os.ModeCharDevice) == 0 {
 			return "", errors.New("charter: stdin is not a TTY — use `aidev charter --answers-file <path>` for non-interactive runs")
 		}
 	}
 	fmt.Fprint(os.Stderr, prompt)
-	var line string
-	_, err := fmt.Fscanln(os.Stdin, &line)
-	// Fscanln returns "unexpected newline" for empty lines — accept that
-	// as an empty answer rather than an error, so optional questions can
-	// be skipped by just pressing enter.
-	if err != nil && err.Error() != "unexpected newline" {
-		return line, nil
+	if s.reader == nil {
+		s.reader = bufio.NewReader(os.Stdin)
 	}
-	return line, nil
+	line, err := s.reader.ReadString('\n')
+	// EOF after some input is fine — the user pressed ctrl-d with a
+	// line in the buffer. Return what we got. A hard error (e.g.
+	// stdin closed mid-read with no bytes) bubbles up so the caller
+	// can complain.
+	if err != nil && err.Error() != "EOF" {
+		return "", fmt.Errorf("charter: read line: %w", err)
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // firstLine returns the first line of s, used only in error messages.
