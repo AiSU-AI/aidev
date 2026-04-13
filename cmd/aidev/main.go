@@ -47,6 +47,13 @@ func main() {
 		runCharterSubcommand()
 		return
 	}
+	// Intercept the `test` subcommand. Detects the project's test
+	// runner and executes it against the current working tree.
+	if len(os.Args) > 1 && os.Args[1] == "test" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runTestSubcommand()
+		return
+	}
 
 	var (
 		issueURL     = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
@@ -130,6 +137,55 @@ func main() {
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
+	}
+}
+
+// runTestSubcommand handles `aidev test`. It detects the project's
+// test runner, executes it against the working tree, and prints the
+// result with an LLM-generated failure summary on non-zero exit.
+func runTestSubcommand() {
+	var (
+		repoPath  = flag.String("repo", ".", "Path to the target repository")
+		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+	)
+	flag.Parse()
+
+	cfg := mustLoadConfig(*configDir)
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("router: %v", err))
+	}
+	tester, err := agents.NewTester(router)
+	if err != nil {
+		fatal(fmt.Sprintf("tester: %v", err))
+	}
+	absRepo, err := filepath.Abs(*repoPath)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+
+	fmt.Fprintf(os.Stderr, "aidev test: detecting test runner in %s...\n", absRepo)
+	result, err := tester.Run(context.Background(), absRepo)
+	if err != nil {
+		fatal(fmt.Sprintf("test: %v", err))
+	}
+
+	fmt.Printf("command: %s\n", result.Command)
+	fmt.Printf("detected: %s\n", result.Detected)
+	fmt.Printf("exit: %d\n", result.ExitCode)
+	fmt.Printf("duration: %s\n", result.Duration)
+	fmt.Printf("passed: %t\n\n", result.Passed)
+	if result.Output != "" {
+		fmt.Println("output (tail):")
+		fmt.Println(result.Output)
+		fmt.Println()
+	}
+	if result.Summary != "" {
+		fmt.Println("failure summary:")
+		fmt.Println(result.Summary)
+	}
+	if !result.Passed {
+		os.Exit(1)
 	}
 }
 

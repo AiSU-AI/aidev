@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.3a — Scout + Critic + Architect + Charter + Implementer + `aidev doctor` + automatic GitHub audit trail. Tester, Reviewer are on the roadmap.
+> **Status:** v0.3b — Scout + Critic + Architect + Charter + Implementer + Tester + `aidev doctor` + automatic GitHub audit trail. Reviewer is on the roadmap.
 
 ## Why
 
@@ -195,8 +195,8 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 - **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering. *(shipped)*
 - **v0.2b.1** — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure. *(shipped)*
 - **v0.2c** — Charter agent + `aidev charter` subcommand + `.aidev/charter.md` + Scout + Critic integration. *(shipped)*
-- **v0.3a** *(this release)* — Implementer agent: produces a unified git diff from a chosen sketch, writes it to `.aidev/proposed.patch` for the user to review and `git apply`.
-- **v0.3b** — Tester agent: runs the detected project test command against a patched working tree.
+- **v0.3a** — Implementer agent: produces a unified git diff from a chosen sketch. *(shipped)*
+- **v0.3b** *(this release)* — Tester agent: detects the project's test runner (go/cargo/python/node/gradle/maven/just/make), executes it, and summarises failures via the small tier. New `aidev test` subcommand.
 - **v0.3c** — Adaptive dialogue (dependency-aware question graphs).
 - **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
 - **v0.5** — Streaming LLM responses in the TUI.

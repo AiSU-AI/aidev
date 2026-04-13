@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/config"
@@ -47,6 +48,9 @@ const (
 	StateSketchesReady State = "sketches_ready"
 	StateImplementing  State = "implementing"
 	StatePatchReady    State = "patch_ready"
+	StateTesting       State = "testing"
+	StateTestsPassed   State = "tests_passed"
+	StateTestsFailed   State = "tests_failed"
 	StateDone          State = "done"
 	StateKilled        State = "killed"
 	StateError         State = "error"
@@ -74,8 +78,10 @@ type Orchestrator struct {
 	critic      *agents.Critic
 	architect   *agents.Architect
 	implementer *agents.Implementer
+	tester      *agents.Tester
 	critRpt     *agents.Report
 	patch       *agents.Patch
+	testResult  *agents.TestResult
 
 	// sketchCount is the N the Architect uses when it runs. It is set by
 	// New via the sketchCount config field and may be overridden at runtime
@@ -182,11 +188,67 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	tester, err := agents.NewTester(router)
+	if err != nil {
+		return nil, err
+	}
 	o.scout = scout
 	o.critic = critic
 	o.architect = architect
 	o.implementer = implementer
+	o.tester = tester
 	return o, nil
+}
+
+// TestResult returns the last Tester result, if any.
+func (o *Orchestrator) TestResult() *agents.TestResult { return o.testResult }
+
+// Test runs the Tester against the current working tree of the loaded
+// repository and emits tests_passed / tests_failed. It is valid from
+// any state once the repo has been loaded — the Tester is a
+// first-class side operation, not tightly coupled to the pipeline
+// phase. This lets the user invoke it directly via `aidev test` or
+// trigger it from inside the pipeline after patch_ready.
+func (o *Orchestrator) Test(ctx context.Context) <-chan Event {
+	out := make(chan Event, 4)
+	go func() {
+		defer close(out)
+		if o.ctx.Snapshot == nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: StateError, Err: errors.New("orchestrator: no repo loaded")})
+			return
+		}
+		o.state = StateTesting
+		o.emit(ctx, out, Event{State: o.state, Message: "Running test suite..."})
+
+		result, err := o.tester.Run(ctx, o.ctx.Snapshot.Root)
+		if err != nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: StateError, Err: err})
+			return
+		}
+		o.testResult = result
+
+		if result.Passed {
+			o.state = StateTestsPassed
+		} else {
+			o.state = StateTestsFailed
+		}
+		o.emit(ctx, out, Event{
+			State: o.state,
+			Message: fmt.Sprintf("Tests %s (%s, exit %d, %s)",
+				passedOrFailed(result.Passed), result.Command, result.ExitCode, result.Duration.Round(time.Millisecond)),
+		})
+	}()
+	return out
+}
+
+// passedOrFailed is a tiny helper for the test result message.
+func passedOrFailed(b bool) string {
+	if b {
+		return "PASSED"
+	}
+	return "FAILED"
 }
 
 // Patch returns the last Implementer patch, if any.
