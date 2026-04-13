@@ -29,18 +29,45 @@ type Issue struct {
 	Labels []string
 }
 
-// Client is a tiny REST client for reading issues. Auth is optional — public
-// repos work without a token — but rate limits are much friendlier when
-// GITHUB_TOKEN is set.
+// defaultAPIBase is the production GitHub API endpoint. Tests inject a
+// fake one via NewClientWithEndpoint.
+const defaultAPIBase = "https://api.github.com"
+
+// Client is a REST client for reading and writing issues and their
+// comments/labels. Auth is optional for public repo reads — but rate
+// limits are much friendlier when GITHUB_TOKEN is set, and private repos
+// and all writes require it.
 type Client struct {
-	token string
-	http  *http.Client
+	token   string
+	baseURL string // no trailing slash
+	http    *http.Client
 }
 
+// NewClient constructs a Client against the real github.com API, reading
+// the token from GITHUB_TOKEN.
 func NewClient() *Client {
 	return &Client{
-		token: os.Getenv("GITHUB_TOKEN"),
-		http:  &http.Client{Timeout: 30 * time.Second},
+		token:   os.Getenv("GITHUB_TOKEN"),
+		baseURL: defaultAPIBase,
+		http:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// NewClientWithEndpoint constructs a Client that talks to baseURL instead
+// of api.github.com. Used by tests with httptest servers; also usable for
+// GitHub Enterprise installations in the future. baseURL may have a
+// trailing slash or not.
+func NewClientWithEndpoint(token, baseURL string) *Client {
+	if baseURL == "" {
+		baseURL = defaultAPIBase
+	}
+	for len(baseURL) > 0 && baseURL[len(baseURL)-1] == '/' {
+		baseURL = baseURL[:len(baseURL)-1]
+	}
+	return &Client{
+		token:   token,
+		baseURL: baseURL,
+		http:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -65,7 +92,7 @@ func ParseURL(url string) (owner, repo string, number int, err error) {
 
 // Fetch returns the issue identified by owner/repo/number.
 func (c *Client) Fetch(ctx context.Context, owner, repo string, number int) (*Issue, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%d", owner, repo, number)
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
