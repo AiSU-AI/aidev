@@ -1,0 +1,76 @@
+# Engineering principles the Critic agent uses when evaluating a proposed change.
+#
+# The Critic is instructed to argue FOR and AGAINST each proposal using these
+# principles as the yardstick. Edit freely — this file is the living charter
+# for what "good" means on this codebase.
+#
+# When aidev is pointed at a repository that ships its own principles file
+# (e.g. .aidev/principles.yaml or an ai-dev-standards copy), that file is
+# loaded in addition to this one.
+
+principles:
+  - name: "Should this exist?"
+    summary: "Every feature justifies its existence against product purpose."
+    description: |
+      Before any implementation, ask whether the proposed change advances the
+      product's stated purpose. If the feature duplicates existing capability,
+      serves a rare edge case, or increases surface area without clear user
+      value, recommend killing or deferring it. Cite the product's own
+      architecture/README/mission when making the case.
+
+  - name: "Boy Scout Rule"
+    summary: "Leave the code cleaner than you found it."
+    description: |
+      When touching a file, fix small nearby issues the change naturally
+      surfaces: dead code, misleading names, obvious duplication, missing
+      tests for the exact path being modified. Do not expand scope into
+      unrelated refactors — file a follow-up issue instead.
+
+  - name: "DRY (Rule of Three)"
+    summary: "Duplicate twice before abstracting."
+    description: |
+      The first and second occurrences of similar code are cheaper duplicated.
+      Abstract on the third occurrence, when the shape of the abstraction is
+      actually known. Premature abstraction is more expensive than repetition.
+
+  - name: "YAGNI"
+    summary: "Build what is asked, not what might be needed."
+    description: |
+      Reject speculative configurability, feature flags without consumers,
+      and extension points with no second implementation in sight. Add them
+      the moment they are actually needed.
+
+  - name: "Well-Architected (pillars)"
+    summary: "Operational excellence, security, reliability, performance, cost, sustainability."
+    description: |
+      For any non-trivial change, briefly consider each pillar. Flag changes
+      that silently degrade one pillar to improve another so the trade-off
+      is explicit.
+
+  - name: "Single Responsibility"
+    summary: "One reason to change per unit."
+    description: |
+      A module, function, or agent should have exactly one axis of change.
+      Multi-responsibility units get split before they grow further.
+
+  - name: "Fail Loudly at Boundaries"
+    summary: "Validate at system edges; trust the interior."
+    description: |
+      Validate user input, external APIs, and file I/O. Do not pepper the
+      interior of the system with defensive checks for conditions that cannot
+      happen — they rot and mislead readers.
+
+  - name: "Tests Describe Intent"
+    summary: "Every change ships with tests that explain why, not how."
+    description: |
+      A test suite that only mirrors the implementation has no value during
+      refactors. Prefer behavioural tests at the boundary of the unit. Full
+      coverage of the change is table stakes; meaningful coverage is the bar.
+
+  - name: "Reversibility"
+    summary: "Prefer decisions that are easy to undo."
+    description: |
+      Two-way-door decisions (feature flags, additive schema changes, new
+      endpoints) are cheap. One-way-door decisions (data migrations, public
+      API breaks, dependency lock-in) require a louder justification and an
+      explicit rollback plan.

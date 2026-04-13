@@ -30,6 +30,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/config"
 	"github.com/aisu-ai/aidev/internal/doctor"
 	"github.com/aisu-ai/aidev/internal/github"
+	"github.com/aisu-ai/aidev/internal/installpkg"
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/plugin"
@@ -71,6 +72,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runPluginSubcommand()
+		return
+	}
+	// Intercept the `install` subcommand. Writes the shipped default
+	// config files into ~/.config/aidev (or $XDG_CONFIG_HOME/aidev)
+	// so the installed binary can find them without AIDEV_CONFIG.
+	if len(os.Args) > 1 && os.Args[1] == "install" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runInstallSubcommand()
 		return
 	}
 	// Intercept the `followups` subcommand. Reads .aidev/followups.md,
@@ -351,6 +360,53 @@ func runFollowUpsSubcommand() {
 	fmt.Fprintf(os.Stderr, "\n%d issue(s) filed against %s/%s\n", len(filed), owner, repo)
 }
 
+// runInstallSubcommand handles `aidev install`. Writes the shipped
+// default config (models.yaml, principles.yaml) into
+// $XDG_CONFIG_HOME/aidev (or ~/.config/aidev) so the installed binary
+// can find them without the user needing to set AIDEV_CONFIG or
+// symlink anything. Idempotent: existing files are preserved unless
+// --force is passed.
+//
+// This is the config half of the full install flow. The binary and
+// plugin halves are handled by the top-level install.sh script which
+// calls `go build`, moves the binary to a bin dir, then invokes this
+// subcommand and `aidev plugin install`.
+func runInstallSubcommand() {
+	var (
+		force = flag.Bool("force", false, "Overwrite existing config files")
+		dir   = flag.String("dir", "", "Target directory (default: $XDG_CONFIG_HOME/aidev or ~/.config/aidev)")
+	)
+	flag.Parse()
+
+	target := *dir
+	if target == "" {
+		resolved, err := installpkg.DefaultConfigDir()
+		if err != nil {
+			fatal(fmt.Sprintf("install: %v", err))
+		}
+		target = resolved
+	}
+
+	written, skipped, err := installpkg.InstallConfig(target, *force)
+	if err != nil {
+		fatal(fmt.Sprintf("install: %v", err))
+	}
+	for _, p := range written {
+		fmt.Fprintf(os.Stderr, "wrote: %s\n", p)
+	}
+	for _, p := range skipped {
+		fmt.Fprintf(os.Stderr, "skipped (exists): %s\n", p)
+	}
+	fmt.Fprintf(os.Stderr, "\n%d written, %d skipped\n", len(written), len(skipped))
+	if len(skipped) > 0 {
+		fmt.Fprintln(os.Stderr, "pass --force to overwrite skipped files")
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "config installed at %s\n", target)
+	fmt.Fprintln(os.Stderr, "aidev will now find its config automatically from any cwd.")
+	fmt.Fprintln(os.Stderr, "next: run `aidev plugin install` to install the Claude Code slash commands.")
+}
+
 // runPluginSubcommand handles `aidev plugin install | uninstall`.
 // Install copies aidev's slash commands into the user's Claude Code
 // commands directory (~/.claude/commands by default, overridable via
@@ -600,31 +656,62 @@ func runDoctorSubcommand() {
 	}
 }
 
-// mustLoadConfig resolves the config directory from flag, env var, and
-// binary-relative defaults, then loads it or fatals.
+// mustLoadConfig resolves the config directory from (in order):
+//
+//  1. the explicit --config flag
+//  2. the AIDEV_CONFIG env var
+//  3. a `config` directory next to the binary (dev workflow — running
+//     the built binary from the aidev checkout)
+//  4. $XDG_CONFIG_HOME/aidev or ~/.config/aidev (installed workflow —
+//     the installer script drops the shipped defaults here)
+//  5. ~/.aidev/config (legacy home-dotdir fallback, for users who
+//     prefer ~/.aidev over ~/.config/aidev)
+//  6. ./config (cwd — matches the dev workflow for "go run")
+//
+// The first directory that exists and contains models.yaml wins.
 func mustLoadConfig(configDir string) *config.Config {
 	if configDir == "" {
 		configDir = os.Getenv("AIDEV_CONFIG")
 	}
 	if configDir == "" {
-		// Prefer config relative to the binary so `aidev` works from any
-		// CWD after installation.
-		if exe, err := os.Executable(); err == nil {
-			candidate := filepath.Join(filepath.Dir(exe), "config")
-			if _, err := os.Stat(candidate); err == nil {
-				configDir = candidate
-			}
-		}
-	}
-	if configDir == "" {
-		configDir = "config"
+		configDir = discoverConfigDir()
 	}
 
 	cfg, err := config.Load(configDir)
 	if err != nil {
-		fatal(fmt.Sprintf("load config: %v", err))
+		fatal(fmt.Sprintf("load config: %v\n  searched: %s\n  hint: run `aidev install` to lay down the default config in ~/.config/aidev", err, configDir))
 	}
 	return cfg
+}
+
+// discoverConfigDir walks the candidate list and returns the first
+// directory that contains models.yaml. Falls back to "config" (the
+// bare-name cwd lookup) when nothing is found so config.Load can
+// return a clean error.
+func discoverConfigDir() string {
+	candidates := []string{}
+
+	// Binary-relative (dev workflow).
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "config"))
+	}
+	// XDG: $XDG_CONFIG_HOME/aidev with a ~/.config/aidev fallback.
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, "aidev"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".config", "aidev"))
+		candidates = append(candidates, filepath.Join(home, ".aidev", "config"))
+	}
+	// CWD — last resort so we don't accidentally shadow an installed config.
+	candidates = append(candidates, "config")
+
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(c, "models.yaml")); err == nil {
+			return c
+		}
+	}
+	return "config"
 }
 
 // runHeadless is a CI-friendly mode that produces a single Markdown report
