@@ -354,12 +354,17 @@ func runCharterSubcommand() {
 	fmt.Fprintf(os.Stderr, "\nwrote %s\n", path)
 }
 
-// runDoctorSubcommand handles `aidev doctor`. It always runs non-interactive
-// (no auto-spawn, no prompts) and prints the full report. Exit code is 0
-// when there are no FAILs, 1 otherwise.
+// runDoctorSubcommand handles `aidev doctor`. It never prompts for user
+// input (no missing-model menu, no pull consent), but it IS allowed to
+// auto-spawn the Ollama daemon if the binary is present and the daemon
+// isn't already running — spawning is idempotent, doesn't require a
+// TTY, and the daemon persists after aidev exits so it's effectively
+// the same as the user typing `ollama serve` in another terminal. Exit
+// code is 0 when there are no FAILs, 1 otherwise.
 func runDoctorSubcommand() {
 	var (
 		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		noSpawn   = flag.Bool("no-spawn", false, "Disable auto-spawning `ollama serve` if the daemon isn't running")
 	)
 	flag.Parse()
 
@@ -367,7 +372,7 @@ func runDoctorSubcommand() {
 
 	opts := doctor.Options{
 		Interactive:     false,
-		AutoSpawnOllama: false,
+		AutoSpawnOllama: !*noSpawn,
 		Out:             os.Stderr,
 	}
 	report := doctor.Run(context.Background(), cfg, opts)
