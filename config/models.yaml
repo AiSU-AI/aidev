@@ -35,6 +35,7 @@ routing:
   scout: small
   critic: large
   architect: large
+  charter: large
   implementer: medium
   reviewer: medium
   tester: small

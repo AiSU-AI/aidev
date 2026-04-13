@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.2b.1 — Scout + Critic + Architect + `aidev doctor` + automatic GitHub audit trail. Implementer, Tester, Reviewer are on the roadmap.
+> **Status:** v0.2c — Scout + Critic + Architect + Charter + `aidev doctor` + automatic GitHub audit trail. Implementer, Tester, Reviewer are on the roadmap.
 
 ## Why
 
@@ -94,6 +94,30 @@ Choosing `2` lists the models already pulled on your Ollama daemon and swaps the
 
 The Ollama daemon lifecycle is **not owned by aidev** — if we spawn it, it persists after aidev exits so we don't interfere with other things that use it.
 
+## Charter
+
+When aidev runs against a repo that has no strong signal for the Critic to anchor against — no `README.md` (or a near-empty one), no `CLAUDE.md`, no `ARCHITECTURE.md`, no `.aidev/charter.md` — the Critic has nothing to cite when pushing back on proposed features. The **Charter** agent fixes that by interviewing you and writing a clean product charter to `.aidev/charter.md` in the target repo.
+
+### Running the interview
+
+```sh
+aidev charter -repo /path/to/target
+```
+
+You'll be asked five questions:
+
+1. In one sentence, what does this product do?
+2. Who uses it?
+3. What's the single most important constraint? (correctness / latency / cost / security / compliance / something else)
+4. What is explicitly out of scope — things this product should NOT do?
+5. Any engineering principles that override or extend the defaults? (optional)
+
+Your raw answers are then synthesised into a structured Markdown charter and written to `<repo>/.aidev/charter.md`. On subsequent runs, the Scout automatically absorbs this charter alongside README/CLAUDE.md/ARCHITECTURE.md and the Critic cites it when arguing about trade-offs.
+
+### Nudges during normal runs
+
+If you invoke `aidev -issue ... -repo ...` against a repo with no strong signal and no existing charter, aidev prints a warning to stderr pointing at `aidev charter` before the pipeline starts. The pipeline still runs — the warning is advisory.
+
 ## Audit trail (controller)
 
 Every significant state transition — Scout started, Critic report ready, user approved, Architect produced sketches, run killed, error — is posted to the GitHub issue that seeded the run. A single **pinned status comment** is updated in place for every transition, and **one-shot artifact comments** contain the full Scout brief, Critic report, and Architect sketches.
@@ -169,8 +193,8 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 
 - **v0.2a** — Architect agent with N divergent sketches, `-n` flag, cost preview. *(shipped)*
 - **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering. *(shipped)*
-- **v0.2b.1** *(this release)* — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure.
-- **v0.2c** — Charter agent + `.aidev/charter.md` + interview flow for repos without a clear stated purpose.
+- **v0.2b.1** — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure. *(shipped)*
+- **v0.2c** *(this release)* — Charter agent + `aidev charter` subcommand + `.aidev/charter.md` + Scout + Critic integration.
 - **v0.3** — Implementer + Tester in an isolated git worktree + container, with full-coverage tests gating completion. Adaptive dialogue (dependency-aware question graphs).
 - **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
 - **v0.5** — Streaming LLM responses in the TUI.

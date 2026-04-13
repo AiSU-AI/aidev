@@ -26,8 +26,34 @@ type Snapshot struct {
 	ReadmeContent   string
 	AgentMarkdown   string // CLAUDE.md, AGENTS.md, or AIDEV.md if present
 	ArchitectureDoc string // ARCHITECTURE.md if present
+	CharterPath     string // .aidev/charter.md if present
+	CharterContent  string // contents of CharterPath
 	PrinciplesPath  string // .aidev/principles.yaml if present
 	TotalFiles      int
+}
+
+// HasStrongSignal reports whether the snapshot has at least one source
+// of truth the Critic can anchor against: a README, an agent markdown, an
+// architecture doc, or a charter. Returns false when all four are absent,
+// at which point the main entry point nudges the user to run `aidev
+// charter`.
+func (s *Snapshot) HasStrongSignal() bool {
+	if s == nil {
+		return false
+	}
+	if len(s.ReadmeContent) >= 100 {
+		return true
+	}
+	if s.AgentMarkdown != "" {
+		return true
+	}
+	if s.ArchitectureDoc != "" {
+		return true
+	}
+	if s.CharterContent != "" {
+		return true
+	}
+	return false
 }
 
 // Scan produces a Snapshot rooted at root. It honours .gitignore-ish sense
@@ -84,6 +110,12 @@ func Scan(root string) (*Snapshot, error) {
 	if p := pickFirst("ARCHITECTURE.md", "docs/ARCHITECTURE.md"); p != "" {
 		if data, err := os.ReadFile(p); err == nil {
 			snap.ArchitectureDoc = string(data)
+		}
+	}
+	if p := pickFirst(".aidev/charter.md"); p != "" {
+		snap.CharterPath = p
+		if data, err := os.ReadFile(p); err == nil {
+			snap.CharterContent = string(data)
 		}
 	}
 	if p := pickFirst(".aidev/principles.yaml", "config/principles.yaml"); p != "" {
