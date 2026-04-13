@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -43,14 +45,48 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient constructs a Client against the real github.com API, reading
-// the token from GITHUB_TOKEN.
+// NewClient constructs a Client against the real github.com API.
+// Token resolution is layered so users don't have to manually export
+// GITHUB_TOKEN every time:
+//
+//  1. GITHUB_TOKEN env var (explicit override, highest priority)
+//  2. GH_TOKEN env var (the gh CLI's own canonical variable)
+//  3. `gh auth token` shell-out (when the gh CLI is installed and
+//     logged in — which is the common case on a developer machine)
+//  4. empty string (unauthenticated; public repos still work, private
+//     repos return 404 with a clear remediation message)
+//
+// The gh fallback is the ergonomic win: most developers are already
+// logged in via `gh auth login`, so aidev should just pick up that
+// credential instead of demanding they re-export it.
 func NewClient() *Client {
 	return &Client{
-		token:   os.Getenv("GITHUB_TOKEN"),
+		token:   resolveToken(),
 		baseURL: defaultAPIBase,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// resolveToken walks the credential sources in priority order and
+// returns the first non-empty token found. Silent on gh-lookup
+// failure — we don't want a missing or broken gh install to produce
+// noisy startup output when GITHUB_TOKEN isn't actually needed yet
+// (public-repo reads, doctor, etc.).
+func resolveToken() string {
+	if v := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("GH_TOKEN")); v != "" {
+		return v
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		return ""
+	}
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // NewClientWithEndpoint constructs a Client that talks to baseURL instead

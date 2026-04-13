@@ -1,6 +1,6 @@
 ---
 description: Run the aidev Reviewer on the current proposed patch
-argument-hint: <issue-url> <repo-path>
+argument-hint: <issue-number-or-url> [repo-path]
 allowed-tools: Bash(aidev:*)
 ---
 
@@ -8,24 +8,25 @@ Run the aidev Reviewer against the patch at `<repo>/.aidev/proposed.patch`
 for the given issue. This is the Boy Scout pass before the user
 commits the change.
 
-STEP 1 — Parse `$ARGUMENTS` into two whitespace-separated tokens:
-  - token 1: the issue URL (https://github.com/owner/repo/issues/N)
-  - token 2: the repo path
+STEP 1 — Parse `$ARGUMENTS`. The first token is the issue reference
+(URL or bare number). The second token, if present, is the repo
+path. If the repo path is absent, default it to `.` (cwd).
 
-If either is missing or empty, STOP and ask the user for the missing
-values. Tell them to re-invoke
-`/aidev-review <issue-url> <repo-path>`.
+If `$ARGUMENTS` is empty, STOP and ask the user for an issue
+reference.
 
-Do NOT use `!` shell execution — use the Bash tool directly so this
-slash command can validate its arguments at the Claude layer.
+The `-issue` flag accepts either a full URL or a bare number; the
+number is resolved against the repo's git remote. `GITHUB_TOKEN` is
+auto-resolved from `gh auth token` so no manual export is needed.
 
-STEP 2 — Once you have both values, use the Bash tool to run:
+Do NOT use `!` shell execution — use the Bash tool directly.
 
-    aidev review -issue <THE-URL> -repo <THE-PATH>
+STEP 2 — Use the Bash tool to run:
 
-Interpolate the literal values from `$ARGUMENTS` into the command
-string. Expand `~` to `$HOME` if present. The Bash tool call is
-pre-approved by this slash command's `allowed-tools` frontmatter.
+    aidev review -issue <ISSUE> -repo <PATH>
+
+Interpolate the parsed values at the Claude layer. Expand `~` to
+`$HOME` if present.
 
 STEP 3 — After the review completes, report to the user:
   - the **verdict** prominently (approve / changes_requested / comment)

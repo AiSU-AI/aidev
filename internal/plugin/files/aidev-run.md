@@ -1,50 +1,52 @@
 ---
 description: Run the full aidev agent pipeline on a GitHub issue
-argument-hint: <issue-url> <repo-path>
+argument-hint: <issue-number-or-url> [repo-path]
 allowed-tools: Bash(aidev:*)
 ---
 
-You are driving `aidev`, the multi-agent coding tool. The user invoked
-this slash command expecting two arguments in `$ARGUMENTS`: a GitHub
-issue URL and a local repository path.
+You are driving `aidev`, the multi-agent coding tool.
 
-STEP 1 — Parse `$ARGUMENTS` into two whitespace-separated tokens:
-  - token 1: the issue URL (https://github.com/owner/repo/issues/N)
-  - token 2: the repo path (absolute, or starting with `~`)
+STEP 1 — Parse `$ARGUMENTS` into tokens. The first token is the issue
+reference (either a full GitHub URL or a bare issue number). The
+second token, if present, is the repository path. If the repo path
+is absent, default it to `.` (current working directory) — aidev can
+resolve a bare issue number against the cwd's git remote.
 
-If either is missing or empty, STOP and ask the user for the missing
-values. Do NOT proceed with partial input. Do NOT guess a repo path
-from the current working directory — the user is invoking from inside
-Claude Code, so cwd is almost never the intended aidev target. Tell
-them to re-invoke `/aidev-run <issue-url> <repo-path>`.
+If `$ARGUMENTS` is empty, STOP and ask the user for an issue
+reference. Do NOT proceed with no input.
 
-Do NOT use `!` shell execution in this slash command. `!` runs before
-the prompt body is processed, and that means Claude Code can't
-validate the arguments first. Use the Bash tool directly instead.
+aidev's `-issue` flag accepts either form:
+  - full URL: `https://github.com/owner/repo/issues/123`
+  - bare number: `123` (resolved against `-repo`'s git remote origin)
 
-STEP 2 — Once you have both values, use the Bash tool to run ONE
-aidev command with the two arguments interpolated into the command
-string at the Claude layer (not as shell variables):
+aidev's `GITHUB_TOKEN` is auto-resolved from `gh auth token` when the
+env var isn't set, so you do not need to wrap the command with a
+manual credential export. If you see a 'private repo? set
+GITHUB_TOKEN' error anyway, tell the user to run `gh auth login` (or
+export a PAT) and retry.
 
-    aidev -headless -auto -sketch 1 -issue <THE-URL> -repo <THE-PATH>
+STEP 2 — Use the Bash tool to run ONE aidev command with the parsed
+values interpolated at the Claude layer (not as shell variables):
 
-Where `<THE-URL>` and `<THE-PATH>` are the literal strings you parsed
-from `$ARGUMENTS`, with `~` expanded to `$HOME` if present. Wrap the
-path in double quotes if it contains spaces or shell-special
-characters.
+    aidev -headless -auto -sketch 1 -issue <ISSUE> -repo <PATH>
 
-The Bash tool call itself is pre-approved by this slash command's
-`allowed-tools: Bash(aidev:*)` frontmatter, so it will not trip the
-permission layer as long as the command starts with `aidev`.
+Where `<ISSUE>` is the literal first token from `$ARGUMENTS` and
+`<PATH>` is the literal second token (or `.` if unset). Expand `~`
+to `$HOME`. Wrap the path in double quotes if it contains spaces.
+
+The Bash call matches `Bash(aidev:*)` and passes the permission
+layer cleanly because it's a single `aidev` invocation with no
+surrounding shell logic.
 
 STEP 3 — After the command finishes, summarise the output for the
 user:
   - what the Critic recommended (build / defer / kill / unclear)
-  - how many sketches the Architect produced
+  - how many sketches the Architect produced (if build)
   - whether the Implementer wrote a patch at
     `<repo>/.aidev/proposed.patch`
   - any doctor warnings
 
 If the Critic recommended `kill` or `defer`, stop and report the
-rationale. Don't push the user to proceed against the Critic's
-judgement — that's the entire point of the Critic.
+rationale verbatim. Surface the Critic's sharp questions to the user
+and ask how they want to proceed. Don't push them to override the
+Critic — that's the entire point of the tool.
