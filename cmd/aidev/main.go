@@ -41,13 +41,14 @@ func main() {
 	}
 
 	var (
-		issueURL    = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
-		repoPath    = flag.String("repo", ".", "Path to the target repository")
-		configDir   = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
-		headless    = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
-		sketchN     = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
-		autoRun     = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
-		skipDoctor  = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
+		issueURL      = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
+		repoPath      = flag.String("repo", ".", "Path to the target repository")
+		configDir     = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		headless      = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
+		sketchN       = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
+		autoRun       = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
+		skipDoctor    = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
+		noAuditTrail  = flag.Bool("no-audit-trail", false, "Disable posting aidev progress + artifacts to the GitHub issue")
 	)
 	flag.Parse()
 
@@ -89,6 +90,17 @@ func main() {
 	}
 	if err := orch.LoadRepo(absRepo); err != nil {
 		fatal(fmt.Sprintf("scan repo: %v", err))
+	}
+
+	// Install the GitHubReporter unless the user opted out. We hand it
+	// the same github.Client the orchestrator already uses, so the
+	// credential story is "one GITHUB_TOKEN env var covers everything".
+	if !*noAuditTrail {
+		if issue := orch.AgentContext().Issue; issue != nil {
+			reporter := orchestrator.NewGitHubReporter(ctx, orch.GitHubClient(), issue, os.Stderr)
+			orch.SetReporter(reporter)
+			defer func() { _ = orch.CloseReporter() }()
+		}
 	}
 
 	if *headless {

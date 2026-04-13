@@ -11,6 +11,10 @@
 // and a subsequent Continue() call transitions await_user -> architecting ->
 // sketches_ready. Killed and errored runs terminate from any state.
 //
+// v0.2b.1 adds the Reporter hook: every state transition is fanned out to
+// both the TUI event channel (as before) and a Reporter that owns all
+// outgoing side effects (GitHub comments, labels, etc.). Agents stay pure.
+//
 // The orchestrator never talks to LLMs directly — it owns a Router and hands
 // the right Provider to each agent via the agents package. This keeps
 // agent-specific prompting out of the state machine.
@@ -20,6 +24,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/config"
@@ -71,6 +77,15 @@ type Orchestrator struct {
 	// New via the sketchCount config field and may be overridden at runtime
 	// via SetSketchCount before Continue() is called.
 	sketchCount int
+
+	// reporter is the side-effect boundary. NullReporter by default;
+	// the main entry point swaps in a GitHubReporter unless the user
+	// passes -no-audit-trail. Never nil after New() returns.
+	reporter Reporter
+
+	// reporterLog is where reporter errors are logged when the reporter
+	// itself returns an error from OnEvent. Defaults to os.Stderr.
+	reporterLog io.Writer
 }
 
 // Option configures the orchestrator at construction time.
@@ -85,6 +100,44 @@ func WithSketchCount(n int) Option {
 		}
 		o.sketchCount = n
 	}
+}
+
+// WithReporter installs a custom Reporter. When omitted, the orchestrator
+// uses a NullReporter (no side effects). Passing nil is treated the same
+// as omitting the option.
+func WithReporter(r Reporter) Option {
+	return func(o *Orchestrator) {
+		if r != nil {
+			o.reporter = r
+		}
+	}
+}
+
+// WithReporterLog sets the io.Writer that reporter errors are logged to.
+// Defaults to os.Stderr when unset.
+func WithReporterLog(w io.Writer) Option {
+	return func(o *Orchestrator) {
+		if w != nil {
+			o.reporterLog = w
+		}
+	}
+}
+
+// GitHubClient exposes the orchestrator's github client so callers (like
+// main.go) can build a GitHubReporter against the same client without
+// duplicating credential handling.
+func (o *Orchestrator) GitHubClient() *github.Client { return o.gh }
+
+// SetReporter installs a Reporter after construction. Most callers should
+// use WithReporter(...) at New time, but main.go needs to build the
+// GitHubReporter *after* the issue is loaded, so we expose a post-hoc
+// setter as well. Passing nil resets to NullReporter.
+func (o *Orchestrator) SetReporter(r Reporter) {
+	if r == nil {
+		o.reporter = NullReporter{}
+		return
+	}
+	o.reporter = r
 }
 
 // New builds an Orchestrator from loaded config. It constructs the Router
@@ -102,6 +155,8 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 		state:       StateInit,
 		ctx:         &agents.Context{},
 		sketchCount: agents.DefaultSketchCount,
+		reporter:    NullReporter{},
+		reporterLog: os.Stderr,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -204,54 +259,71 @@ func (o *Orchestrator) LoadRepo(root string) error {
 // Run executes the first pass of the pipeline: scout -> critic -> await user.
 // It emits one Event per state transition on the returned channel and closes
 // the channel when the first pass terminates (at await_user, killed, or
-// error). Call Continue() to drive the second pass (architect -> sketches).
+// error). Every emitted event is also fanned out to the Reporter. Call
+// Continue() to drive the second pass (architect -> sketches).
 func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 	out := make(chan Event, 8)
 	go func() {
 		defer close(out)
 
 		if o.ctx.Issue == nil {
-			o.state = StateError
-			out <- Event{State: o.state, Err: errors.New("orchestrator: no issue loaded")}
+			o.emit(ctx, out, Event{State: StateError, Err: errors.New("orchestrator: no issue loaded")})
 			return
 		}
 		if o.ctx.Snapshot == nil {
-			o.state = StateError
-			out <- Event{State: o.state, Err: errors.New("orchestrator: no repo loaded")}
+			o.emit(ctx, out, Event{State: StateError, Err: errors.New("orchestrator: no repo loaded")})
 			return
 		}
 
 		// Scout.
 		o.state = StateScouting
-		out <- Event{State: o.state, Message: "Scouting repository..."}
+		o.emit(ctx, out, Event{State: o.state, Message: "Scouting repository..."})
 		if _, err := o.scout.Run(ctx, o.ctx); err != nil {
 			o.state = StateError
-			out <- Event{State: o.state, Err: err}
+			o.emit(ctx, out, Event{State: o.state, Err: err})
 			return
 		}
 
 		// Critic.
 		o.state = StateCritiquing
-		out <- Event{State: o.state, Message: "Critic evaluating proposal..."}
+		o.emit(ctx, out, Event{State: o.state, Message: "Critic evaluating proposal..."})
 		rpt, err := o.critic.Run(ctx, o.ctx)
 		if err != nil {
 			o.state = StateError
-			out <- Event{State: o.state, Err: err}
+			o.emit(ctx, out, Event{State: o.state, Err: err})
 			return
 		}
 		o.critRpt = rpt
 
 		// First pass terminates here and awaits the human's verdict.
 		o.state = StateAwaitUser
-		out <- Event{State: o.state, Message: "Critic recommends: " + rpt.Recommendation}
+		o.emit(ctx, out, Event{State: o.state, Message: "Critic recommends: " + rpt.Recommendation})
 	}()
 	return out
+}
+
+// emit fans an event out to both the TUI channel and the Reporter. It
+// stamps the event with a pointer to the current agents.Context so the
+// Reporter can read downstream artifacts (ScoutReport, CriticReport,
+// Sketches) from the one place that holds them. Reporter errors are
+// logged to o.reporterLog and never propagated — the audit trail is a
+// best-effort facility, not a gate.
+func (o *Orchestrator) emit(ctx context.Context, out chan<- Event, ev Event) {
+	ev.Report = o.ctx
+	out <- ev
+	if o.reporter == nil {
+		return
+	}
+	if err := o.reporter.OnEvent(ctx, ev); err != nil {
+		fmt.Fprintf(o.reporterLog, "aidev reporter: %v\n", err)
+	}
 }
 
 // Continue runs the Architect stage. Must be called after Run() has
 // transitioned to StateAwaitUser; the TUI typically calls it when the user
 // presses the approve key. The returned channel emits architecting events
-// and closes when sketches are ready (or the run errors).
+// and closes when sketches are ready (or the run errors). Events are also
+// fanned to the Reporter.
 //
 // Calling Continue from any state other than StateAwaitUser returns a
 // channel that immediately emits an error event and closes.
@@ -261,44 +333,63 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 		defer close(out)
 
 		if o.state != StateAwaitUser {
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   fmt.Errorf("orchestrator: Continue called from state %q, expected await_user", o.state),
+			})
 			o.state = StateError
-			out <- Event{
-				State: o.state,
-				Err: fmt.Errorf("orchestrator: Continue called from state %q, expected await_user", o.state),
-			}
 			return
 		}
 
 		o.state = StateArchitecting
 		preview := agents.EstimateCost(o.sketchCount)
-		out <- Event{
+		o.emit(ctx, out, Event{
 			State: o.state,
 			Message: fmt.Sprintf("Architect generating %d sketches (~%d tokens, ~%ds)...",
 				preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds),
-		}
+		})
 
 		sketches, err := o.architect.Run(ctx, o.ctx)
 		if err != nil {
 			o.state = StateError
-			out <- Event{State: o.state, Err: err}
+			o.emit(ctx, out, Event{State: o.state, Err: err})
 			return
 		}
 		o.ctx.Sketches = sketches
 
 		o.state = StateSketchesReady
-		out <- Event{
-			State: o.state,
+		o.emit(ctx, out, Event{
+			State:   o.state,
 			Message: fmt.Sprintf("Architect produced %d sketches. Review them and pick one.", len(sketches)),
-		}
+		})
 	}()
 	return out
 }
 
-// Kill transitions the orchestrator to StateKilled. It is safe to call from
+// Kill transitions the orchestrator to StateKilled and fires a terminal
+// event to both the TUI channel and the Reporter. It is safe to call from
 // any non-terminal state and idempotent once terminal.
 func (o *Orchestrator) Kill() {
 	if o.state == StateDone || o.state == StateKilled || o.state == StateError {
 		return
 	}
 	o.state = StateKilled
+	// Fire a synthetic terminal event so the Reporter can finalise its
+	// audit trail. We use a one-shot channel the caller drops.
+	ctx := context.Background()
+	if o.reporter != nil {
+		ev := Event{State: StateKilled, Message: "Killed by user", Report: o.ctx}
+		if err := o.reporter.OnEvent(ctx, ev); err != nil {
+			fmt.Fprintf(o.reporterLog, "aidev reporter: %v\n", err)
+		}
+	}
+}
+
+// CloseReporter releases the reporter. Safe to call after the
+// orchestrator is done; main.go uses this from a defer.
+func (o *Orchestrator) CloseReporter() error {
+	if o.reporter == nil {
+		return nil
+	}
+	return o.reporter.Close()
 }

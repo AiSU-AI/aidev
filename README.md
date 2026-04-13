@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.2b — Scout + Critic + Architect + `aidev doctor`. Implementer, Tester, Reviewer are on the roadmap.
+> **Status:** v0.2b.1 — Scout + Critic + Architect + `aidev doctor` + automatic GitHub audit trail. Implementer, Tester, Reviewer are on the roadmap.
 
 ## Why
 
@@ -94,6 +94,20 @@ Choosing `2` lists the models already pulled on your Ollama daemon and swaps the
 
 The Ollama daemon lifecycle is **not owned by aidev** — if we spawn it, it persists after aidev exits so we don't interfere with other things that use it.
 
+## Audit trail (controller)
+
+Every significant state transition — Scout started, Critic report ready, user approved, Architect produced sketches, run killed, error — is posted to the GitHub issue that seeded the run. A single **pinned status comment** is updated in place for every transition, and **one-shot artifact comments** contain the full Scout brief, Critic report, and Architect sketches.
+
+A single `aidev:<phase>` label on the issue gives you a kanban-style view of every run at a glance on the repo's Issues page. Labels are swapped (not stacked) so there's always exactly one `aidev:*` label on an issue.
+
+**Agents stay pure.** The controller pattern puts all GitHub I/O in the orchestrator — agents receive a `Context`, call an LLM, return markdown. They never touch the network. This keeps unit tests deterministic and keeps the failure modes of the pipeline contained to one place.
+
+**Idempotent across re-runs.** The pinned status comment carries a hidden HTML fingerprint (`<!-- aidev:status -->`). On startup, aidev scans existing comments for that fingerprint and updates the existing one instead of posting a duplicate — so re-running aidev on the same issue doesn't spam the thread.
+
+**Disable with `-no-audit-trail`.** The controller is on by default when the run has a GitHub issue. Pass `-no-audit-trail` to run silently.
+
+**Credential.** The audit trail writes require `GITHUB_TOKEN` in the environment, with Issues: read and write permission. The same token aidev already uses for issue fetching.
+
 ## TUI keybindings
 
 | Key | Action |
@@ -154,7 +168,8 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 ## Roadmap
 
 - **v0.2a** — Architect agent with N divergent sketches, `-n` flag, cost preview. *(shipped)*
-- **v0.2b** *(this release)* — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering.
+- **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering. *(shipped)*
+- **v0.2b.1** *(this release)* — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure.
 - **v0.2c** — Charter agent + `.aidev/charter.md` + interview flow for repos without a clear stated purpose.
 - **v0.3** — Implementer + Tester in an isolated git worktree + container, with full-coverage tests gating completion. Adaptive dialogue (dependency-aware question graphs).
 - **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
@@ -168,8 +183,8 @@ internal/config/        YAML loader for models + principles
 internal/llm/           Provider interface, Ollama + Claude backends, Router
 internal/github/        REST client for fetching issues
 internal/repo/          Repo scanner + repo-local principle loader
-internal/agents/        Scout, Critic, Architect agents (shared Context)
-internal/orchestrator/  State machine that drives the pipeline
+internal/agents/        Scout, Critic, Architect agents (shared Context, pure)
+internal/orchestrator/  State machine + Reporter interface + GitHubReporter (controller)
 internal/tui/           Bubble Tea model, update, view, keybindings
 internal/doctor/        Precondition checks: config, keys, Ollama daemon/models
 config/                 Shipped defaults: models.yaml, principles.yaml
