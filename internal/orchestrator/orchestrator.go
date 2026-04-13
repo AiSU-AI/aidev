@@ -39,15 +39,17 @@ import (
 type State string
 
 const (
-	StateInit           State = "init"
-	StateScouting       State = "scouting"
-	StateCritiquing     State = "critiquing"
-	StateAwaitUser      State = "await_user"
-	StateArchitecting   State = "architecting"
-	StateSketchesReady  State = "sketches_ready"
-	StateDone           State = "done"
-	StateKilled         State = "killed"
-	StateError          State = "error"
+	StateInit          State = "init"
+	StateScouting      State = "scouting"
+	StateCritiquing    State = "critiquing"
+	StateAwaitUser     State = "await_user"
+	StateArchitecting  State = "architecting"
+	StateSketchesReady State = "sketches_ready"
+	StateImplementing  State = "implementing"
+	StatePatchReady    State = "patch_ready"
+	StateDone          State = "done"
+	StateKilled        State = "killed"
+	StateError         State = "error"
 )
 
 // Event names every externally observable thing the orchestrator does. The
@@ -66,12 +68,14 @@ type Orchestrator struct {
 	router *llm.Router
 	gh     *github.Client
 
-	state     State
-	ctx       *agents.Context
-	scout     *agents.Scout
-	critic    *agents.Critic
-	architect *agents.Architect
-	critRpt   *agents.Report
+	state       State
+	ctx         *agents.Context
+	scout       *agents.Scout
+	critic      *agents.Critic
+	architect   *agents.Architect
+	implementer *agents.Implementer
+	critRpt     *agents.Report
+	patch       *agents.Patch
 
 	// sketchCount is the N the Architect uses when it runs. It is set by
 	// New via the sketchCount config field and may be overridden at runtime
@@ -174,10 +178,78 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	implementer, err := agents.NewImplementer(router)
+	if err != nil {
+		return nil, err
+	}
 	o.scout = scout
 	o.critic = critic
 	o.architect = architect
+	o.implementer = implementer
 	return o, nil
+}
+
+// Patch returns the last Implementer patch, if any.
+func (o *Orchestrator) Patch() *agents.Patch { return o.patch }
+
+// Implement runs the Implementer against the chosen sketch index
+// (1-indexed into c.Sketches). Must be called after StateSketchesReady.
+// Emits a patch_ready event on success and writes the diff to
+// `<repo>/.aidev/proposed.patch` so the user can `git apply` it.
+func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan Event {
+	out := make(chan Event, 4)
+	go func() {
+		defer close(out)
+
+		if o.state != StateSketchesReady {
+			o.state = StateError
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   fmt.Errorf("orchestrator: Implement called from state %q, expected sketches_ready", o.state),
+			})
+			return
+		}
+		if sketchNumber < 1 || sketchNumber > len(o.ctx.Sketches) {
+			o.state = StateError
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   fmt.Errorf("orchestrator: sketch %d out of range (have %d)", sketchNumber, len(o.ctx.Sketches)),
+			})
+			return
+		}
+
+		chosen := o.ctx.Sketches[sketchNumber-1]
+
+		o.state = StateImplementing
+		o.emit(ctx, out, Event{
+			State:   o.state,
+			Message: fmt.Sprintf("Implementing sketch %d: %s", chosen.Number, chosen.Title),
+		})
+
+		patch, err := o.implementer.Run(ctx, o.ctx, &chosen)
+		if err != nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: StateError, Err: err})
+			return
+		}
+
+		// Write the patch to disk so the user can git apply it. Failure
+		// here is non-fatal — we still return the patch in memory.
+		if o.ctx.Snapshot != nil {
+			if _, werr := patch.WriteTo(o.ctx.Snapshot.Root); werr != nil {
+				fmt.Fprintf(o.reporterLog, "aidev implementer: write patch: %v\n", werr)
+			}
+		}
+		o.patch = patch
+
+		o.state = StatePatchReady
+		msg := fmt.Sprintf("Patch ready: %d files touched.", len(patch.FilesTouched))
+		if patch.Path != "" {
+			msg += " Saved to " + patch.Path
+		}
+		o.emit(ctx, out, Event{State: o.state, Message: msg})
+	}()
+	return out
 }
 
 // Router exposes the router so the TUI can display provider health.

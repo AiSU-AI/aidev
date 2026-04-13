@@ -49,14 +49,15 @@ func main() {
 	}
 
 	var (
-		issueURL      = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
-		repoPath      = flag.String("repo", ".", "Path to the target repository")
-		configDir     = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
-		headless      = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
-		sketchN       = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
-		autoRun       = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
-		skipDoctor    = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
-		noAuditTrail  = flag.Bool("no-audit-trail", false, "Disable posting aidev progress + artifacts to the GitHub issue")
+		issueURL     = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
+		repoPath     = flag.String("repo", ".", "Path to the target repository")
+		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
+		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
+		pickSketch   = flag.Int("sketch", 0, "Headless only: after Architect produces sketches, automatically run the Implementer on this sketch number (1-indexed). 0 disables.")
+		autoRun      = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
+		skipDoctor   = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
+		noAuditTrail = flag.Bool("no-audit-trail", false, "Disable posting aidev progress + artifacts to the GitHub issue")
 	)
 	flag.Parse()
 
@@ -121,7 +122,7 @@ func main() {
 	}
 
 	if *headless {
-		runHeadless(ctx, orch, *autoRun)
+		runHeadless(ctx, orch, *autoRun, *pickSketch)
 		return
 	}
 
@@ -223,7 +224,9 @@ func mustLoadConfig(configDir string) *config.Config {
 // runHeadless is a CI-friendly mode that produces a single Markdown report
 // on stdout. With -auto, it also runs the Architect when the Critic
 // recommends "build", so a CI pipeline can get the sketches in one pass.
-func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool) {
+// With -sketch N, it additionally runs the Implementer against the chosen
+// sketch and prints the resulting patch.
+func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool, pickSketch int) {
 	for ev := range orch.Run(ctx) {
 		if ev.Err != nil {
 			fatal(ev.Err.Error())
@@ -270,6 +273,26 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool
 			fmt.Println()
 		}
 		fmt.Println(s.Markdown)
+	}
+
+	// Implementer opt-in.
+	if pickSketch <= 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("## Implementer (auto, sketch %d)\n\n", pickSketch)
+	for ev := range orch.Implement(ctx, pickSketch) {
+		if ev.Err != nil {
+			fatal(ev.Err.Error())
+		}
+	}
+	if p := orch.Patch(); p != nil {
+		fmt.Println("```diff")
+		fmt.Println(p.Diff)
+		fmt.Println("```")
+		if p.Path != "" {
+			fmt.Printf("\n_Patch also written to %s_\n", p.Path)
+		}
 	}
 }
 
