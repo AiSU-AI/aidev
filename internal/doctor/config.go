@@ -50,8 +50,10 @@ func checkConfig(cfg *config.Config) Result {
 
 // checkAnthropicKey reports whether the ANTHROPIC_API_KEY env var is set.
 // It is only a FAIL if the current routing actually sends some role to an
-// anthropic-typed tier — otherwise it's a WARN (the user might be running
-// a fully local setup and not need the key).
+// anthropic-typed tier. If no tier uses the anthropic provider, the key
+// is irrelevant and the check is a silent OK — previously this emitted a
+// noisy WARN, which was misleading for users who deliberately chose the
+// claude-cli path and never intended to set the env var.
 func checkAnthropicKey(cfg *config.Config) Result {
 	r := Result{Name: "anthropic-key"}
 	needsKey := false
@@ -71,11 +73,11 @@ func checkAnthropicKey(cfg *config.Config) Result {
 			r.Severity = FAIL
 			r.Message = "ANTHROPIC_API_KEY not set, but one or more roles route to an anthropic tier"
 			r.Remediation = "export ANTHROPIC_API_KEY=sk-ant-... (or swap the anthropic tiers to local providers)"
-		} else {
-			r.Severity = WARN
-			r.Message = "ANTHROPIC_API_KEY not set"
-			r.Remediation = "harmless if your routing stays local-only"
+			return r
 		}
+		// Not set, not needed — this is fine, not a warning.
+		r.Severity = OK
+		r.Message = "ANTHROPIC_API_KEY not set (not needed — no tiers use the anthropic provider)"
 		return r
 	}
 	r.Severity = OK

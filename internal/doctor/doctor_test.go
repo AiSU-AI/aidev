@@ -140,8 +140,11 @@ func TestCheckAnthropicKeyWarnsWhenNotRouted(t *testing.T) {
 		},
 	}
 	r := checkAnthropicKey(cfg)
-	if r.Severity != WARN {
-		t.Errorf("severity = %v, want WARN", r.Severity)
+	// Was WARN in v0.2d; downgraded to OK in the polish fix because
+	// a user on a fully local or claude-cli setup has deliberately
+	// chosen not to set the key.
+	if r.Severity != OK {
+		t.Errorf("severity = %v, want OK (no tier uses anthropic so the key is irrelevant)", r.Severity)
 	}
 }
 
