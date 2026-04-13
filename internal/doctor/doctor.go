@@ -154,6 +154,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) Report {
 	// missing.
 	report.Results = append(report.Results, checkConfig(cfg))
 	report.Results = append(report.Results, checkAnthropicKey(cfg))
+	report.Results = append(report.Results, checkClaudeCLI(cfg))
 
 	ollamaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
