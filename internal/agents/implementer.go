@@ -333,14 +333,26 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		"   belong in the same diff, not a follow-up.\n" +
 		"\n" +
 		"6. Do NOT wrap the diff in a Markdown code fence. Do NOT prefix the diff\n" +
-		"   with commentary. The first line of your response MUST be either\n" +
-		"   'diff --git' (a change) or '# no-op' (if you've decided the sketch\n" +
-		"   doesn't require any code changes — e.g. it was a documentation-only\n" +
-		"   sketch).\n" +
+		"   with commentary. The first line of your response MUST be\n" +
+		"   'diff --git'. There is no opt-out. If the sketch genuinely\n" +
+		"   requires no code changes (e.g. a pure doc-only task), you still\n" +
+		"   produce a real diff against a doc file — silence is not an\n" +
+		"   acceptable answer.\n" +
 		"\n" +
 		"7. If you are unsure about a file's current content and need more\n" +
 		"   context, do your best with what you know and annotate uncertain\n" +
 		"   regions with '# TODO(aidev): verify ...' inside the diff content.\n" +
+		"   A partially-correct starting point is strictly more useful than\n" +
+		"   an empty response; the user will review and fix the rough edges.\n" +
+		"\n" +
+		"8. ESCAPE HATCH (use sparingly): if and only if you cannot produce\n" +
+		"   ANY diff because the request is fundamentally impossible from\n" +
+		"   the context provided (e.g. the sketch references files that\n" +
+		"   don't exist and no reasonable substitute is visible), emit a\n" +
+		"   single line starting with 'ERROR: ' followed by a one-sentence\n" +
+		"   explanation of exactly what blocked you. Do NOT use this to\n" +
+		"   sidestep uncertainty — uncertainty is what the TODO annotations\n" +
+		"   in rule 7 are for.\n" +
 		"\n" +
 		"Stay realistic. The user will apply this diff with 'git apply' and\n" +
 		"review it; a partially-correct starting point is more useful than an\n" +
@@ -410,8 +422,18 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 	// "no code fence" instruction — we've seen it happen in practice.
 	diff = stripCodeFence(diff)
 
-	if !strings.HasPrefix(diff, "diff --git") && !strings.HasPrefix(diff, "# no-op") {
-		return nil, fmt.Errorf("implementer: expected 'diff --git' or '# no-op', got %q", firstLine(diff))
+	if strings.HasPrefix(diff, "ERROR:") {
+		// Hard-fail escape hatch. The Implementer has declared it cannot
+		// produce a diff at all. Surface the reason verbatim to the
+		// orchestrator so the user sees exactly what blocked it.
+		reason := strings.TrimSpace(strings.TrimPrefix(firstLine(diff), "ERROR:"))
+		if reason == "" {
+			reason = "(no reason given)"
+		}
+		return nil, fmt.Errorf("implementer: declared ERROR: %s", reason)
+	}
+	if !strings.HasPrefix(diff, "diff --git") {
+		return nil, fmt.Errorf("implementer: expected 'diff --git', got %q", firstLine(diff))
 	}
 
 	return &Patch{

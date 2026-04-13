@@ -66,9 +66,9 @@ type FollowUpIssue struct {
 }
 
 // Run produces a Review for the given patch and repo context. The patch
-// must be a non-empty unified diff (or the `# no-op` sentinel the
-// Implementer uses for documentation-only sketches — in that case the
-// reviewer returns an empty review quickly).
+// must be a non-empty unified diff; the Implementer no longer emits a
+// `# no-op` sentinel, so any non-diff content here is treated as an
+// error by the downstream review prompt.
 func (r *Reviewer) Run(ctx context.Context, c *Context, patch string) (*Review, error) {
 	if c == nil || c.Issue == nil {
 		return nil, errors.New("reviewer: missing issue")
@@ -76,12 +76,6 @@ func (r *Reviewer) Run(ctx context.Context, c *Context, patch string) (*Review, 
 	patch = strings.TrimSpace(patch)
 	if patch == "" {
 		return nil, errors.New("reviewer: empty patch")
-	}
-	if strings.HasPrefix(patch, "# no-op") {
-		return &Review{
-			Markdown: "# Review\n\nNo-op patch — nothing to review.\n\nVERDICT: approve\n",
-			Verdict:  "approve",
-		}, nil
 	}
 
 	system := "You are the Reviewer for aidev, a multi-agent coding tool. A " +
