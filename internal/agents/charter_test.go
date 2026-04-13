@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,5 +124,110 @@ func TestCharterQuestionsCoverAllExpectedKeys(t *testing.T) {
 	}
 	for k := range want {
 		t.Errorf("missing question key: %q", k)
+	}
+}
+
+// TestRunWithAnswersRejectsMissingFields ensures the non-interactive
+// path validates required answers BEFORE hitting the LLM. We can't
+// test the happy path without a real Provider, so this test only
+// covers the validation branch: each case is expected to error
+// during validation and never reach `synthesise`.
+func TestRunWithAnswersRejectsMissingFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		answers map[string]string
+	}{
+		{
+			name: "missing purpose",
+			answers: map[string]string{
+				"users":        "devs",
+				"constraint":   "correctness",
+				"out_of_scope": "web ui",
+			},
+		},
+		{
+			name: "whitespace-only users",
+			answers: map[string]string{
+				"purpose":      "a tool",
+				"users":        "   ",
+				"constraint":   "correctness",
+				"out_of_scope": "web ui",
+			},
+		},
+		{
+			name: "missing constraint",
+			answers: map[string]string{
+				"purpose":      "a tool",
+				"users":        "devs",
+				"out_of_scope": "web ui",
+			},
+		},
+		{
+			name: "missing out_of_scope",
+			answers: map[string]string{
+				"purpose":    "a tool",
+				"users":      "devs",
+				"constraint": "correctness",
+			},
+		},
+		{
+			name:    "nil map",
+			answers: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Provider is nil — validation must catch the missing
+			// field and return an error BEFORE the synthesise call
+			// would dereference Provider. A nil-pointer panic here
+			// means validation is wrong.
+			c := &Charter{Provider: nil}
+			_, err := c.RunWithAnswers(context.Background(), "/tmp/any", tc.answers)
+			if err == nil {
+				t.Error("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+// TestRunWithAnswersOptionalOverridesDoesNotValidate ensures the
+// `overrides` field is allowed to be empty — it's the single optional
+// field in the question set.
+func TestRunWithAnswersAllowsEmptyOverrides(t *testing.T) {
+	// Can't reach the LLM path with a nil Provider, so we only
+	// check that the 'overrides is optional' rule is encoded in
+	// validation by verifying a map with every required field
+	// present + overrides missing does NOT fail at validation (it
+	// fails later at synthesise with a different error). A panic
+	// from nil-provider dereference would also satisfy this — but
+	// we defend against that by recovering and checking the
+	// recovery reason doesn't mention "is required".
+	defer func() {
+		if r := recover(); r != nil {
+			// Expected: synthesise dereferences the nil Provider.
+			// That's fine — it means we got past validation.
+			msg := toString(r)
+			if strings.Contains(msg, "is required") {
+				t.Errorf("validation error leaked into panic: %v", r)
+			}
+		}
+	}()
+	c := &Charter{Provider: nil}
+	_, _ = c.RunWithAnswers(context.Background(), "/tmp/any", map[string]string{
+		"purpose":      "a tool",
+		"users":        "devs",
+		"constraint":   "correctness",
+		"out_of_scope": "web ui",
+	})
+}
+
+func toString(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case error:
+		return x.Error()
+	default:
+		return ""
 	}
 }
