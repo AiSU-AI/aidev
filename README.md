@@ -83,6 +83,10 @@ go build -o aidev ./cmd/aidev
 # Bypass the startup doctor (not recommended; use when you manage the
 # environment yourself and want to save a few hundred ms on cold start)
 ./aidev -skip-doctor -issue ... -repo ...
+
+# Run tests inside a Docker container (isolation for untrusted patches)
+./aidev test -repo ~/code/myrepo --sandbox --image golang:1.24
+./aidev test -repo ~/code/myrepo --sandbox --image node:20 --writable
 ```
 
 ## Doctor

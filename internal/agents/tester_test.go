@@ -139,3 +139,80 @@ func TestMakefileHasTarget(t *testing.T) {
 		t.Error("should not find lint target")
 	}
 }
+
+// v0.5b Docker sandbox tests.
+
+func TestWrapInDockerReadOnly(t *testing.T) {
+	got := wrapInDocker("golang:1.24", "/home/user/repo", false, []string{"go", "test", "./..."})
+	want := []string{
+		"run", "--rm",
+		"-v", "/home/user/repo:/work:ro",
+		"-w", "/work",
+		"golang:1.24",
+		"go", "test", "./...",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d args, want %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("args[%d] = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestWrapInDockerWritable(t *testing.T) {
+	got := wrapInDocker("python:3.12", "/repo", true, []string{"pytest"})
+	// The mount arg should NOT end in :ro when writable is true.
+	found := false
+	for _, a := range got {
+		if a == "/repo:/work" {
+			found = true
+		}
+		if a == "/repo:/work:ro" {
+			t.Errorf("read-only mount leaked into writable mode: %v", got)
+		}
+	}
+	if !found {
+		t.Errorf("mount arg missing from writable invocation: %v", got)
+	}
+}
+
+func TestWrapInDockerPreservesCommandArgs(t *testing.T) {
+	cmd := []string{"npm", "test", "--", "--coverage"}
+	got := wrapInDocker("node:20", "/r", false, cmd)
+	// The last len(cmd) args should be the command verbatim.
+	tail := got[len(got)-len(cmd):]
+	for i, c := range cmd {
+		if tail[i] != c {
+			t.Errorf("tail[%d] = %q, want %q", i, tail[i], c)
+		}
+	}
+}
+
+func TestSetSandboxFlipsFlags(t *testing.T) {
+	tester := &Tester{}
+	tester.SetSandbox("golang:1.24", true)
+	if !tester.Sandbox {
+		t.Error("Sandbox should be true after SetSandbox")
+	}
+	if tester.Image != "golang:1.24" {
+		t.Errorf("Image = %q", tester.Image)
+	}
+	if !tester.Writable {
+		t.Error("Writable should be true")
+	}
+}
+
+func TestRunFailsFastWhenSandboxEnabledButNoImage(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x"), 0o644)
+	tester := &Tester{Sandbox: true} // Image intentionally empty
+	_, err := tester.Run(nil, dir)
+	if err == nil {
+		t.Error("expected error when sandbox is enabled but no image is set")
+	}
+	if !strings.Contains(err.Error(), "image") {
+		t.Errorf("error should mention image, got: %v", err)
+	}
+}

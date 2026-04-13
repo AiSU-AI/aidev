@@ -14,11 +14,13 @@ import (
 	"github.com/aisu-ai/aidev/internal/llm"
 )
 
-// Tester is the v0.3b agent that runs the target repository's detected
-// test command and reports pass/fail. It never runs in a sandbox — tests
-// execute against the real working tree with the real process
-// environment, because aidev's safety story is "we propose, the human
-// applies, the tests run where the human ran git apply".
+// Tester runs the target repository's detected test command and
+// reports pass/fail. By default (v0.3b) it executes on the host with
+// the host's toolchain; with `Sandbox=true` (v0.5b) it runs the same
+// command inside a Docker container with the repo mounted read-only.
+// Sandbox mode is opt-in because it requires an image selection and a
+// docker daemon, but it's the safer path when you're about to run
+// test suites that came from someone else's patch.
 //
 // On test failure the Tester asks the medium-tier LLM for a 3-sentence
 // summary of what broke, which is attached to the TestResult. On success
@@ -30,27 +32,62 @@ type Tester struct {
 	// Timeout is the wall-clock limit for the test command. Zero means
 	// the default (5 minutes).
 	Timeout time.Duration
+
+	// Sandbox enables Docker-based isolation for test runs. When true,
+	// the detected test command is executed inside a container using
+	// the Image below, with the repository mounted at /work.
+	Sandbox bool
+
+	// Image is the Docker image reference used in sandbox mode. Users
+	// pick their own image so the toolchain matches what their project
+	// actually needs — we don't ship our own runner image.
+	Image string
+
+	// Writable mounts the repo read-write when true. Default (false)
+	// mounts read-only so a buggy test can't mutate the working tree
+	// from inside the container.
+	Writable bool
+
+	// DockerBin is the docker binary path; defaults to "docker".
+	// Exported so tests can inject a fake binary.
+	DockerBin string
 }
 
 // NewTester builds a Tester from the router's RoleTester mapping (the
 // small tier by default — failure summaries don't need deep reasoning).
+// Sandbox mode is off by default; enable it via SetSandbox().
 func NewTester(router *llm.Router) (*Tester, error) {
 	p, err := router.For(llm.RoleTester)
 	if err != nil {
 		return nil, err
 	}
-	return &Tester{Provider: p, Timeout: 5 * time.Minute}, nil
+	return &Tester{
+		Provider:  p,
+		Timeout:   5 * time.Minute,
+		DockerBin: "docker",
+	}, nil
+}
+
+// SetSandbox enables Docker isolation for subsequent Run() calls. image
+// is required — we don't guess at what runtime the user's project
+// needs. writable mounts the repo read-write; the default (false)
+// mounts read-only.
+func (t *Tester) SetSandbox(image string, writable bool) {
+	t.Sandbox = true
+	t.Image = image
+	t.Writable = writable
 }
 
 // TestResult is the output of a single Tester run.
 type TestResult struct {
-	Command  string
-	Detected string        // short label for the detection (go, node, cargo, etc.)
-	ExitCode int
-	Passed   bool
-	Output   string // tail of combined stdout+stderr, trimmed to a reasonable size
-	Duration time.Duration
-	Summary  string // LLM summary, only populated on failure
+	Command   string
+	Detected  string // short label for the detection (go, node, cargo, etc.)
+	Sandboxed bool   // true when the command ran inside a Docker container
+	ExitCode  int
+	Passed    bool
+	Output    string // tail of combined stdout+stderr, trimmed to a reasonable size
+	Duration  time.Duration
+	Summary   string // LLM summary, only populated on failure
 }
 
 // DetectTestCommand inspects the top-level files of repoRoot and returns
@@ -129,6 +166,13 @@ func (t *Tester) Run(ctx context.Context, repoRoot string) (*TestResult, error) 
 		return nil, errors.New("tester: empty repo root")
 	}
 
+	// Fail fast on sandbox misconfiguration BEFORE touching the context
+	// — a nil ctx would panic in context.WithTimeout later, and we'd
+	// rather surface a clean config error than a runtime panic.
+	if t.Sandbox && t.Image == "" {
+		return nil, errors.New("tester: sandbox enabled but no image set (call SetSandbox first)")
+	}
+
 	var cmdArgs []string
 	label := ""
 	if override := os.Getenv("AIDEV_TEST_COMMAND"); override != "" {
@@ -152,8 +196,25 @@ func (t *Tester) Run(ctx context.Context, repoRoot string) (*TestResult, error) 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Dir = repoRoot
+	// Rewrite cmdArgs + CWD into a docker invocation when sandboxing
+	// is enabled. wrapInDocker is a pure function (tested directly) so
+	// we can unit-test the command construction without a real docker
+	// daemon.
+	var cmd *exec.Cmd
+	if t.Sandbox {
+		dockerBin := t.DockerBin
+		if dockerBin == "" {
+			dockerBin = "docker"
+		}
+		dockerArgs := wrapInDocker(t.Image, repoRoot, t.Writable, cmdArgs)
+		cmd = exec.CommandContext(runCtx, dockerBin, dockerArgs...)
+		// CWD for docker itself doesn't matter — the container's CWD
+		// is set via -w /work inside wrapInDocker.
+	} else {
+		cmd = exec.CommandContext(runCtx, cmdArgs[0], cmdArgs[1:]...)
+		cmd.Dir = repoRoot
+	}
+
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -173,12 +234,13 @@ func (t *Tester) Run(ctx context.Context, repoRoot string) (*TestResult, error) 
 
 	output := tailString(buf.String(), 4096)
 	result := &TestResult{
-		Command:  strings.Join(cmdArgs, " "),
-		Detected: label,
-		ExitCode: exitCode,
-		Passed:   exitCode == 0,
-		Output:   output,
-		Duration: duration,
+		Command:   strings.Join(cmdArgs, " "),
+		Detected:  label,
+		Sandboxed: t.Sandbox,
+		ExitCode:  exitCode,
+		Passed:    exitCode == 0,
+		Output:    output,
+		Duration:  duration,
 	}
 
 	if !result.Passed {
@@ -229,4 +291,25 @@ func tailString(s string, n int) string {
 		return s
 	}
 	return "...[truncated]...\n" + s[len(s)-n:]
+}
+
+// wrapInDocker rewrites a host-native test command into a
+// `docker run --rm -v <repo>:/work[:ro] -w /work <image> <cmd...>`
+// invocation. Pure function — exported so tests can exercise every
+// branch without a real docker daemon.
+//
+// The container runs with `--rm` so it's cleaned up after the test
+// exits. The repository mounts at `/work` inside the container; `-w
+// /work` sets that as the working directory. Read-only by default;
+// pass writable=true to allow tests that legitimately mutate the
+// working tree (generated files, coverage output, etc.).
+func wrapInDocker(image, repoRoot string, writable bool, cmd []string) []string {
+	args := []string{"run", "--rm"}
+	mount := repoRoot + ":/work"
+	if !writable {
+		mount += ":ro"
+	}
+	args = append(args, "-v", mount, "-w", "/work", image)
+	args = append(args, cmd...)
+	return args
 }
