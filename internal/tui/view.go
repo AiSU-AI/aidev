@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -28,14 +27,16 @@ var (
 			Padding(0, 1)
 )
 
-// View renders the full TUI: three panes side-by-side (issue | scout | critic),
-// a title at the top and a status line at the bottom.
+// View renders the full TUI: three panes side-by-side (issue | scout | critic/sketches),
+// a title at the top and a status line at the bottom. The rightmost pane
+// retitles itself from "Critic report" to "Architect sketches" once the
+// Architect has produced output.
 func (m Model) View() string {
 	if !m.ready {
 		return "initialising aidev TUI..."
 	}
 
-	header := title.Render("aidev — Scout + Critic (v0.1)")
+	header := title.Render("aidev — Scout + Critic + Architect (v0.2a)")
 
 	panel := func(name string, vp string, focused bool) string {
 		style := borderInactive
@@ -50,7 +51,11 @@ func (m Model) View() string {
 
 	issuePanel := panel("Issue", m.issueVP.View(), m.focus == paneIssue)
 	scoutPanel := panel("Scout brief", m.scoutVP.View(), m.focus == paneScout)
-	criticPanel := panel("Critic report", m.criticVP.View(), m.focus == paneCritic)
+	rightTitle := "Critic report"
+	if m.showingSketches {
+		rightTitle = "Architect sketches"
+	}
+	criticPanel := panel(rightTitle, m.criticVP.View(), m.focus == paneCritic)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, issuePanel, scoutPanel, criticPanel)
 
@@ -72,5 +77,5 @@ func (m Model) View() string {
 }
 
 func helpHint() string {
-	return fmt.Sprintf("tab: cycle panes   r: run pipeline   a: approve   k: kill   q: quit")
+	return "tab: cycle panes   r: run   a: approve → Architect   k: kill   q: quit"
 }
