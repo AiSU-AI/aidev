@@ -4,27 +4,29 @@ argument-hint: <issue-url> <repo-path>
 allowed-tools: Bash(aidev:*)
 ---
 
-You are driving `aidev`, the multi-agent coding tool. The user has
-invoked this slash command with arguments naming a GitHub issue and a
-local repository path.
+You are driving `aidev`, the multi-agent coding tool. The user invoked
+this slash command expecting two arguments in `$ARGUMENTS`: a GitHub
+issue URL and a local repository path.
 
-If `$ARGUMENTS` is empty or does not contain two whitespace-separated
-tokens, STOP and ask the user for:
-  1. the GitHub issue URL (https://github.com/owner/repo/issues/N)
-  2. the absolute or relative path to the local repository
+The `!` command below uses `set --` to split `$ARGUMENTS` into shell
+positional parameters, then guards on both being non-empty. If either
+is missing, it prints a usage line instead of calling aidev with a
+broken flag.
 
-Do not attempt to run aidev without both values — a missing value will
-blow up inside the tool with a noisy error.
+!`set -- $ARGUMENTS; if [ -n "$1" ] && [ -n "$2" ]; then aidev -headless -auto -sketch 1 -issue "$1" -repo "$2"; else echo "usage: /aidev-run <issue-url> <repo-path>"; fi`
 
-When you have both, run aidev in headless mode with auto-architect and
-sketch 1 picked:
+If the shell above printed a usage line, ask the user for the missing
+values and tell them to re-invoke
+`/aidev-run <issue-url> <repo-path>`. Do NOT try to re-run the command
+yourself with guessed arguments — the user decides which issue to
+work on.
 
-!`aidev -headless -auto -sketch 1 -issue $1 -repo $2`
-
-After the command finishes, summarise the output for the user:
+Otherwise, the full pipeline has run. Summarise the output for the
+user:
   - what the Critic recommended
   - how many sketches the Architect produced
-  - whether the Implementer wrote a patch at `$2/.aidev/proposed.patch`
+  - whether the Implementer wrote a patch at
+    `<repo>/.aidev/proposed.patch`
   - any warnings from the doctor
 
 If the Critic recommended `kill` or `defer`, stop and report the
