@@ -358,12 +358,16 @@ func runReviewSubcommand() {
 }
 
 // runTestSubcommand handles `aidev test`. It detects the project's
-// test runner, executes it against the working tree, and prints the
-// result with an LLM-generated failure summary on non-zero exit.
+// test runner, executes it against the working tree (or inside a
+// Docker container if --sandbox is passed), and prints the result with
+// an LLM-generated failure summary on non-zero exit.
 func runTestSubcommand() {
 	var (
 		repoPath  = flag.String("repo", ".", "Path to the target repository")
 		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		sandbox   = flag.Bool("sandbox", false, "Run tests inside a Docker container instead of on the host")
+		image     = flag.String("image", "", "Docker image to use with --sandbox (e.g. golang:1.24, node:20, python:3.12)")
+		writable  = flag.Bool("writable", false, "Mount the repo read-write instead of read-only (sandbox mode)")
 	)
 	flag.Parse()
 
@@ -376,12 +380,30 @@ func runTestSubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("tester: %v", err))
 	}
+
+	if *sandbox {
+		if *image == "" {
+			fatal("--sandbox requires --image (e.g. --image golang:1.24)")
+		}
+		tester.SetSandbox(*image, *writable)
+	}
+
 	absRepo, err := filepath.Abs(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
 	}
 
-	fmt.Fprintf(os.Stderr, "aidev test: detecting test runner in %s...\n", absRepo)
+	if *sandbox {
+		fmt.Fprintf(os.Stderr, "aidev test: running in sandbox (image %s, %s mount)...\n",
+			*image, func() string {
+				if *writable {
+					return "rw"
+				}
+				return "ro"
+			}())
+	} else {
+		fmt.Fprintf(os.Stderr, "aidev test: detecting test runner in %s...\n", absRepo)
+	}
 	result, err := tester.Run(context.Background(), absRepo)
 	if err != nil {
 		fatal(fmt.Sprintf("test: %v", err))
@@ -389,6 +411,7 @@ func runTestSubcommand() {
 
 	fmt.Printf("command: %s\n", result.Command)
 	fmt.Printf("detected: %s\n", result.Detected)
+	fmt.Printf("sandboxed: %t\n", result.Sandboxed)
 	fmt.Printf("exit: %d\n", result.ExitCode)
 	fmt.Printf("duration: %s\n", result.Duration)
 	fmt.Printf("passed: %t\n\n", result.Passed)
