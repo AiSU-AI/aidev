@@ -1,0 +1,53 @@
+# Model tier configuration for aidev.
+#
+# aidev routes each agent role to a model tier. Small tiers run locally
+# via Ollama; medium and large tiers default to the Claude Code CLI so
+# any user with a Max/Pro subscription gets deep-reasoning agents
+# (Critic, Architect, Charter, Reviewer) at no extra per-token cost.
+#
+# Alternatives you can swap in:
+#
+#   provider: anthropic   # direct REST API, requires ANTHROPIC_API_KEY
+#   provider: ollama      # fully local, no cloud calls
+#   provider: claude-cli  # (default) shells out to `claude --print`
+#
+# Override endpoint/model via environment variables:
+#   AIDEV_OLLAMA_URL    override ollama endpoint (default http://localhost:11434)
+#   ANTHROPIC_API_KEY   required when any tier uses provider: anthropic
+#
+# The claude-cli provider uses whichever model your Claude Code
+# subscription defaults to when `model` is empty. Set `model` to an
+# explicit name (e.g. claude-opus-4-6) to pin it.
+
+tiers:
+  small:
+    provider: ollama
+    model: qwen2.5-coder:7b
+    endpoint: http://localhost:11434
+    max_tokens: 2048
+    temperature: 0.2
+
+  medium:
+    provider: claude-cli
+    model: ""
+    max_tokens: 4096
+    temperature: 0.2
+
+  large:
+    provider: claude-cli
+    model: ""
+    max_tokens: 8192
+    temperature: 0.3
+
+# Role -> tier routing. Roles that need deep reasoning (critic,
+# architect, charter, reviewer) use the large tier. Implementer uses
+# medium. Scout and tester are routed to the small local tier for speed
+# and cost.
+routing:
+  scout: small
+  critic: large
+  architect: large
+  charter: large
+  implementer: medium
+  reviewer: medium
+  tester: small
