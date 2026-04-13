@@ -28,6 +28,8 @@ type Snapshot struct {
 	ArchitectureDoc string // ARCHITECTURE.md if present
 	CharterPath     string // .aidev/charter.md if present
 	CharterContent  string // contents of CharterPath
+	ClarifierPath   string // .aidev/clarifier.md if present
+	ClarifierContent string // contents of ClarifierPath
 	PrinciplesPath  string // .aidev/principles.yaml if present
 	TotalFiles      int
 }
@@ -116,6 +118,12 @@ func Scan(root string) (*Snapshot, error) {
 		snap.CharterPath = p
 		if data, err := os.ReadFile(p); err == nil {
 			snap.CharterContent = string(data)
+		}
+	}
+	if p := pickFirst(".aidev/clarifier.md"); p != "" {
+		snap.ClarifierPath = p
+		if data, err := os.ReadFile(p); err == nil {
+			snap.ClarifierContent = string(data)
 		}
 	}
 	if p := pickFirst(".aidev/principles.yaml", "config/principles.yaml"); p != "" {

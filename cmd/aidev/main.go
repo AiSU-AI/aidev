@@ -16,15 +16,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"strings"
 
 	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/config"
@@ -79,6 +79,16 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "followups" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runFollowUpsSubcommand()
+		return
+	}
+	// Intercept the `clarify` subcommand. Runs the Clarifier agent
+	// against an issue + fresh Critic report, walks the resulting
+	// question graph in dependency-aware waves, and writes the
+	// session to .aidev/clarifier.md for the Architect to absorb on
+	// its next run.
+	if len(os.Args) > 1 && os.Args[1] == "clarify" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runClarifySubcommand()
 		return
 	}
 
@@ -165,6 +175,101 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
 	}
+}
+
+// runClarifySubcommand handles `aidev clarify`. It runs the full
+// Scout + Critic pipeline so the Clarifier has context to work from,
+// then asks the Clarifier to produce a structured question graph,
+// then walks the graph in dependency-aware waves with stdin-based
+// answers from the developer, and finally persists the session to
+// `<repo>/.aidev/clarifier.md`.
+//
+// Unlike the full `aidev -issue ...` flow this subcommand does NOT
+// run the Architect afterwards — it's a standalone interview you run
+// BEFORE the Architect when the Critic flagged ambiguities.
+func runClarifySubcommand() {
+	var (
+		issueURL  = flag.String("issue", "", "GitHub issue URL (required)")
+		repoPath  = flag.String("repo", ".", "Path to the target repository")
+		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+	)
+	flag.Parse()
+	if *issueURL == "" {
+		fatal("missing required flag: -issue")
+	}
+
+	cfg := mustLoadConfig(*configDir)
+	orch, err := orchestrator.New(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("orchestrator: %v", err))
+	}
+	ctx := context.Background()
+	if err := orch.LoadIssue(ctx, *issueURL); err != nil {
+		fatal(fmt.Sprintf("load issue: %v", err))
+	}
+	absRepo, err := filepath.Abs(*repoPath)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+	if err := orch.LoadRepo(absRepo); err != nil {
+		fatal(fmt.Sprintf("scan repo: %v", err))
+	}
+
+	// Run the first-pass pipeline so the agent context has a fresh
+	// Scout brief + Critic report to hand to the Clarifier.
+	fmt.Fprintln(os.Stderr, "aidev clarify: running scout + critic to gather context...")
+	for ev := range orch.Run(ctx) {
+		if ev.Err != nil {
+			fatal(ev.Err.Error())
+		}
+	}
+
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("router: %v", err))
+	}
+	clarifier, err := agents.NewClarifier(router)
+	if err != nil {
+		fatal(fmt.Sprintf("clarifier: %v", err))
+	}
+
+	fmt.Fprintln(os.Stderr, "aidev clarify: asking the Clarifier to produce a question graph...")
+	graph, err := clarifier.Run(ctx, orch.AgentContext())
+	if err != nil {
+		fatal(fmt.Sprintf("clarifier: %v", err))
+	}
+	if len(graph.Questions) == 0 {
+		fmt.Fprintln(os.Stderr, "Clarifier produced no questions — the Critic report has nothing ambiguous worth asking about. Skipping the interview.")
+		return
+	}
+
+	// Walk the graph in waves.
+	waves := agents.BatchByDependencies(graph)
+	var answers []agents.Answer
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Fprintf(os.Stderr, "\n%d questions in %d wave(s). Answer each one, then press enter.\n\n", len(graph.Questions), len(waves))
+	for wi, wave := range waves {
+		fmt.Fprintf(os.Stderr, "— Wave %d (%d question(s)) —\n\n", wi+1, len(wave))
+		for _, q := range wave {
+			fmt.Fprintf(os.Stderr, "%s: %s\n> ", q.ID, q.Text)
+			line, err := reader.ReadString('\n')
+			if err != nil && line == "" {
+				fatal(fmt.Sprintf("read answer: %v", err))
+			}
+			answers = append(answers, agents.Answer{
+				ID:   q.ID,
+				Text: strings.TrimRight(line, "\n"),
+			})
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+
+	path, err := agents.WriteClarifierMarkdown(absRepo, graph, answers)
+	if err != nil {
+		fatal(fmt.Sprintf("write clarifier: %v", err))
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
 }
 
 // runFollowUpsSubcommand handles `aidev followups`. With --file-issues,

@@ -71,6 +71,11 @@ func (s *Scout) Run(ctx context.Context, c *Context) (string, error) {
 		b.WriteString(truncate(snap.CharterContent, 4096))
 		b.WriteString("\n\n")
 	}
+	if snap.ClarifierContent != "" {
+		b.WriteString("## .aidev/clarifier.md (recent clarifier session — human decisions on ambiguous points)\n\n")
+		b.WriteString(truncate(snap.ClarifierContent, 4096))
+		b.WriteString("\n\n")
+	}
 
 	system := `You are the Scout for aidev, a multi-agent coding tool.
 Your job is to produce a FACTUAL, concise brief of the repository a developer
