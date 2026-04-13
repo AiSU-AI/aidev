@@ -29,6 +29,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/doctor"
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
+	"github.com/aisu-ai/aidev/internal/plugin"
 	"github.com/aisu-ai/aidev/internal/tui"
 )
 
@@ -60,6 +61,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "review" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runReviewSubcommand()
+		return
+	}
+	// Intercept the `plugin` subcommand. Installs/uninstalls aidev's
+	// slash commands into the user's Claude Code config directory.
+	if len(os.Args) > 1 && os.Args[1] == "plugin" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runPluginSubcommand()
 		return
 	}
 
@@ -145,6 +153,64 @@ func main() {
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
+	}
+}
+
+// runPluginSubcommand handles `aidev plugin install | uninstall`.
+// Install copies aidev's slash commands into the user's Claude Code
+// commands directory (~/.claude/commands by default, overridable via
+// CLAUDE_CONFIG_DIR). Existing files are preserved unless --force is
+// passed. Uninstall removes files whose content matches the shipped
+// version, preserving any files the user edited locally.
+func runPluginSubcommand() {
+	if len(os.Args) < 2 {
+		fatal("usage: aidev plugin install|uninstall [--force] [--dir <path>]")
+	}
+	action := os.Args[1]
+	os.Args = append(os.Args[:1], os.Args[2:]...)
+
+	var (
+		force = flag.Bool("force", false, "Overwrite existing files on install")
+		dir   = flag.String("dir", "", "Target directory (default: ~/.claude/commands)")
+	)
+	flag.Parse()
+
+	target := *dir
+	if target == "" {
+		resolved, err := plugin.DefaultCommandsDir()
+		if err != nil {
+			fatal(fmt.Sprintf("plugin: %v", err))
+		}
+		target = resolved
+	}
+
+	switch action {
+	case "install":
+		written, skipped, err := plugin.Install(target, *force)
+		if err != nil {
+			fatal(fmt.Sprintf("plugin install: %v", err))
+		}
+		for _, p := range written {
+			fmt.Fprintf(os.Stderr, "installed: %s\n", p)
+		}
+		for _, p := range skipped {
+			fmt.Fprintf(os.Stderr, "skipped (exists): %s\n", p)
+		}
+		fmt.Fprintf(os.Stderr, "\n%d installed, %d skipped\n", len(written), len(skipped))
+		if len(skipped) > 0 {
+			fmt.Fprintln(os.Stderr, "pass --force to overwrite skipped files")
+		}
+	case "uninstall":
+		removed, err := plugin.Uninstall(target)
+		if err != nil {
+			fatal(fmt.Sprintf("plugin uninstall: %v", err))
+		}
+		for _, p := range removed {
+			fmt.Fprintf(os.Stderr, "removed: %s\n", p)
+		}
+		fmt.Fprintf(os.Stderr, "\n%d removed (locally-modified files preserved)\n", len(removed))
+	default:
+		fatal(fmt.Sprintf("plugin: unknown action %q (use install or uninstall)", action))
 	}
 }
 

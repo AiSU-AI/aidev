@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.4 — Scout + Critic + Architect + Charter + Implementer + Tester + Reviewer + `aidev doctor` + automatic GitHub audit trail. Full agent pipeline shipped.
+> **Status:** v0.2d — Full agent pipeline (Scout + Critic + Architect + Charter + Implementer + Tester + Reviewer) + `aidev doctor` + automatic GitHub audit trail + Claude Code CLI provider as the default backend + one-command Claude Code plugin install.
 
 ## Why
 
@@ -28,9 +28,32 @@ Model routing is declarative (`config/models.yaml`): each role is mapped to a na
 ## Requirements
 
 - Go 1.24+
-- For the small tier: a local [Ollama](https://ollama.com) daemon with a coder model pulled (e.g. `ollama pull qwen2.5-coder:7b`).
-- For the large tier: `ANTHROPIC_API_KEY` in the environment.
-- `GITHUB_TOKEN` in the environment for private issues (public issues work without it, but rate limits are tighter).
+- **For the medium and large tiers (default):** [Claude Code](https://claude.ai/download) installed and authenticated (`claude /login`). aidev routes Critic/Architect/Charter/Implementer/Reviewer through `claude --print`, so agent calls bill against your Max/Pro subscription. No `ANTHROPIC_API_KEY` required.
+- **For the small tier:** a local [Ollama](https://ollama.com) daemon with a coder model pulled (e.g. `ollama pull qwen2.5-coder:7b`). Used for the Scout and Tester. Optional — you can route these to the large tier by editing `config/models.yaml`.
+- `GITHUB_TOKEN` in the environment for private issues and for the controller's audit trail (Issues: Read and write scope).
+- **Alternative to Claude Code CLI:** if you prefer the direct REST API, edit `config/models.yaml` to set `provider: anthropic` on the medium/large tiers and export `ANTHROPIC_API_KEY`.
+
+## Claude Code plugin (install once, use from inside any Claude Code session)
+
+aidev ships a set of slash commands that integrate directly into Claude Code. Install them with one command:
+
+```sh
+aidev plugin install
+```
+
+This copies five commands into `~/.claude/commands/` (or `$CLAUDE_CONFIG_DIR/commands/` if set), without overwriting any existing files:
+
+| Slash command | Effect |
+|---|---|
+| `/aidev-run <issue-url> <repo-path>` | Full headless pipeline: scout → critic → (auto) architect → (sketch 1) implementer, writes `.aidev/proposed.patch` |
+| `/aidev-doctor` | Environment audit (config, keys, CLI, Ollama) |
+| `/aidev-charter <repo-path>` | 5-question interview, writes `.aidev/charter.md` |
+| `/aidev-test <repo-path>` | Detect and run the project's test suite |
+| `/aidev-review <issue-url> <repo-path>` | Boy Scout pass on `.aidev/proposed.patch` with blockers + follow-up proposals |
+
+Pass `--force` to overwrite existing commands. Uninstall with `aidev plugin uninstall` (locally-modified files are always preserved — the uninstaller only removes files whose content matches the shipped version).
+
+After install, type `/` in any Claude Code session and you'll see the new commands listed alongside your existing ones.
 
 ## Build & run
 
@@ -197,7 +220,8 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 - **v0.2c** — Charter agent + `aidev charter` subcommand + `.aidev/charter.md` + Scout + Critic integration. *(shipped)*
 - **v0.3a** — Implementer agent: produces a unified git diff from a chosen sketch. *(shipped)*
 - **v0.3b** — Tester agent: detects the project's test runner, executes it, and summarises failures. *(shipped)*
-- **v0.4** *(this release)* — Reviewer agent: Boy Scout pass on a patch with blockers/suggestions/follow-up issue proposals. New `aidev review` subcommand. Full agent pipeline is now complete.
+- **v0.4** — Reviewer agent: Boy Scout pass on a patch with blockers/suggestions/follow-up issue proposals. New `aidev review` subcommand. Full agent pipeline complete. *(shipped)*
+- **v0.2d** *(this release)* — Claude Code CLI provider as the default backend for medium and large tiers (works out of the box with a Max/Pro subscription, no API key required), plus `aidev plugin install` for Claude Code slash-command integration.
 - **v0.5+** — Adaptive dialogue (dependency-aware question graphs), auto-filing of follow-up issues via `aidev followups --file-issues`, sandboxing for the Tester, streaming LLM responses in the TUI, two-turn Implementer file-content loading.
 - **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
 - **v0.5** — Streaming LLM responses in the TUI.
@@ -213,6 +237,8 @@ internal/repo/          Repo scanner + repo-local principle loader
 internal/agents/        Scout, Critic, Architect agents (shared Context, pure)
 internal/orchestrator/  State machine + Reporter interface + GitHubReporter (controller)
 internal/tui/           Bubble Tea model, update, view, keybindings
-internal/doctor/        Precondition checks: config, keys, Ollama daemon/models
+internal/doctor/        Precondition checks: config, keys, claude CLI, Ollama daemon/models
+internal/plugin/        Claude Code slash command installer (embedded files)
+plugin/aidev/           Slash command source (also embedded in the binary)
 config/                 Shipped defaults: models.yaml, principles.yaml
 ```

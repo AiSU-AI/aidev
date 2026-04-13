@@ -39,6 +39,8 @@ func buildProvider(t config.Tier) (Provider, error) {
 		return NewOllama(t.Endpoint, t.Model, t.MaxTokens, t.Temperature), nil
 	case "anthropic":
 		return NewClaude(t.Model, t.MaxTokens, t.Temperature), nil
+	case "claude-cli":
+		return NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature), nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", t.Provider)
 	}
