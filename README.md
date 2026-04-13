@@ -3,7 +3,9 @@
 > A local multi-agent coding assistant that **argues with you before it writes code**. Built in Go. Works with your Claude Max/Pro subscription — no API key required.
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash
+gh repo clone AiSU-AI/aidev ~/code/personal/aidev   # or git clone with SSH
+cd ~/code/personal/aidev
+./install.sh
 ```
 
 Then, from inside any Claude Code session:
@@ -42,42 +44,54 @@ The rest of the pipeline is designed around the same principle: **propose, never
 
 ## Install
 
-### The easy way (no Go required)
+`AiSU-AI/aidev` is currently a private repo, so the canonical install path is **clone + `./install.sh`**. You'll need Go 1.24+ on your machine for the from-source build.
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash
-```
-
-The installer detects your OS/arch, downloads the right prebuilt binary from the latest GitHub release, installs it to `~/.local/bin/aidev`, drops default config at `~/.config/aidev/`, and installs slash commands for Claude Code at `~/.claude/commands/aidev-*.md`.
-
-### From source
-
-```sh
-git clone https://github.com/AiSU-AI/aidev.git
-cd aidev
+gh repo clone AiSU-AI/aidev ~/code/personal/aidev    # or: git clone git@github.com:AiSU-AI/aidev.git ~/code/personal/aidev
+cd ~/code/personal/aidev
 ./install.sh
 ```
 
-Auto-detects that you have Go and builds from the checkout. Same end state as the download path.
+The installer:
 
-### Other flags
+1. Builds the binary with `go build`
+2. Copies it to `~/.local/bin/aidev` (or `~/bin` or `/usr/local/bin`, first writable dir on PATH)
+3. Writes default config to `~/.config/aidev/{models,principles}.yaml`
+4. Installs Claude Code slash commands to `~/.claude/commands/aidev-*.md`
+5. Runs `aidev doctor` to smoke-test the environment
+6. Prints next steps
+
+If the install dir isn't on your PATH already, the script will tell you the exact `export PATH=...` line to add to `~/.zshrc` or `~/.bashrc`.
+
+### Flags
 
 ```sh
 ./install.sh --bin ~/bin        # override target bin directory
-./install.sh --from-release     # force download mode even if Go is installed
-./install.sh --from-source      # force build mode
-./install.sh --version v0.2f    # pin a specific release
+./install.sh --from-source      # force build mode (the default when Go is present)
+./install.sh --from-release     # download from a GitHub release (requires the repo to be public OR GITHUB_TOKEN with contents:read access)
+./install.sh --version v0.2f    # pin a specific release tag (release mode only)
 ./install.sh --force            # overwrite existing binary/config/plugin files
 ./install.sh --no-doctor        # skip the post-install smoke test
 ./install.sh --no-prereqs       # skip the 'suggest installing ollama' check
 ```
 
+### Future: one-line install via release binaries
+
+The install script has a release-download mode that would let anyone run:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash
+```
+
+without cloning the repo or having Go installed. That flow only works when `AiSU-AI/aidev` is public or when the user has a `GITHUB_TOKEN` with read access. The `v*` tag → GitHub Actions → release-asset pipeline is in place (`.github/workflows/release.yaml`); once the repo goes public, the `curl | bash` one-liner becomes the canonical install path and replaces the clone-first flow above.
+
 ### Requirements
 
 - **macOS or Linux.** Windows is not supported yet — the TUI has POSIX-isms.
+- **Go 1.24+** to build from source. Install from https://go.dev/dl/.
 - **[Claude Code](https://claude.ai/download)** installed and logged in (`claude /login`). aidev's medium and large tiers route through `claude --print`, so agent calls bill against your Max/Pro subscription. No `ANTHROPIC_API_KEY` required for the default config.
 - **[Ollama](https://ollama.com)** for the small tier (Scout, Tester failure summary). Optional — you can route the small tier through the claude CLI too by editing `config/models.yaml`, at the cost of subscription tokens.
-- **`GITHUB_TOKEN`** in your environment for reading private issues and posting the audit trail (`Issues: Read and write` scope).
+- **`GITHUB_TOKEN`** in your environment for reading private issues and posting the audit trail (`Issues: Read and write` scope). The same token is also used for `git push` if your repo access is HTTPS-based.
 
 Run `aidev doctor` at any point to verify the environment. If Ollama is installed but not running, doctor will spawn `ollama serve` in the background automatically.
 
