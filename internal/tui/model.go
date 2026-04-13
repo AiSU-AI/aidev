@@ -16,14 +16,15 @@ import (
 
 // pane identifies the currently focused viewport so Tab can cycle between
 // them. The third pane doubles as the critic pane in the first half of the
-// pipeline and the sketches pane in the second half — toggled by
-// Model.showingSketches.
+// pipeline and the "current output" pane later — it retitles and rewrites
+// its content as each downstream phase (critic → architect → implementer →
+// tester → reviewer) produces new output.
 type pane int
 
 const (
 	paneIssue pane = iota
 	paneScout
-	paneCritic
+	paneOutput
 	numPanes
 )
 
@@ -33,13 +34,19 @@ const (
 type phase int
 
 const (
-	phaseIdle       phase = iota // waiting for user to press 'r'
-	phaseRunning                 // scout or critic is mid-flight
-	phaseAwaitUser               // critic done, waiting for a/k
-	phaseArchitect               // architect is mid-flight
-	phaseSketches                // sketches ready for review
-	phaseKilled                  // user killed the proposal
-	phaseErrored                 // something broke
+	phaseIdle        phase = iota // waiting for user to press 'r'
+	phaseRunning                  // scout or critic is mid-flight
+	phaseAwaitUser                // critic done, waiting for a/k
+	phaseArchitect                // architect is mid-flight
+	phaseSketches                 // sketches ready for review — 1-9 to pick one
+	phaseImplementing             // implementer mid-flight
+	phasePatchReady               // patch ready — t to test, v to review
+	phaseTesting                  // tester mid-flight
+	phaseTestsDone                // tests passed or failed — v to review
+	phaseReviewing                // reviewer mid-flight
+	phaseReviewDone               // review complete — q to finish
+	phaseKilled                   // user killed the proposal
+	phaseErrored                  // something broke
 )
 
 // Model is the root Bubble Tea model.
@@ -50,7 +57,7 @@ type Model struct {
 
 	issueVP  viewport.Model
 	scoutVP  viewport.Model
-	criticVP viewport.Model
+	outputVP viewport.Model
 
 	focus   pane
 	keys    keyMap
@@ -63,12 +70,14 @@ type Model struct {
 	// phase caches the high-level TUI state so view() can branch without
 	// reaching into the orchestrator on every render.
 	phase phase
-	// showingSketches flips the criticVP label from "Critic report" to
-	// "Architect sketches" once the Architect has produced output.
-	showingSketches bool
+
+	// outputTitle is the current label on the rightmost pane. It flips
+	// through "Critic report" → "Architect sketches" → "Implementer
+	// patch" → "Test result" → "Review" as the pipeline advances.
+	outputTitle string
 
 	// events is the current active event stream; only one phase drives it
-	// at a time (either Run or Continue).
+	// at a time (Run, Continue, Implement, Test, or ReviewPatch).
 	events <-chan orchestrator.Event
 }
 
@@ -76,12 +85,13 @@ type Model struct {
 func New(o *orchestrator.Orchestrator, issueURL, repoRoot string) Model {
 	preview := o.CostPreview()
 	return Model{
-		orch:     o,
-		issueURL: issueURL,
-		repoRoot: repoRoot,
-		keys:     defaultKeys(),
-		phase:    phaseIdle,
-		status: formatIdleStatus(preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds),
+		orch:        o,
+		issueURL:    issueURL,
+		repoRoot:    repoRoot,
+		keys:        defaultKeys(),
+		phase:       phaseIdle,
+		outputTitle: "Critic report",
+		status:      formatIdleStatus(preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds),
 	}
 }
 
@@ -104,6 +114,34 @@ func (m *Model) runPipelineCmd() tea.Cmd {
 func (m *Model) continuePipelineCmd() tea.Cmd {
 	m.events = m.orch.Continue(context.Background())
 	m.phase = phaseArchitect
+	return waitForEvent(m.events)
+}
+
+// implementCmd kicks off the Implementer on the given sketch number.
+func (m *Model) implementCmd(n int) tea.Cmd {
+	m.events = m.orch.Implement(context.Background(), n)
+	m.phase = phaseImplementing
+	return waitForEvent(m.events)
+}
+
+// testCmd kicks off the Tester against the currently-loaded repo.
+func (m *Model) testCmd() tea.Cmd {
+	m.events = m.orch.Test(context.Background())
+	m.phase = phaseTesting
+	return waitForEvent(m.events)
+}
+
+// reviewCmd kicks off the Reviewer against the current patch.
+func (m *Model) reviewCmd() tea.Cmd {
+	patch := ""
+	if p := m.orch.Patch(); p != nil {
+		patch = p.Diff
+	}
+	if patch == "" {
+		return nil
+	}
+	m.events = m.orch.ReviewPatch(context.Background(), patch)
+	m.phase = phaseReviewing
 	return waitForEvent(m.events)
 }
 

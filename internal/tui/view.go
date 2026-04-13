@@ -51,13 +51,13 @@ func (m Model) View() string {
 
 	issuePanel := panel("Issue", m.issueVP.View(), m.focus == paneIssue)
 	scoutPanel := panel("Scout brief", m.scoutVP.View(), m.focus == paneScout)
-	rightTitle := "Critic report"
-	if m.showingSketches {
-		rightTitle = "Architect sketches"
+	rightTitle := m.outputTitle
+	if rightTitle == "" {
+		rightTitle = "Critic report"
 	}
-	criticPanel := panel(rightTitle, m.criticVP.View(), m.focus == paneCritic)
+	outputPanel := panel(rightTitle, m.outputVP.View(), m.focus == paneOutput)
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top, issuePanel, scoutPanel, criticPanel)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, issuePanel, scoutPanel, outputPanel)
 
 	var footer string
 	if m.lastErr != nil {
@@ -77,5 +77,5 @@ func (m Model) View() string {
 }
 
 func helpHint() string {
-	return "tab: cycle panes   r: run   a: approve → Architect   k: kill   q: quit"
+	return "tab: cycle   r: run   a: approve→Architect   1-9: pick sketch→Implementer   t: test   v: review   k: kill   q: quit"
 }

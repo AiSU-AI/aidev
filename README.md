@@ -161,6 +161,9 @@ A single `aidev:<phase>` label on the issue gives you a kanban-style view of eve
 |-----|--------|
 | `r` | Run Scout + Critic |
 | `a` | After Critic: approve → kick off Architect |
+| `1`–`9` | After Sketches: pick a sketch → kick off Implementer |
+| `t` | After Patch/Tests: run the detected test suite |
+| `v` | After Patch/Tests: run the Reviewer on the patch |
 | `k` | Kill the proposal |
 | `tab` | Cycle pane focus |
 | `q` / `ctrl+c` | Quit |
