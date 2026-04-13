@@ -1,0 +1,74 @@
+# release.yaml — build and upload cross-platform aidev binaries when a
+# version tag is pushed.
+#
+# Trigger: push a tag matching `v*` (e.g. v0.2f, v1.0.0).
+#
+# For each target platform, builds a statically-linked binary, archives
+# it as a tar.gz, and attaches it to the GitHub Release created by the
+# tag. The install script downloads the right archive based on the
+# user's detected OS/arch.
+#
+# Targets:
+#   darwin-arm64   — Apple Silicon Macs
+#   darwin-amd64   — Intel Macs
+#   linux-amd64    — most Linux x86_64 servers + most WSL2
+#   linux-arm64    — Linux on ARM (Raspberry Pi, AWS Graviton, etc.)
+
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create releases and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          BIN="aidev"
+          OUT_DIR="dist/aidev-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p "${OUT_DIR}"
+          go build \
+            -ldflags "-s -w -X github.com/aisu-ai/aidev/internal/version.Version=${VERSION}" \
+            -o "${OUT_DIR}/${BIN}" \
+            ./cmd/aidev
+          cp README.md LICENSE 2>/dev/null || true
+          cp README.md "${OUT_DIR}/" 2>/dev/null || true
+          tar -C dist -czf "dist/aidev-${VERSION}-${GOOS}-${GOARCH}.tar.gz" \
+            "aidev-${VERSION}-${GOOS}-${GOARCH}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/aidev-*-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

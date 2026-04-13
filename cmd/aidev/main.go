@@ -35,9 +35,19 @@ import (
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/plugin"
 	"github.com/aisu-ai/aidev/internal/tui"
+	"github.com/aisu-ai/aidev/internal/version"
 )
 
 func main() {
+	// --version / -V is a zero-dependency query, cheap to handle
+	// before any flag parsing or subcommand dispatch.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-V", "version":
+			fmt.Printf("aidev %s\n", version.Version)
+			return
+		}
+	}
 	// Intercept the `doctor` subcommand before flag parsing so it can
 	// share the normal config discovery but not require -issue/-repo.
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
