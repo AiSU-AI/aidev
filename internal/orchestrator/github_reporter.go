@@ -110,17 +110,13 @@ func (r *GitHubReporter) OnEvent(ctx context.Context, ev Event) error {
 	case StateImplementing:
 		return r.transition(ctx, "implementing", "🔨 Implementer generating patch...", ev.Message)
 	case StatePatchReady:
-		// Post the patch as a one-shot artifact so reviewers on the
-		// issue can see what aidev proposed without pulling the repo.
-		// The patch body is wrapped in a code fence so GitHub renders
-		// it with diff highlighting.
-		if agCtx := contextFromEvent(ev); agCtx != nil {
-			// Access the patch through a helper on the reporter so we
-			// don't need a back-reference to the orchestrator. We post
-			// the diff via a separate method which reads the event
-			// message as the summary line.
-		}
 		return r.transition(ctx, "patch-ready", "✅ Patch ready — review and apply", ev.Message)
+	case StateTesting:
+		return r.transition(ctx, "testing", "🧪 Running tests...", ev.Message)
+	case StateTestsPassed:
+		return r.transition(ctx, "tests-passed", "✅ Tests passed", ev.Message)
+	case StateTestsFailed:
+		return r.transition(ctx, "tests-failed", "❌ Tests failed", ev.Message)
 	case StateKilled:
 		return r.transition(ctx, "killed", "🛑 Killed", ev.Message)
 	case StateError:
