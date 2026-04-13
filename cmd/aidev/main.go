@@ -27,6 +27,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/config"
 	"github.com/aisu-ai/aidev/internal/doctor"
+	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/tui"
 )
@@ -37,6 +38,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runDoctorSubcommand()
+		return
+	}
+	// Intercept the `charter` subcommand. Interactive interview that
+	// writes .aidev/charter.md to a target repo.
+	if len(os.Args) > 1 && os.Args[1] == "charter" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runCharterSubcommand()
 		return
 	}
 
@@ -92,6 +100,15 @@ func main() {
 		fatal(fmt.Sprintf("scan repo: %v", err))
 	}
 
+	// Nudge the user if the repo has no strong signal for the Critic to
+	// anchor against. The Critic will still run (it's more lenient than
+	// this check) but the quality of its reasoning drops sharply without
+	// a product charter.
+	if snap := orch.AgentContext().Snapshot; snap != nil && !snap.HasStrongSignal() {
+		fmt.Fprintln(os.Stderr, "warning: target repo has no README, CLAUDE.md, ARCHITECTURE.md, or .aidev/charter.md.")
+		fmt.Fprintln(os.Stderr, "         consider running `aidev charter -repo "+absRepo+"` to establish the product's purpose before running the full pipeline.")
+	}
+
 	// Install the GitHubReporter unless the user opted out. We hand it
 	// the same github.Client the orchestrator already uses, so the
 	// credential story is "one GITHUB_TOKEN env var covers everything".
@@ -113,6 +130,44 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
 	}
+}
+
+// runCharterSubcommand handles `aidev charter`. It runs the interview
+// flow against a target repo (default cwd) and writes the resulting
+// markdown to `<repo>/.aidev/charter.md`. The subcommand never runs the
+// agent pipeline — it is a one-shot tool.
+func runCharterSubcommand() {
+	var (
+		repoPath  = flag.String("repo", ".", "Path to the target repository")
+		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+	)
+	flag.Parse()
+
+	cfg := mustLoadConfig(*configDir)
+
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("router: %v", err))
+	}
+	charter, err := agents.NewCharter(router, nil)
+	if err != nil {
+		fatal(fmt.Sprintf("charter: %v", err))
+	}
+	absRepo, err := filepath.Abs(*repoPath)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve repo path: %v", err))
+	}
+
+	fmt.Fprintln(os.Stderr, "aidev charter: interactive interview. Answer each question, then press enter.")
+	fmt.Fprintln(os.Stderr, "Leaving an optional field blank is fine.")
+	fmt.Fprintln(os.Stderr)
+
+	ctx := context.Background()
+	path, err := charter.Interview(ctx, absRepo)
+	if err != nil {
+		fatal(fmt.Sprintf("charter: %v", err))
+	}
+	fmt.Fprintf(os.Stderr, "\nwrote %s\n", path)
 }
 
 // runDoctorSubcommand handles `aidev doctor`. It always runs non-interactive
