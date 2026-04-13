@@ -142,6 +142,44 @@ func (c *Client) AddLabels(ctx context.Context, owner, repo string, issue int, l
 	return nil
 }
 
+// CreateIssue opens a new issue on owner/repo with the given title,
+// body, and labels. Used by the `aidev followups --file-issues`
+// subcommand to file Reviewer-proposed follow-ups as real issues.
+// Returns the created issue number and HTML URL.
+func (c *Client) CreateIssue(ctx context.Context, owner, repo, title, body string, labels []string) (number int, url string, err error) {
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues", c.baseURL, owner, repo)
+	payload := struct {
+		Title  string   `json:"title"`
+		Body   string   `json:"body"`
+		Labels []string `json:"labels,omitempty"`
+	}{Title: title, Body: body, Labels: labels}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return 0, "", err
+	}
+	c.setAuth(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("create issue: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, "", fmt.Errorf("create issue: %s", resp.Status)
+	}
+	var raw struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return 0, "", fmt.Errorf("create issue: decode: %w", err)
+	}
+	return raw.Number, raw.HTMLURL, nil
+}
+
 // RemoveLabel removes a single label from an issue. Absent labels are a
 // no-op (we swallow the 404), so the controller can call this blindly
 // when swapping phase labels.

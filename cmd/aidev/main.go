@@ -24,9 +24,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"strings"
+
 	"github.com/aisu-ai/aidev/internal/agents"
 	"github.com/aisu-ai/aidev/internal/config"
 	"github.com/aisu-ai/aidev/internal/doctor"
+	"github.com/aisu-ai/aidev/internal/github"
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/plugin"
@@ -68,6 +71,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runPluginSubcommand()
+		return
+	}
+	// Intercept the `followups` subcommand. Reads .aidev/followups.md,
+	// parses the Reviewer's proposals, and files them as real GitHub
+	// issues (when --file-issues is passed).
+	if len(os.Args) > 1 && os.Args[1] == "followups" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runFollowUpsSubcommand()
 		return
 	}
 
@@ -154,6 +165,85 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
 	}
+}
+
+// runFollowUpsSubcommand handles `aidev followups`. With --file-issues,
+// it reads the Reviewer-produced .aidev/followups.md file, parses each
+// proposal, and files them as real GitHub issues on the specified
+// target repo. Without --file-issues, it lists what WOULD be filed —
+// a dry run. Either way, the user is always in control of when
+// followups turn into issues.
+func runFollowUpsSubcommand() {
+	var (
+		repoPath   = flag.String("repo", ".", "Path to the target repository (where .aidev/followups.md lives)")
+		target     = flag.String("target", "", "Target GitHub repo in owner/repo form (required for --file-issues)")
+		file       = flag.Bool("file-issues", false, "Actually file the proposals as GitHub issues (default: dry run)")
+		followups  = flag.String("path", "", "Override path to followups.md (default: <repo>/.aidev/followups.md)")
+		configDir  = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+	)
+	flag.Parse()
+
+	_ = mustLoadConfig(*configDir) // validate config even though we don't use it directly
+
+	absRepo, err := filepath.Abs(*repoPath)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+	path := *followups
+	if path == "" {
+		path = filepath.Join(absRepo, ".aidev", "followups.md")
+	}
+
+	proposals, err := agents.ParseFollowUpsFile(path)
+	if err != nil {
+		fatal(fmt.Sprintf("parse followups: %v", err))
+	}
+	if len(proposals) == 0 {
+		fmt.Fprintf(os.Stderr, "no follow-ups found at %s\n", path)
+		return
+	}
+
+	if !*file {
+		// Dry run — list the proposals.
+		fmt.Printf("# Dry run — %d proposal(s) at %s\n\n", len(proposals), path)
+		fmt.Printf("_Pass --file-issues --target owner/repo to actually create these on GitHub._\n\n")
+		for i, p := range proposals {
+			fmt.Printf("## %d. %s\n\n", i+1, p.Title)
+			if len(p.Labels) > 0 {
+				fmt.Printf("labels: %s\n\n", strings.Join(p.Labels, ", "))
+			}
+			fmt.Println(p.Body)
+			fmt.Println()
+		}
+		return
+	}
+
+	if *target == "" {
+		fatal("--file-issues requires --target owner/repo")
+	}
+	parts := strings.SplitN(*target, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		fatal(fmt.Sprintf("invalid --target %q, want owner/repo form", *target))
+	}
+	owner, repo := parts[0], parts[1]
+
+	client := github.NewClient()
+	ctx := context.Background()
+
+	filed, err := agents.FileFollowUps(proposals, func(title, body string, labels []string) (int, string, error) {
+		return client.CreateIssue(ctx, owner, repo, title, body, labels)
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nerror partway through filing: %v\n", err)
+		fmt.Fprintf(os.Stderr, "filed %d issue(s) before the failure:\n", len(filed))
+	}
+	for _, f := range filed {
+		fmt.Printf("filed #%d: %s — %s\n", f.Number, f.Proposal.Title, f.URL)
+	}
+	if err != nil {
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "\n%d issue(s) filed against %s/%s\n", len(filed), owner, repo)
 }
 
 // runPluginSubcommand handles `aidev plugin install | uninstall`.
