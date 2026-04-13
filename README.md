@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.2d — Full agent pipeline (Scout + Critic + Architect + Charter + Implementer + Tester + Reviewer) + `aidev doctor` + automatic GitHub audit trail + Claude Code CLI provider as the default backend + one-command Claude Code plugin install.
+> **Status:** v0.3a.1 — Full agent pipeline with two-turn Implementer (file-content loading), Claude Code CLI as the default backend, one-command plugin install, and automatic GitHub audit trail.
 
 ## Why
 
@@ -219,6 +219,7 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 - **v0.2b.1** — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure. *(shipped)*
 - **v0.2c** — Charter agent + `aidev charter` subcommand + `.aidev/charter.md` + Scout + Critic integration. *(shipped)*
 - **v0.3a** — Implementer agent: produces a unified git diff from a chosen sketch. *(shipped)*
+- **v0.3a.1** *(this release)* — Two-turn Implementer: first turn asks the model which files it needs to see the contents of, second turn embeds those file contents in the prompt before generating the diff. Dramatically improves the chance that `.aidev/proposed.patch` applies cleanly with `git apply`.
 - **v0.3b** — Tester agent: detects the project's test runner, executes it, and summarises failures. *(shipped)*
 - **v0.4** — Reviewer agent: Boy Scout pass on a patch with blockers/suggestions/follow-up issue proposals. New `aidev review` subcommand. Full agent pipeline complete. *(shipped)*
 - **v0.2d** *(this release)* — Claude Code CLI provider as the default backend for medium and large tiers (works out of the box with a Max/Pro subscription, no API key required), plus `aidev plugin install` for Claude Code slash-command integration.

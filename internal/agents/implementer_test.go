@@ -156,3 +156,162 @@ func intoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// v0.3a.1 two-turn Implementer tests.
+
+func TestParseFileSelectionBareJSON(t *testing.T) {
+	got, err := parseFileSelection(`["cmd/main.go", "internal/foo.go"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "cmd/main.go" || got[1] != "internal/foo.go" {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseFileSelectionWrappedInCodeFence(t *testing.T) {
+	raw := "```json\n[\"a.go\", \"b.go\"]\n```"
+	got, err := parseFileSelection(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseFileSelectionWithSurroundingProse(t *testing.T) {
+	raw := "Here are the files I need:\n\n[\"main.go\"]\n\nLet me know if you need more."
+	got, err := parseFileSelection(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "main.go" {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseFileSelectionEmptyErrors(t *testing.T) {
+	if _, err := parseFileSelection(""); err == nil {
+		t.Error("expected error on empty input")
+	}
+}
+
+func TestParseFileSelectionNoJSONErrors(t *testing.T) {
+	if _, err := parseFileSelection("sorry, I can't help with that"); err == nil {
+		t.Error("expected error when no JSON array is present")
+	}
+}
+
+func TestCleanFileListDropsUnsafePaths(t *testing.T) {
+	in := []string{
+		"good/path.go",
+		"/absolute/path.go",       // absolute — drop
+		"../escape.go",            // escape — drop
+		"nested/../evil.go",       // escape — drop
+		"good/path.go",            // duplicate — drop
+		"another.go",
+	}
+	got := cleanFileList(in)
+	want := []string{"good/path.go", "another.go"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestCleanFileListCapsLength(t *testing.T) {
+	in := make([]string, 30)
+	for j := range in {
+		in[j] = "file" + intoa(j) + ".go"
+	}
+	got := cleanFileList(in)
+	if len(got) != maxRequestedFiles {
+		t.Errorf("got %d, want %d", len(got), maxRequestedFiles)
+	}
+}
+
+func TestIsSafeRelPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"foo/bar.go", true},
+		{"foo.go", true},
+		{"", false},
+		{"/abs/path", false},
+		{"../escape", false},
+		{"foo/../escape", false},
+		{"foo/./ok.go", true},
+		{strings.Repeat("a", 2000), false},
+	}
+	for _, c := range cases {
+		got := isSafeRelPath(c.in)
+		if got != c.want {
+			t.Errorf("isSafeRelPath(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestReadFilesSkipsMissingAndDirs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "exists.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readFiles(dir, []string{"exists.go", "missing.go", "sub"})
+	if len(got) != 1 {
+		t.Errorf("got %d files, want 1", len(got))
+	}
+	if got["exists.go"] != "package main" {
+		t.Errorf("content mismatch: %q", got["exists.go"])
+	}
+}
+
+func TestReadFilesTruncatesLargeFiles(t *testing.T) {
+	dir := t.TempDir()
+	big := strings.Repeat("x", maxFileBytes*2)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readFiles(dir, []string{"big.txt"})
+	content := got["big.txt"]
+	if !strings.Contains(content, "truncated") {
+		t.Errorf("expected truncation marker, got first 100 chars: %q", content[:100])
+	}
+	// Length should be bounded by the limit + marker.
+	if len(content) > maxFileBytes+500 {
+		t.Errorf("truncated content too long: %d bytes", len(content))
+	}
+}
+
+func TestReadFilesRefusesUnsafePaths(t *testing.T) {
+	dir := t.TempDir()
+	// Create a file OUTSIDE the intended root that an escape path
+	// could try to reach.
+	parent := filepath.Dir(dir)
+	secret := filepath.Join(parent, "secret.txt")
+	if err := os.WriteFile(secret, []byte("top secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(secret)
+
+	got := readFiles(dir, []string{"../" + filepath.Base(secret), "/etc/passwd"})
+	if len(got) != 0 {
+		t.Errorf("unsafe paths should have been rejected, got %v", got)
+	}
+}
+
+func TestSortStrings(t *testing.T) {
+	a := []string{"c", "a", "b"}
+	sortStrings(a)
+	if a[0] != "a" || a[1] != "b" || a[2] != "c" {
+		t.Errorf("sortStrings result: %v", a)
+	}
+}

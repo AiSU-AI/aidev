@@ -2,6 +2,7 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -52,13 +53,26 @@ type Patch struct {
 	FilesTouched []string
 }
 
+// Size and count limits for the file-content loading pass. These keep
+// the second-turn prompt bounded regardless of what the first-turn
+// file picker returns.
+const (
+	maxRequestedFiles = 15
+	maxFileBytes      = 10 * 1024 // 10 KiB per file
+)
+
 // Run asks the LLM to produce a unified diff that implements the chosen
-// Sketch. The Implementer is given the full context chain: issue, scout
-// brief, critic report, chosen sketch, and the names of the top-level
-// source files in the repo (to anchor the diff at real paths). It does
-// NOT send file contents — v0.3a ships without file-content loading, so
-// the resulting patch is a first-draft the user will almost certainly
-// edit. A better context-loading story is tracked for v0.3a.1.
+// Sketch. v0.3a.1 drives a **two-turn conversation**:
+//
+//	Turn 1: send the full context chain plus a file inventory and ask
+//	        the model to list (as a JSON array) the files it needs to
+//	        see the contents of to write a correct patch.
+//	Turn 2: read those files from disk, embed their contents in the
+//	        prompt, and ask for the unified diff.
+//
+// This dramatically improves diff quality compared to v0.3a, which only
+// sent file names and not contents — the resulting diffs often failed
+// to apply cleanly because the model guessed at context lines.
 //
 // chosen must be non-nil and must be one of the sketches already
 // produced by the Architect (live in c.Sketches). The caller is
@@ -74,6 +88,215 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	if c.Snapshot == nil {
 		return nil, errors.New("implementer: no repo snapshot")
 	}
+
+	// Turn 1: ask the model which files it needs to see.
+	wanted, err := i.selectFiles(ctx, c, chosen)
+	if err != nil {
+		return nil, fmt.Errorf("implementer: file selection: %w", err)
+	}
+
+	// Load the requested file contents (size-capped, path-validated).
+	// File read errors are logged into the contents map rather than
+	// aborting — the model can still work with partial information.
+	contents := readFiles(c.Snapshot.Root, wanted)
+
+	// Turn 2: produce the diff with real file contents in hand.
+	return i.generateDiff(ctx, c, chosen, contents)
+}
+
+// fileSelectionJSONRe extracts a JSON array from a potentially messy
+// LLM response. It matches the first `[...]` block in the response,
+// which handles both bare JSON and JSON wrapped in a markdown code
+// fence or surrounded by explanatory prose.
+var fileSelectionJSONRe = regexp.MustCompile(`(?s)\[[^\]]*\]`)
+
+// selectFiles is turn 1. It sends the full context chain plus the file
+// inventory and asks the LLM to return a JSON array of up to
+// maxRequestedFiles relative paths that it needs to see the contents
+// of before writing the patch.
+func (i *Implementer) selectFiles(ctx context.Context, c *Context, chosen *Sketch) ([]string, error) {
+	system := "You are the Implementer's file picker for aidev, a multi-agent coding tool.\n" +
+		"\n" +
+		"Given the context below, return ONLY a JSON array of relative file\n" +
+		"paths (up to " + fmt.Sprint(maxRequestedFiles) + ") that you need to see\n" +
+		"the contents of before you can write a correct unified diff for the\n" +
+		"chosen sketch. Include:\n" +
+		"\n" +
+		"  - files you plan to modify\n" +
+		"  - files whose current behaviour you need to understand in order\n" +
+		"    to modify another file correctly\n" +
+		"  - test files adjacent to the code you plan to touch\n" +
+		"\n" +
+		"DO NOT include files you don't actually need. Fewer, more-relevant\n" +
+		"files is better than a long list. The second turn's prompt grows with\n" +
+		"each file you request.\n" +
+		"\n" +
+		"Output format: EXACTLY a JSON array of strings, no code fence, no\n" +
+		"surrounding prose. Example:\n" +
+		"\n" +
+		"[\"internal/foo/foo.go\", \"internal/foo/foo_test.go\", \"cmd/app/main.go\"]\n" +
+		"\n" +
+		"Paths MUST be relative to the repository root (no leading slash, no\n" +
+		"'..' components). Paths to files that don't currently exist in the\n" +
+		"repository (new files you plan to create) MUST NOT appear here — we\n" +
+		"only fetch existing content in this turn."
+
+	var user strings.Builder
+	fmt.Fprintf(&user, "## Issue %s/%s#%d: %s\n\n", c.Issue.Owner, c.Issue.Repo, c.Issue.Number, c.Issue.Title)
+	user.WriteString(c.Issue.Body)
+	user.WriteString("\n\n## Scout brief\n\n")
+	user.WriteString(c.ScoutReport)
+	user.WriteString("\n\n## Critic report\n\n")
+	user.WriteString(c.CriticReport)
+	fmt.Fprintf(&user, "\n\n## Chosen sketch %d: %s\n\n", chosen.Number, chosen.Title)
+	user.WriteString(chosen.Markdown)
+
+	files := listSourceFiles(c.Snapshot.Root, 200)
+	if len(files) > 0 {
+		user.WriteString("\n\n## File inventory (paths only, pick from this list)\n\n")
+		for _, f := range files {
+			user.WriteString("- ")
+			user.WriteString(f)
+			user.WriteString("\n")
+		}
+	}
+
+	resp, err := i.Provider.Complete(ctx, llm.Request{
+		System: system,
+		Messages: []llm.Message{
+			{Role: "user", Content: user.String()},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return parseFileSelection(resp.Content)
+}
+
+// parseFileSelection extracts a []string from the model's response to
+// the file-picker prompt. It tolerates:
+//
+//   - bare JSON arrays
+//   - JSON wrapped in a markdown code fence
+//   - JSON preceded or followed by prose
+//
+// Exported for tests. Duplicate and clearly invalid entries (absolute
+// paths, paths with '..' components, paths longer than 1 KB) are
+// silently dropped. The resulting slice is capped at maxRequestedFiles.
+func parseFileSelection(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("empty file selection response")
+	}
+	// Fast path: the whole response is already a JSON array.
+	var arr []string
+	if err := json.Unmarshal([]byte(raw), &arr); err == nil {
+		return cleanFileList(arr), nil
+	}
+	// Fallback: pull the first [...] block out of the response.
+	match := fileSelectionJSONRe.FindString(raw)
+	if match == "" {
+		return nil, fmt.Errorf("no JSON array in file selection response: %q", firstLine(raw))
+	}
+	if err := json.Unmarshal([]byte(match), &arr); err != nil {
+		return nil, fmt.Errorf("parse JSON array: %w", err)
+	}
+	return cleanFileList(arr), nil
+}
+
+// cleanFileList strips invalid paths (absolute, escape attempts, too
+// long), de-duplicates by value preserving first-seen order, and caps
+// the list length at maxRequestedFiles.
+func cleanFileList(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		p = strings.TrimSpace(p)
+		if !isSafeRelPath(p) {
+			continue
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+		if len(out) >= maxRequestedFiles {
+			break
+		}
+	}
+	return out
+}
+
+// isSafeRelPath rejects paths that:
+//
+//   - are empty
+//   - are absolute
+//   - contain any '..' component (even if filepath.Clean would resolve
+//     the traversal to something safe — we treat any traversal-looking
+//     input as suspicious by default)
+//   - exceed 1 KB (nothing legitimate is that long)
+//
+// Uses raw path splitting rather than filepath.Clean because we want to
+// reject the ORIGINAL string shape, not its resolved form.
+func isSafeRelPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if len(p) > 1024 {
+		return false
+	}
+	if filepath.IsAbs(p) {
+		return false
+	}
+	// Split on both '/' and the OS separator so Windows-style paths
+	// are rejected the same way Unix-style paths are.
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool {
+		return r == '/' || r == filepath.Separator
+	}) {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// readFiles loads the file contents for the given paths, relative to
+// repoRoot. Missing files are skipped silently (they may have been
+// requested by the model but don't exist on disk). Files larger than
+// maxFileBytes are truncated with a marker at the end.
+//
+// The returned map is keyed by the ORIGINAL requested path (not the
+// resolved absolute path), so the second-turn prompt can cite the same
+// strings the first turn returned.
+func readFiles(repoRoot string, paths []string) map[string]string {
+	out := make(map[string]string, len(paths))
+	for _, p := range paths {
+		if !isSafeRelPath(p) {
+			continue
+		}
+		abs := filepath.Join(repoRoot, p)
+		info, err := os.Stat(abs)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		if len(data) > maxFileBytes {
+			data = append(data[:maxFileBytes], []byte("\n// ...[truncated by aidev at "+fmt.Sprint(maxFileBytes)+" bytes]...")...)
+		}
+		out[p] = string(data)
+	}
+	return out
+}
+
+// generateDiff is turn 2. Same prompt shape as the old single-turn
+// Run() but with the requested file contents embedded. Kept separate
+// from selectFiles so tests and callers can exercise the two phases
+// independently.
+func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sketch, contents map[string]string) (*Patch, error) {
 
 	system := "You are the Implementer for aidev, a multi-agent coding tool.\n" +
 		"\n" +
@@ -123,10 +346,9 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 		"review it; a partially-correct starting point is more useful than an\n" +
 		"attempt at a whole-repo rewrite."
 
-	// Assemble the user message. We include the full context chain plus
-	// a small file listing (names only, no contents) so the model knows
-	// what paths actually exist. Contents are deliberately omitted in
-	// v0.3a — loading them correctly is its own design problem.
+	// Assemble the user message. v0.3a.1 includes the CONTENTS of the
+	// files the first turn's picker asked for, so the model can anchor
+	// its diff at exact context lines.
 	var user strings.Builder
 	fmt.Fprintf(&user, "## Issue %s/%s#%d: %s\n\n", c.Issue.Owner, c.Issue.Repo, c.Issue.Number, c.Issue.Title)
 	user.WriteString(c.Issue.Body)
@@ -137,13 +359,31 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	fmt.Fprintf(&user, "\n\n## Chosen sketch %d: %s\n\n", chosen.Number, chosen.Title)
 	user.WriteString(chosen.Markdown)
 
-	files := listSourceFiles(c.Snapshot.Root, 150)
-	if len(files) > 0 {
-		user.WriteString("\n\n## File inventory (paths only; contents not included in v0.3a)\n\n")
-		for _, f := range files {
-			user.WriteString("- ")
-			user.WriteString(f)
-			user.WriteString("\n")
+	// Embed the requested file contents verbatim. We use a stable sort
+	// order by path so the prompt is deterministic across runs.
+	if len(contents) > 0 {
+		paths := make([]string, 0, len(contents))
+		for p := range contents {
+			paths = append(paths, p)
+		}
+		sortStrings(paths)
+
+		user.WriteString("\n\n## Current file contents (for exact-line anchoring)\n\n")
+		for _, p := range paths {
+			fmt.Fprintf(&user, "### %s\n\n```\n%s\n```\n\n", p, contents[p])
+		}
+		user.WriteString("Only the files above are shown. If you need others to write a correct diff, annotate TODOs in your response — the user can re-run after adding them to the Scout's file inventory.\n")
+	} else {
+		// Fallback to the v0.3a behaviour (paths only) when the picker
+		// returned nothing useful. Degrades gracefully.
+		files := listSourceFiles(c.Snapshot.Root, 150)
+		if len(files) > 0 {
+			user.WriteString("\n\n## File inventory (paths only — the file picker did not identify any files to load)\n\n")
+			for _, f := range files {
+				user.WriteString("- ")
+				user.WriteString(f)
+				user.WriteString("\n")
+			}
 		}
 	}
 
@@ -286,3 +526,15 @@ func listSourceFiles(rootDir string, limit int) []string {
 // have enough file paths. WalkFunc returning a non-nil error that isn't
 // filepath.SkipDir aborts the walk.
 var errStopWalk = errors.New("stop walk")
+
+// sortStrings is a tiny in-place insertion sort used by generateDiff to
+// stabilise the file-contents section ordering. We avoid importing
+// "sort" here because this file already has a tight import list and
+// this is the only call site.
+func sortStrings(a []string) {
+	for i := 1; i < len(a); i++ {
+		for j := i; j > 0 && a[j-1] > a[j]; j-- {
+			a[j-1], a[j] = a[j], a[j-1]
+		}
+	}
+}
