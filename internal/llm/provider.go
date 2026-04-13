@@ -63,7 +63,52 @@ type Response struct {
 type Provider interface {
 	// Name is a human-readable identifier ("ollama:qwen2.5-coder:7b").
 	Name() string
-	// Complete performs a single non-streaming completion. Streaming will be
-	// added when the TUI needs it; for now simplicity wins.
+	// Complete performs a single non-streaming completion — the most
+	// common path for aidev's agent code.
 	Complete(ctx context.Context, req Request) (Response, error)
+}
+
+// Streamer is an optional capability interface that providers can
+// implement to expose incremental responses. Callers detect support via
+// a type assertion:
+//
+//	if s, ok := provider.(llm.Streamer); ok {
+//		chunks, err := s.Stream(ctx, req)
+//		...
+//	}
+//
+// Providers that don't implement Streamer continue to work unchanged —
+// callers can fall back to the single-shot Complete path. aidev's
+// shipped providers do the following:
+//
+//	Claude (REST)   — native SSE streaming
+//	Ollama          — native /api/chat?stream=true
+//	Claude CLI      — falls back to a synthetic single-chunk stream
+//	                  (the CLI's --output-format stream-json is more
+//	                  complex than it is worth for aidev's needs)
+type Streamer interface {
+	// Stream performs a streaming completion. The returned channel
+	// emits StreamChunks until it is closed (EOF). Any error is
+	// delivered on the err return and the channel is closed
+	// immediately. Cancelling ctx aborts the stream.
+	Stream(ctx context.Context, req Request) (<-chan StreamChunk, error)
+}
+
+// StreamChunk is one unit of a streaming response. Providers emit them
+// in order; concatenating every Text field in a stream reconstructs
+// the same string Complete() would have returned.
+type StreamChunk struct {
+	// Text is the incremental output from this chunk. May be empty
+	// (keep-alive pings, status frames).
+	Text string
+
+	// Done is true on the final chunk of a stream. Some providers
+	// deliver trailing metadata in the Done chunk; consumers that only
+	// care about text can ignore this field.
+	Done bool
+
+	// Err is set on the final chunk if the stream ended with an error.
+	// Consumers should check this before drawing conclusions from the
+	// accumulated Text.
+	Err error
 }
