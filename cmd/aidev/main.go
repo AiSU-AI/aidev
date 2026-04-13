@@ -54,6 +54,14 @@ func main() {
 		runTestSubcommand()
 		return
 	}
+	// Intercept the `review` subcommand. Runs the Reviewer against a
+	// patch file (default: .aidev/proposed.patch in the target repo)
+	// and prints the review plus any follow-up proposals.
+	if len(os.Args) > 1 && os.Args[1] == "review" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runReviewSubcommand()
+		return
+	}
 
 	var (
 		issueURL     = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
@@ -137,6 +145,59 @@ func main() {
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Sprintf("tui: %v", err))
+	}
+}
+
+// runReviewSubcommand handles `aidev review`. It loads a patch file
+// (default `<repo>/.aidev/proposed.patch`), fetches the issue context,
+// runs the Reviewer, and prints the structured review to stdout. If the
+// review contains follow-up proposals they're also written to
+// `<repo>/.aidev/followups.md` for manual triage.
+func runReviewSubcommand() {
+	var (
+		issueURL  = flag.String("issue", "", "GitHub issue URL (required for context)")
+		repoPath  = flag.String("repo", ".", "Path to the target repository")
+		patchPath = flag.String("patch", "", "Path to the patch file to review (default: <repo>/.aidev/proposed.patch)")
+		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+	)
+	flag.Parse()
+	if *issueURL == "" {
+		fatal("missing required flag: -issue")
+	}
+
+	cfg := mustLoadConfig(*configDir)
+	orch, err := orchestrator.New(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("orchestrator: %v", err))
+	}
+	ctx := context.Background()
+	if err := orch.LoadIssue(ctx, *issueURL); err != nil {
+		fatal(fmt.Sprintf("load issue: %v", err))
+	}
+	absRepo, err := filepath.Abs(*repoPath)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+	if err := orch.LoadRepo(absRepo); err != nil {
+		fatal(fmt.Sprintf("scan repo: %v", err))
+	}
+
+	pp := *patchPath
+	if pp == "" {
+		pp = filepath.Join(absRepo, ".aidev", "proposed.patch")
+	}
+	data, err := os.ReadFile(pp)
+	if err != nil {
+		fatal(fmt.Sprintf("read patch %s: %v", pp, err))
+	}
+
+	for ev := range orch.ReviewPatch(ctx, string(data)) {
+		if ev.Err != nil {
+			fatal(ev.Err.Error())
+		}
+	}
+	if rev := orch.Review(); rev != nil {
+		fmt.Println(rev.Markdown)
 	}
 }
 

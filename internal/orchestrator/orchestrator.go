@@ -51,6 +51,8 @@ const (
 	StateTesting       State = "testing"
 	StateTestsPassed   State = "tests_passed"
 	StateTestsFailed   State = "tests_failed"
+	StateReviewing     State = "reviewing"
+	StateReviewDone    State = "review_done"
 	StateDone          State = "done"
 	StateKilled        State = "killed"
 	StateError         State = "error"
@@ -79,9 +81,11 @@ type Orchestrator struct {
 	architect   *agents.Architect
 	implementer *agents.Implementer
 	tester      *agents.Tester
+	reviewer    *agents.Reviewer
 	critRpt     *agents.Report
 	patch       *agents.Patch
 	testResult  *agents.TestResult
+	review      *agents.Review
 
 	// sketchCount is the N the Architect uses when it runs. It is set by
 	// New via the sketchCount config field and may be overridden at runtime
@@ -192,12 +196,62 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	reviewer, err := agents.NewReviewer(router)
+	if err != nil {
+		return nil, err
+	}
 	o.scout = scout
 	o.critic = critic
 	o.architect = architect
 	o.implementer = implementer
 	o.tester = tester
+	o.reviewer = reviewer
 	return o, nil
+}
+
+// Review returns the last Reviewer output, if any.
+func (o *Orchestrator) Review() *agents.Review { return o.review }
+
+// ReviewPatch runs the Reviewer against the given patch string and
+// emits reviewing → review_done. Proposed follow-ups are written to
+// `<repo>/.aidev/followups.md` if any are present. The patch argument
+// lets callers supply either the orchestrator's own Implementer output
+// or an external diff file (for `aidev review -patch foo.diff`).
+func (o *Orchestrator) ReviewPatch(ctx context.Context, patch string) <-chan Event {
+	out := make(chan Event, 4)
+	go func() {
+		defer close(out)
+		if o.ctx.Issue == nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: StateError, Err: errors.New("orchestrator: no issue loaded")})
+			return
+		}
+		o.state = StateReviewing
+		o.emit(ctx, out, Event{State: o.state, Message: "Reviewer performing Boy Scout pass..."})
+
+		rev, err := o.reviewer.Run(ctx, o.ctx, patch)
+		if err != nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: StateError, Err: err})
+			return
+		}
+		o.review = rev
+
+		// Best-effort follow-up persistence.
+		if o.ctx.Snapshot != nil && len(rev.FollowUps) > 0 {
+			if _, werr := rev.WriteFollowUps(o.ctx.Snapshot.Root); werr != nil {
+				fmt.Fprintf(o.reporterLog, "aidev reviewer: write followups: %v\n", werr)
+			}
+		}
+
+		o.state = StateReviewDone
+		o.emit(ctx, out, Event{
+			State: o.state,
+			Message: fmt.Sprintf("Review complete: %d blockers, %d suggestions, %d follow-ups, verdict %q",
+				len(rev.Blockers), len(rev.Suggests), len(rev.FollowUps), rev.Verdict),
+		})
+	}()
+	return out
 }
 
 // TestResult returns the last Tester result, if any.
