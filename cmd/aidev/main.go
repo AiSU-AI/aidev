@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -600,14 +601,25 @@ func runTestSubcommand() {
 	}
 }
 
-// runCharterSubcommand handles `aidev charter`. It runs the interview
-// flow against a target repo (default cwd) and writes the resulting
-// markdown to `<repo>/.aidev/charter.md`. The subcommand never runs the
-// agent pipeline — it is a one-shot tool.
+// runCharterSubcommand handles `aidev charter`. It runs in one of two
+// modes:
+//
+//   - Interactive (default): prompts the user for answers via stdin.
+//     Fails fast if stdin isn't a TTY so we never hang waiting for
+//     input that will never arrive.
+//
+//   - Non-interactive (`--answers-file <path>`): reads a JSON file
+//     with the five answer fields and skips the interviewer
+//     entirely. Used by the Claude Code `/aidev-charter` slash
+//     command, which collects answers in the chat before invoking
+//     aidev.
+//
+// Either way, the end result is a synthesised `<repo>/.aidev/charter.md`.
 func runCharterSubcommand() {
 	var (
-		repoPath  = flag.String("repo", ".", "Path to the target repository")
-		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		repoPath    = flag.String("repo", ".", "Path to the target repository")
+		configDir   = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		answersFile = flag.String("answers-file", "", "Path to a JSON file containing the five charter answers (non-interactive mode). Keys: purpose, users, constraint, out_of_scope, overrides")
 	)
 	flag.Parse()
 
@@ -626,14 +638,34 @@ func runCharterSubcommand() {
 		fatal(fmt.Sprintf("resolve repo path: %v", err))
 	}
 
-	fmt.Fprintln(os.Stderr, "aidev charter: interactive interview. Answer each question, then press enter.")
-	fmt.Fprintln(os.Stderr, "Leaving an optional field blank is fine.")
-	fmt.Fprintln(os.Stderr)
-
 	ctx := context.Background()
-	path, err := charter.Interview(ctx, absRepo)
-	if err != nil {
-		fatal(fmt.Sprintf("charter: %v", err))
+
+	var path string
+	if *answersFile != "" {
+		// Non-interactive: load answers from JSON, skip the
+		// interviewer.
+		data, err := os.ReadFile(*answersFile)
+		if err != nil {
+			fatal(fmt.Sprintf("read answers file: %v", err))
+		}
+		var answers map[string]string
+		if err := json.Unmarshal(data, &answers); err != nil {
+			fatal(fmt.Sprintf("parse answers file: %v (expected a JSON object with string values)", err))
+		}
+		fmt.Fprintf(os.Stderr, "aidev charter: running in non-interactive mode with answers from %s\n", *answersFile)
+		path, err = charter.RunWithAnswers(ctx, absRepo, answers)
+		if err != nil {
+			fatal(fmt.Sprintf("charter: %v", err))
+		}
+	} else {
+		// Interactive: walk the user through the 5 questions.
+		fmt.Fprintln(os.Stderr, "aidev charter: interactive interview. Answer each question, then press enter.")
+		fmt.Fprintln(os.Stderr, "Leaving an optional field blank is fine. For non-interactive use, pass --answers-file.")
+		fmt.Fprintln(os.Stderr)
+		path, err = charter.Interview(ctx, absRepo)
+		if err != nil {
+			fatal(fmt.Sprintf("charter: %v", err))
+		}
 	}
 	fmt.Fprintf(os.Stderr, "\nwrote %s\n", path)
 }

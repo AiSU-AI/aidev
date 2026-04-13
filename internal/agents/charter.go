@@ -67,9 +67,14 @@ var CharterQuestions = []ChartQuestion{
 	{Key: "overrides", Prompt: "Any engineering principles that override or extend the defaults? (free text; leave blank for none)"},
 }
 
-// Interview runs the full flow: ask all questions, synthesise the
-// charter via the LLM, and write the result to
-// `<repoRoot>/.aidev/charter.md`. Returns the path to the written file.
+// Interview runs the full interactive flow: ask all questions via the
+// configured Interviewer, synthesise the charter via the LLM, and
+// write the result to `<repoRoot>/.aidev/charter.md`. Returns the path
+// to the written file.
+//
+// For non-interactive callers (Claude Code slash commands, CI jobs),
+// use RunWithAnswers instead — Interview blocks on stdin and will hang
+// forever if stdin is not a TTY.
 func (c *Charter) Interview(ctx context.Context, repoRoot string) (string, error) {
 	if repoRoot == "" {
 		return "", errors.New("charter: empty repo root")
@@ -77,6 +82,34 @@ func (c *Charter) Interview(ctx context.Context, repoRoot string) (string, error
 	answers, err := c.askAll()
 	if err != nil {
 		return "", err
+	}
+	return c.RunWithAnswers(ctx, repoRoot, answers)
+}
+
+// RunWithAnswers is the non-interactive path: it skips the Interviewer
+// entirely and goes straight from pre-collected answers to LLM
+// synthesis + file write. Used by `aidev charter --answers-file <path>`
+// and by the Claude Code `/aidev-charter` slash command, which collects
+// answers from the user in the chat before handing them to aidev.
+//
+// The `answers` map must contain the five keys listed in
+// CharterQuestions; an empty `overrides` is allowed. Missing required
+// keys return a validation error BEFORE the LLM call.
+func (c *Charter) RunWithAnswers(ctx context.Context, repoRoot string, answers map[string]string) (string, error) {
+	if repoRoot == "" {
+		return "", errors.New("charter: empty repo root")
+	}
+	if answers == nil {
+		return "", errors.New("charter: nil answers")
+	}
+	// Validate that every required question has a non-empty answer.
+	// Missing keys are treated the same as empty strings.
+	for _, q := range CharterQuestions {
+		v := strings.TrimSpace(answers[q.Key])
+		answers[q.Key] = v
+		if v == "" && q.Key != "overrides" {
+			return "", fmt.Errorf("charter: %q is required", q.Key)
+		}
 	}
 	md, err := c.synthesise(ctx, answers)
 	if err != nil {
@@ -180,10 +213,27 @@ func (c *Charter) writeCharter(repoRoot, md string) (string, error) {
 
 // StdinInterviewer reads answers from os.Stdin. Prompts are written to
 // os.Stderr so they don't taint stdout-piped output.
+//
+// Ask fails fast if stdin isn't a TTY. This guards against the
+// 'slash command invokes aidev charter via !shell execution and aidev
+// hangs forever waiting for stdin' failure mode — without this check,
+// `fmt.Fscanln` on a non-TTY stdin blocks indefinitely. Callers that
+// need a non-interactive path should use Charter.RunWithAnswers with a
+// pre-collected map instead of this interviewer.
 type StdinInterviewer struct{}
 
 // Ask prints the prompt to stderr and reads a single line from stdin.
+// Returns an error immediately if stdin is not a TTY.
 func (StdinInterviewer) Ask(prompt string) (string, error) {
+	// Non-TTY stdin means this process was invoked from a script, a
+	// pipe, or a tool like Claude Code's `!` shell execution. None of
+	// those have a user to type answers. Fail fast instead of
+	// hanging on fmt.Fscanln.
+	if fi, err := os.Stdin.Stat(); err == nil {
+		if (fi.Mode() & os.ModeCharDevice) == 0 {
+			return "", errors.New("charter: stdin is not a TTY — use `aidev charter --answers-file <path>` for non-interactive runs")
+		}
+	}
 	fmt.Fprint(os.Stderr, prompt)
 	var line string
 	_, err := fmt.Fscanln(os.Stdin, &line)
