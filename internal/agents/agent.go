@@ -32,6 +32,18 @@ type Context struct {
 	ScoutReport  string   // filled in after Scout runs
 	CriticReport string   // filled in after Critic runs
 	Sketches     []Sketch // filled in after Architect runs
+
+	// ClarifierNotes holds a compact markdown rendering of a Clarifier
+	// session (the Critic's sharp questions plus the human's answers)
+	// collected in the CURRENT orchestrator run. When non-empty it is
+	// threaded into the Critic prompt so a second pass can reach a
+	// verdict with the ambiguities resolved.
+	//
+	// This is distinct from Snapshot.ClarifierContent, which is the
+	// durable `.aidev/clarifier.md` file on disk. ClarifierNotes is
+	// authoritative for the in-memory re-critique loop; the on-disk
+	// file is what downstream runs pick up.
+	ClarifierNotes string
 }
 
 // Principle is re-exported so agent code doesn't need to import the config

@@ -490,6 +490,55 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 	return out
 }
 
+// Recritique re-runs ONLY the Critic stage against the current agent
+// context. The expected caller is the headless interview loop: it has
+// just collected Clarifier answers, stashed them on
+// ctx.ClarifierNotes, and now wants a fresh verdict informed by those
+// answers — without re-running Scout (the repo hasn't changed).
+//
+// Recritique is only valid when the orchestrator is sitting at
+// StateAwaitUser. It overwrites the stored critic report and leaves
+// the state at StateAwaitUser so the caller can decide what to do
+// next (proceed to Continue, or interview again, or bail). Emits one
+// event on the returned channel and closes.
+func (o *Orchestrator) Recritique(ctx context.Context) <-chan Event {
+	out := make(chan Event, 4)
+	go func() {
+		defer close(out)
+
+		if o.state != StateAwaitUser {
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   fmt.Errorf("orchestrator: Recritique called from state %q, expected await_user", o.state),
+			})
+			o.state = StateError
+			return
+		}
+		if o.ctx == nil || o.ctx.ScoutReport == "" {
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   errors.New("orchestrator: Recritique requires a prior Scout+Critic pass"),
+			})
+			o.state = StateError
+			return
+		}
+
+		o.state = StateCritiquing
+		o.emit(ctx, out, Event{State: o.state, Message: "Critic re-evaluating with clarifier answers..."})
+		rpt, err := o.critic.Run(ctx, o.ctx)
+		if err != nil {
+			o.state = StateError
+			o.emit(ctx, out, Event{State: o.state, Err: err})
+			return
+		}
+		o.critRpt = rpt
+
+		o.state = StateAwaitUser
+		o.emit(ctx, out, Event{State: o.state, Message: "Critic recommends: " + rpt.Recommendation})
+	}()
+	return out
+}
+
 // emit fans an event out to both the TUI channel and the Reporter. It
 // stamps the event with a pointer to the current agents.Context so the
 // Reporter can read downstream artifacts (ScoutReport, CriticReport,
