@@ -2,7 +2,7 @@
 
 A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
 
-> **Status:** v0.2a — Scout + Critic + Architect. Implementer, Tester, Reviewer are on the roadmap.
+> **Status:** v0.2b — Scout + Critic + Architect + `aidev doctor`. Implementer, Tester, Reviewer are on the roadmap.
 
 ## Why
 
@@ -37,8 +37,14 @@ Model routing is declarative (`config/models.yaml`): each role is mapped to a na
 ```sh
 go build -o aidev ./cmd/aidev
 
+# Audit the environment before doing any real work (config, Anthropic key,
+# Ollama daemon, required models). Exits 1 on any FAIL.
+./aidev doctor
+
 # TUI mode — three panes: issue, scout brief, critic report (rightmost pane
 # retitles to "Architect sketches" once the Architect has produced output).
+# On startup, aidev runs the doctor automatically. In an interactive terminal
+# it will offer to auto-spawn Ollama and pull/swap missing models.
 ./aidev -issue https://github.com/owner/repo/issues/42 -repo ../owner-repo
 
 # Override the Architect's sketch count (default 3)
@@ -50,7 +56,43 @@ go build -o aidev ./cmd/aidev
 # Headless mode with auto-architect — if Critic says "build", automatically
 # run the Architect and print sketches too. Useful in CI.
 ./aidev -headless -auto -n 3 -issue ... -repo ...
+
+# Bypass the startup doctor (not recommended; use when you manage the
+# environment yourself and want to save a few hundred ms on cold start)
+./aidev -skip-doctor -issue ... -repo ...
 ```
+
+## Doctor
+
+`aidev doctor` is a precondition audit that runs automatically on every `aidev` invocation (unless you pass `-skip-doctor`). It checks:
+
+| Check | Fails when | Fix |
+|---|---|---|
+| `config` | `models.yaml` missing tiers or routing | edit `config/models.yaml` |
+| `anthropic-key` | a role routes to an anthropic tier but `ANTHROPIC_API_KEY` is unset | `export ANTHROPIC_API_KEY=sk-ant-...` |
+| `ollama-binary` | any role routes to ollama but the `ollama` CLI isn't on PATH | install from ollama.com |
+| `ollama-daemon` | binary present but `/api/tags` unreachable | aidev will offer to run `ollama serve` in the background (interactive TTY only) |
+| `ollama-models` | required models aren't pulled | aidev will offer to **pull**, **swap to an installed model**, or **abort** (interactive TTY only) |
+
+In headless/CI mode the doctor never prompts — it reports and fails fast, so you know exactly what to fix. Run `aidev doctor` explicitly to get the full report and a zero/non-zero exit code for a CI gate.
+
+### First-pull consent
+
+aidev will never silently download a multi-GB model. When a required model is missing, you'll see:
+
+```
+Ollama model "qwen2.5-coder:7b" is required but not installed.
+
+  [1] Pull qwen2.5-coder:7b now (multi-GB download, requires network)
+  [2] Swap to one of your already-installed models
+  [3] Abort — aidev cannot run without a model for this tier
+
+Choice [1/2/3]:
+```
+
+Choosing `2` lists the models already pulled on your Ollama daemon and swaps the routing in-memory for the current run. To make the swap permanent, edit `config/models.yaml` to reference your chosen model.
+
+The Ollama daemon lifecycle is **not owned by aidev** — if we spawn it, it persists after aidev exits so we don't interfere with other things that use it.
 
 ## TUI keybindings
 
@@ -111,8 +153,8 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 
 ## Roadmap
 
-- **v0.2a** *(this release)* — Architect agent with N divergent sketches, `-n` flag, cost preview.
-- **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent.
+- **v0.2a** — Architect agent with N divergent sketches, `-n` flag, cost preview. *(shipped)*
+- **v0.2b** *(this release)* — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering.
 - **v0.2c** — Charter agent + `.aidev/charter.md` + interview flow for repos without a clear stated purpose.
 - **v0.3** — Implementer + Tester in an isolated git worktree + container, with full-coverage tests gating completion. Adaptive dialogue (dependency-aware question graphs).
 - **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
@@ -121,7 +163,7 @@ Sketches are Markdown only — no code. The Implementer (v0.3) is what writes co
 ## Layout
 
 ```
-cmd/aidev/              entry point and flag handling
+cmd/aidev/              entry point, flag handling, doctor subcommand
 internal/config/        YAML loader for models + principles
 internal/llm/           Provider interface, Ollama + Claude backends, Router
 internal/github/        REST client for fetching issues
@@ -129,5 +171,6 @@ internal/repo/          Repo scanner + repo-local principle loader
 internal/agents/        Scout, Critic, Architect agents (shared Context)
 internal/orchestrator/  State machine that drives the pipeline
 internal/tui/           Bubble Tea model, update, view, keybindings
+internal/doctor/        Precondition checks: config, keys, Ollama daemon/models
 config/                 Shipped defaults: models.yaml, principles.yaml
 ```
