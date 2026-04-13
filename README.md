@@ -1,252 +1,288 @@
 # aidev
 
-A local, multi-agent coding assistant TUI written in Go. Feed it a GitHub issue; it runs a tiered agent pipeline — small local models for extractive work, large cloud models for deep reasoning — and hands you a defensible recommendation before a single line of code is written.
-
-> **Status:** v0.3a.1 — Full agent pipeline with two-turn Implementer (file-content loading), Claude Code CLI as the default backend, one-command plugin install, and automatic GitHub audit trail.
-
-## Why
-
-Several good tools already turn issues into patches (aider, plandex, opencode, goose, Claude Code). None of them *argue with you* before implementation. aidev's distinguishing feature is the **Critic**: an adversarial agent whose single job is to answer "should this be built?" using your repository's stated purpose and your own engineering principles as the yardstick. When the answer is "yes", the **Architect** produces N divergent solution sketches so you pick the *approach* before any code is written.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│ Orchestrator (state machine)                │
-└──┬──────┬──────────┬──────┬──────┬──────────┘
-   │      │          │      │      │
- Scout  Critic  Architect  Impl  Tester   (v0.2a ships the first three)
-```
-
-- **Scout** — reads the target repo (README, CLAUDE.md, ARCHITECTURE.md, file layout) and produces a factual brief. Runs on the **small local tier** (Ollama).
-- **Critic** — takes the brief + the issue + your principles and produces a `build | defer | kill | unclear` recommendation with arguments for and against. Runs on the **large tier** (Claude).
-- **Architect** — after the human approves the Critic's "build" verdict, produces N *meaningfully different* solution sketches with trade-offs, risks, principle alignment, and a rough scope estimate for each. Runs on the **large tier**. Default N is 3; override with `-n`.
-- **Implementer / Tester / Reviewer** — next milestone.
-
-Model routing is declarative (`config/models.yaml`): each role is mapped to a named tier, and each tier is mapped to a provider. Swap tiers freely.
-
-## Requirements
-
-- Go 1.24+
-- **For the medium and large tiers (default):** [Claude Code](https://claude.ai/download) installed and authenticated (`claude /login`). aidev routes Critic/Architect/Charter/Implementer/Reviewer through `claude --print`, so agent calls bill against your Max/Pro subscription. No `ANTHROPIC_API_KEY` required.
-- **For the small tier:** a local [Ollama](https://ollama.com) daemon with a coder model pulled (e.g. `ollama pull qwen2.5-coder:7b`). Used for the Scout and Tester. Optional — you can route these to the large tier by editing `config/models.yaml`.
-- `GITHUB_TOKEN` in the environment for private issues and for the controller's audit trail (Issues: Read and write scope).
-- **Alternative to Claude Code CLI:** if you prefer the direct REST API, edit `config/models.yaml` to set `provider: anthropic` on the medium/large tiers and export `ANTHROPIC_API_KEY`.
-
-## Claude Code plugin (install once, use from inside any Claude Code session)
-
-aidev ships a set of slash commands that integrate directly into Claude Code. Install them with one command:
+> A local multi-agent coding assistant that **argues with you before it writes code**. Built in Go. Works with your Claude Max/Pro subscription — no API key required.
 
 ```sh
-aidev plugin install
+curl -sSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash
 ```
 
-This copies five commands into `~/.claude/commands/` (or `$CLAUDE_CONFIG_DIR/commands/` if set), without overwriting any existing files:
+Then, from inside any Claude Code session:
 
-| Slash command | Effect |
-|---|---|
-| `/aidev-run <issue-url> <repo-path>` | Full headless pipeline: scout → critic → (auto) architect → (sketch 1) implementer, writes `.aidev/proposed.patch` |
-| `/aidev-doctor` | Environment audit (config, keys, CLI, Ollama) |
-| `/aidev-charter <repo-path>` | 5-question interview, writes `.aidev/charter.md` |
-| `/aidev-test <repo-path>` | Detect and run the project's test suite |
-| `/aidev-review <issue-url> <repo-path>` | Boy Scout pass on `.aidev/proposed.patch` with blockers + follow-up proposals |
+```
+/aidev-run https://github.com/your-org/your-repo/issues/42 ~/code/your-repo
+```
 
-Pass `--force` to overwrite existing commands. Uninstall with `aidev plugin uninstall` (locally-modified files are always preserved — the uninstaller only removes files whose content matches the shipped version).
-
-After install, type `/` in any Claude Code session and you'll see the new commands listed alongside your existing ones.
-
-## Build & run
+...or from your terminal:
 
 ```sh
-go build -o aidev ./cmd/aidev
-
-# Audit the environment before doing any real work (config, Anthropic key,
-# Ollama daemon, required models). Exits 1 on any FAIL.
-./aidev doctor
-
-# TUI mode — three panes: issue, scout brief, critic report (rightmost pane
-# retitles to "Architect sketches" once the Architect has produced output).
-# On startup, aidev runs the doctor automatically. In an interactive terminal
-# it will offer to auto-spawn Ollama and pull/swap missing models.
-./aidev -issue https://github.com/owner/repo/issues/42 -repo ../owner-repo
-
-# Override the Architect's sketch count (default 3)
-./aidev -issue ... -repo ... -n 5
-
-# Headless mode — scout + critic only, prints to stdout
-./aidev -headless -issue ... -repo ...
-
-# Headless mode with auto-architect — if Critic says "build", automatically
-# run the Architect and print sketches too. Useful in CI.
-./aidev -headless -auto -n 3 -issue ... -repo ...
-
-# Bypass the startup doctor (not recommended; use when you manage the
-# environment yourself and want to save a few hundred ms on cold start)
-./aidev -skip-doctor -issue ... -repo ...
-
-# Run tests inside a Docker container (isolation for untrusted patches)
-./aidev test -repo ~/code/myrepo --sandbox --image golang:1.24
-./aidev test -repo ~/code/myrepo --sandbox --image node:20 --writable
+aidev -issue https://github.com/your-org/your-repo/issues/42 -repo ~/code/your-repo
 ```
 
-## Doctor
+---
 
-`aidev doctor` is a precondition audit that runs automatically on every `aidev` invocation (unless you pass `-skip-doctor`). It checks:
+## What aidev actually does
 
-| Check | Fails when | Fix |
-|---|---|---|
-| `config` | `models.yaml` missing tiers or routing | edit `config/models.yaml` |
-| `anthropic-key` | a role routes to an anthropic tier but `ANTHROPIC_API_KEY` is unset | `export ANTHROPIC_API_KEY=sk-ant-...` |
-| `ollama-binary` | any role routes to ollama but the `ollama` CLI isn't on PATH | install from ollama.com |
-| `ollama-daemon` | binary present but `/api/tags` unreachable | aidev will offer to run `ollama serve` in the background (interactive TTY only) |
-| `ollama-models` | required models aren't pulled | aidev will offer to **pull**, **swap to an installed model**, or **abort** (interactive TTY only) |
+You give aidev a GitHub issue and a local repo. It runs a sequence of agents that each do one thing well:
 
-In headless/CI mode the doctor never prompts — it reports and fails fast, so you know exactly what to fix. Run `aidev doctor` explicitly to get the full report and a zero/non-zero exit code for a CI gate.
+1. **Scout** reads your repo (README, `CLAUDE.md`, `ARCHITECTURE.md`, file layout) and produces a factual brief.
+2. **Critic** takes the issue + brief + your engineering principles and argues both sides: is this change worth making? It ends with `RECOMMENDATION: build | defer | kill | unclear`. This is the feature aidev is built around — everything else exists because the Critic said *yes*.
+3. You approve (or kill).
+4. **Architect** produces N meaningfully different solution sketches (default 3) with trade-offs, risks, and principle alignment for each. You pick one.
+5. **Implementer** generates a unified git diff. Two turns: it asks which files it needs, you get those, it writes the patch. Saved to `.aidev/proposed.patch` — aidev never touches your source files directly, you `git apply` when you're ready.
+6. **Tester** runs your project's detected test suite (go / cargo / pytest / npm / gradle / make). Optionally inside a Docker sandbox.
+7. **Reviewer** does a Boy Scout pass on the patch: blockers, suggestions, and proposed follow-up issues.
 
-### First-pull consent
+Every step posts to the issue's GitHub thread as a running audit trail, with one pinned status comment + one-shot artifact comments per phase, and a rotating `aidev:<phase>` label so the Issues page becomes a kanban view of what aidev is doing across every repo.
 
-aidev will never silently download a multi-GB model. When a required model is missing, you'll see:
+## Why this shape
 
-```
-Ollama model "qwen2.5-coder:7b" is required but not installed.
+Several tools already turn issues into patches (aider, plandex, opencode, goose, Claude Code itself). None of them *argue with you first*. If the Critic decides the feature shouldn't exist, aidev tells you that and stops — it doesn't sheepishly try to implement a thing it thinks is a bad idea. That's the differentiator.
 
-  [1] Pull qwen2.5-coder:7b now (multi-GB download, requires network)
-  [2] Swap to one of your already-installed models
-  [3] Abort — aidev cannot run without a model for this tier
+The rest of the pipeline is designed around the same principle: **propose, never mutate**. Implementer writes a diff, doesn't apply it. Reviewer proposes follow-up issues, doesn't file them. Tester can run inside a container if you don't trust the patch yet. Every safety decision defaults to the narrower option.
 
-Choice [1/2/3]:
-```
+## Install
 
-Choosing `2` lists the models already pulled on your Ollama daemon and swaps the routing in-memory for the current run. To make the swap permanent, edit `config/models.yaml` to reference your chosen model.
-
-The Ollama daemon lifecycle is **not owned by aidev** — if we spawn it, it persists after aidev exits so we don't interfere with other things that use it.
-
-## Charter
-
-When aidev runs against a repo that has no strong signal for the Critic to anchor against — no `README.md` (or a near-empty one), no `CLAUDE.md`, no `ARCHITECTURE.md`, no `.aidev/charter.md` — the Critic has nothing to cite when pushing back on proposed features. The **Charter** agent fixes that by interviewing you and writing a clean product charter to `.aidev/charter.md` in the target repo.
-
-### Running the interview
+### The easy way (no Go required)
 
 ```sh
-aidev charter -repo /path/to/target
+curl -sSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash
 ```
 
-You'll be asked five questions:
+The installer detects your OS/arch, downloads the right prebuilt binary from the latest GitHub release, installs it to `~/.local/bin/aidev`, drops default config at `~/.config/aidev/`, and installs slash commands for Claude Code at `~/.claude/commands/aidev-*.md`.
 
-1. In one sentence, what does this product do?
-2. Who uses it?
-3. What's the single most important constraint? (correctness / latency / cost / security / compliance / something else)
-4. What is explicitly out of scope — things this product should NOT do?
-5. Any engineering principles that override or extend the defaults? (optional)
+### From source
 
-Your raw answers are then synthesised into a structured Markdown charter and written to `<repo>/.aidev/charter.md`. On subsequent runs, the Scout automatically absorbs this charter alongside README/CLAUDE.md/ARCHITECTURE.md and the Critic cites it when arguing about trade-offs.
+```sh
+git clone https://github.com/AiSU-AI/aidev.git
+cd aidev
+./install.sh
+```
 
-### Nudges during normal runs
+Auto-detects that you have Go and builds from the checkout. Same end state as the download path.
 
-If you invoke `aidev -issue ... -repo ...` against a repo with no strong signal and no existing charter, aidev prints a warning to stderr pointing at `aidev charter` before the pipeline starts. The pipeline still runs — the warning is advisory.
+### Other flags
 
-## Audit trail (controller)
+```sh
+./install.sh --bin ~/bin        # override target bin directory
+./install.sh --from-release     # force download mode even if Go is installed
+./install.sh --from-source      # force build mode
+./install.sh --version v0.2f    # pin a specific release
+./install.sh --force            # overwrite existing binary/config/plugin files
+./install.sh --no-doctor        # skip the post-install smoke test
+./install.sh --no-prereqs       # skip the 'suggest installing ollama' check
+```
 
-Every significant state transition — Scout started, Critic report ready, user approved, Architect produced sketches, run killed, error — is posted to the GitHub issue that seeded the run. A single **pinned status comment** is updated in place for every transition, and **one-shot artifact comments** contain the full Scout brief, Critic report, and Architect sketches.
+### Requirements
 
-A single `aidev:<phase>` label on the issue gives you a kanban-style view of every run at a glance on the repo's Issues page. Labels are swapped (not stacked) so there's always exactly one `aidev:*` label on an issue.
+- **macOS or Linux.** Windows is not supported yet — the TUI has POSIX-isms.
+- **[Claude Code](https://claude.ai/download)** installed and logged in (`claude /login`). aidev's medium and large tiers route through `claude --print`, so agent calls bill against your Max/Pro subscription. No `ANTHROPIC_API_KEY` required for the default config.
+- **[Ollama](https://ollama.com)** for the small tier (Scout, Tester failure summary). Optional — you can route the small tier through the claude CLI too by editing `config/models.yaml`, at the cost of subscription tokens.
+- **`GITHUB_TOKEN`** in your environment for reading private issues and posting the audit trail (`Issues: Read and write` scope).
 
-**Agents stay pure.** The controller pattern puts all GitHub I/O in the orchestrator — agents receive a `Context`, call an LLM, return markdown. They never touch the network. This keeps unit tests deterministic and keeps the failure modes of the pipeline contained to one place.
+Run `aidev doctor` at any point to verify the environment. If Ollama is installed but not running, doctor will spawn `ollama serve` in the background automatically.
 
-**Idempotent across re-runs.** The pinned status comment carries a hidden HTML fingerprint (`<!-- aidev:status -->`). On startup, aidev scans existing comments for that fingerprint and updates the existing one instead of posting a duplicate — so re-running aidev on the same issue doesn't spam the thread.
+## Usage
 
-**Disable with `-no-audit-trail`.** The controller is on by default when the run has a GitHub issue. Pass `-no-audit-trail` to run silently.
+### Typical flow (interactive TUI)
 
-**Credential.** The audit trail writes require `GITHUB_TOKEN` in the environment, with Issues: read and write permission. The same token aidev already uses for issue fetching.
-
-## TUI keybindings
+```sh
+aidev -issue https://github.com/your-org/your-repo/issues/42 -repo ~/code/your-repo
+```
 
 | Key | Action |
 |-----|--------|
 | `r` | Run Scout + Critic |
-| `a` | After Critic: approve → kick off Architect |
-| `1`–`9` | After Sketches: pick a sketch → kick off Implementer |
-| `t` | After Patch/Tests: run the detected test suite |
-| `v` | After Patch/Tests: run the Reviewer on the patch |
+| `a` | Approve Critic's recommendation → kick off Architect |
+| `1`–`9` | After sketches appear, pick one → kick off Implementer |
+| `t` | After patch is ready: run the test suite |
+| `v` | After patch is ready: run the Reviewer |
 | `k` | Kill the proposal |
 | `tab` | Cycle pane focus |
 | `q` / `ctrl+c` | Quit |
 
-The status bar shows a **cost preview** for the Architect run (sketch count, estimated output tokens, estimated seconds) before you approve, so the bill is never a surprise.
+The rightmost pane retitles as the pipeline advances: **Critic report** → **Architect sketches** → **Implementer patch** → **Test result** → **Review**. Earlier phases live in the GitHub audit trail on the issue, so the TUI doesn't try to preserve history.
+
+### From inside Claude Code (slash commands)
+
+Once `aidev plugin install` has dropped the slash commands, type `/` in any Claude Code session and you'll see:
+
+| Command | Effect |
+|---|---|
+| `/aidev-run <issue-url> <repo-path>` | Full pipeline: scout → critic → architect → sketch 1 → implementer |
+| `/aidev-doctor` | Environment audit |
+| `/aidev-charter <repo-path>` | 5-question interview to produce `.aidev/charter.md` |
+| `/aidev-test <repo-path>` | Run detected test suite, summarise failures |
+| `/aidev-review <issue-url> <repo-path>` | Boy Scout pass on the current proposed patch |
+
+### Headless (CI-friendly)
+
+```sh
+# Scout + Critic only
+aidev -headless -issue <url> -repo <path>
+
+# + auto-run Architect when Critic recommends "build"
+aidev -headless -auto -n 3 -issue <url> -repo <path>
+
+# + auto-run Implementer on sketch 1
+aidev -headless -auto -sketch 1 -issue <url> -repo <path>
+```
+
+Writes the diff to `.aidev/proposed.patch` and prints the full Markdown report to stdout.
+
+### Standalone subcommands
+
+```sh
+aidev doctor                                # environment audit
+aidev charter -repo <path>                  # interactive product charter interview
+aidev clarify -issue <url> -repo <path>     # structured question graph for ambiguities
+aidev test -repo <path>                     # run detected test suite
+aidev test -repo <path> --sandbox --image golang:1.24   # run tests inside Docker
+aidev review -issue <url> -repo <path>      # Boy Scout pass on .aidev/proposed.patch
+aidev followups -repo <path>                # dry-run review of proposed follow-up issues
+aidev followups -repo <path> --file-issues --target owner/repo   # actually file them
+aidev plugin install                        # install Claude Code slash commands
+aidev install                               # (re)install default config to ~/.config/aidev
+aidev --version                             # print the embedded build version
+```
 
 ## Configuration
 
-### `config/models.yaml`
+### `~/.config/aidev/models.yaml`
 
-Defines three tiers (small / medium / large) and a `routing` table that maps agent roles to tiers. Edit this file to point tiers at different models or providers. The Architect is routed to the `large` tier by default because sketch divergence needs deep reasoning.
+Three tiers (`small`, `medium`, `large`) mapped to providers (`ollama`, `anthropic`, `claude-cli`), plus a role-to-tier routing table. The shipped defaults:
 
-### `config/principles.yaml`
-
-The living charter the Critic uses. Starts with "Should this exist?", Boy Scout Rule, DRY, YAGNI, Well-Architected, Single Responsibility, Fail Loudly at Boundaries, Tests Describe Intent, and Reversibility. Add your own.
-
-A target repository can ship its own `.aidev/principles.yaml` which is merged on top of the global set — useful when an organisation has a standards repo (like `ai-dev-standards`) that downstream projects inherit from.
-
-## Sketch format
-
-The Architect is required to emit sketches in a parseable structure:
-
-```
-## Sketch 1: <short title>
-
-### Approach
-...
-
-### Key decisions
-- ...
-
-### Trade-offs
-- pro: ...
-- con: ...
-
-### Risks
-- ...
-
-### Principle alignment
-- <Principle Name>: aligned / tension / violation — why
-
-### Rough scope
-Files touched, LOC estimate, migrations, new dependencies.
-
----
-
-## Sketch 2: ...
+```yaml
+tiers:
+  small:  { provider: ollama,     model: qwen2.5-coder:7b,  ... }
+  medium: { provider: claude-cli, model: "" }
+  large:  { provider: claude-cli, model: "" }
+routing:
+  scout: small
+  critic: large
+  architect: large
+  charter: large
+  clarifier: large
+  implementer: medium
+  reviewer: medium
+  tester: small
 ```
 
-Sketches are Markdown only — no code. The Implementer (v0.3) is what writes code against a chosen sketch.
+Want the Critic on the direct Anthropic API with a specific model? Change one line:
+
+```yaml
+large: { provider: anthropic, model: claude-opus-4-6 }
+```
+
+and export `ANTHROPIC_API_KEY`. Want Scout on Claude instead of local Ollama? Change `scout: small` to `scout: large`.
+
+### `~/.config/aidev/principles.yaml`
+
+The living charter the Critic uses when arguing whether a feature should ship. Starts with "Should this exist?", Boy Scout Rule, DRY, YAGNI, Well-Architected, Single Responsibility, Fail Loudly at Boundaries, Tests Describe Intent, and Reversibility. Add your own; the Critic cites them by name.
+
+A target repo can also ship its own `.aidev/principles.yaml` which is merged on top of the global set — useful when an organisation has a standards repo (`ai-dev-standards`) that downstream projects inherit from.
+
+### `.aidev/charter.md` (per-repo)
+
+When a target repo has no strong signal — no README, no `CLAUDE.md`, no `ARCHITECTURE.md` — the Critic has nothing to anchor against. Run `aidev charter -repo <path>` to sit through a 5-question interview and produce `<repo>/.aidev/charter.md`. The Scout automatically absorbs it on every subsequent run and the Critic cites it when pushing back on proposals.
+
+### `.aidev/clarifier.md` (per-repo, per-session)
+
+After the Critic flags ambiguities in a proposal, run `aidev clarify -issue ... -repo ...` to get a structured dependency-aware question graph. Independent questions batch, chained questions serialise. Your answers get written to `.aidev/clarifier.md` and the next Architect run absorbs them as context.
+
+## The full agent pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Orchestrator (state machine + Reporter fanout)                      │
+└──┬──────┬──────┬─────┬──────┬──────┬─────┬──────┬──────┬────────────┘
+   │      │      │     │      │      │     │      │      │
+ Scout  Critic  (Clarifier) Architect Charter Implementer Tester Reviewer
+ (sm)   (lg)    (lg)        (lg)      (lg)    (md, 2-turn) (sm)  (md)
+
+ sm = small tier, ollama by default
+ md = medium tier, claude-cli by default
+ lg = large tier,  claude-cli by default
+```
+
+- **Scout** (extractive, small tier)
+- **Critic** (adversarial, large tier) — the keystone
+- **Architect** (divergent sketches, large tier)
+- **Charter / Clarifier** (opt-in standalone subcommands)
+- **Implementer** (generative, medium tier, two-turn file-content loading)
+- **Tester** (detected test runner, small tier for failure summaries, optional Docker sandbox)
+- **Reviewer** (Boy Scout pass, medium tier)
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `aidev doctor` says `FAIL claude-cli-binary` | Install Claude Code from https://claude.ai/download and log in (`claude /login`). Or edit `config/models.yaml` to route medium/large tiers to `anthropic` and set `ANTHROPIC_API_KEY`. |
+| `aidev doctor` says `FAIL ollama-daemon` | Should auto-spawn as of v0.2e. If it doesn't, run `ollama serve` manually, or pass `-skip-doctor` if you're managing the daemon yourself. |
+| `FAIL ollama-models — missing qwen2.5-coder:7b` | Interactive runs will offer to pull or swap. Manual fix: `ollama pull qwen2.5-coder:7b`, or edit `models.yaml` to point at a model you already have. |
+| Agent calls return `not authenticated` | Run `claude /login`. |
+| Private repo issue returns 404 | Export `GITHUB_TOKEN` with `Issues: Read and write`. |
+| Proposed.patch doesn't `git apply` cleanly | Known rough edge for complex diffs; read it manually and use it as a guide. File an issue with the failing diff if it's consistently bad. |
+| Tests touch the working tree in ways you don't trust | `aidev test --sandbox --image golang:1.24` runs inside Docker with the repo read-only. |
 
 ## Roadmap
 
-- **v0.2a** — Architect agent with N divergent sketches, `-n` flag, cost preview. *(shipped)*
-- **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent with alternative-model offering. *(shipped)*
-- **v0.2b.1** — automatic GitHub audit trail (pinned status comment, artifact comments, phase labels) via a controller that keeps agents pure. *(shipped)*
-- **v0.2c** — Charter agent + `aidev charter` subcommand + `.aidev/charter.md` + Scout + Critic integration. *(shipped)*
-- **v0.3a** — Implementer agent: produces a unified git diff from a chosen sketch. *(shipped)*
-- **v0.3a.1** *(this release)* — Two-turn Implementer: first turn asks the model which files it needs to see the contents of, second turn embeds those file contents in the prompt before generating the diff. Dramatically improves the chance that `.aidev/proposed.patch` applies cleanly with `git apply`.
-- **v0.3b** — Tester agent: detects the project's test runner, executes it, and summarises failures. *(shipped)*
-- **v0.4** — Reviewer agent: Boy Scout pass on a patch with blockers/suggestions/follow-up issue proposals. New `aidev review` subcommand. Full agent pipeline complete. *(shipped)*
-- **v0.2d** *(this release)* — Claude Code CLI provider as the default backend for medium and large tiers (works out of the box with a Max/Pro subscription, no API key required), plus `aidev plugin install` for Claude Code slash-command integration.
-- **v0.5+** — Adaptive dialogue (dependency-aware question graphs), auto-filing of follow-up issues via `aidev followups --file-issues`, sandboxing for the Tester, streaming LLM responses in the TUI, two-turn Implementer file-content loading.
-- **v0.4** — Reviewer + Boy Scout pass; auto-open follow-up issues for out-of-scope improvements.
-- **v0.5** — Streaming LLM responses in the TUI.
+Shipped:
+
+- **v0.1** — Scout + Critic + Bubble Tea TUI
+- **v0.2a** — Architect with N divergent sketches, cost preview
+- **v0.2b** — `aidev doctor` + Ollama auto-spawn + first-pull consent
+- **v0.2b.1** — Controller for automatic GitHub issue audit trail
+- **v0.2c** — Charter agent + interview subcommand
+- **v0.2d** — Claude Code CLI provider + `aidev plugin install`
+- **v0.2e** — One-command `install.sh` + XDG config discovery + prebuilt release binaries
+- **v0.3a** — Implementer agent (unified git diff)
+- **v0.3a.1** — Two-turn Implementer with file-content loading
+- **v0.3a.2** — TUI keybindings for Implementer / Tester / Reviewer
+- **v0.3b** — Tester agent with detected test runner
+- **v0.4** — Reviewer agent with Boy Scout pass + follow-up proposals
+- **v0.4.1** — `aidev followups --file-issues`
+- **v0.5a** — Optional Streamer interface + Claude SSE implementation
+- **v0.5b** — Tester Docker sandbox
+- **v0.5c** — Clarifier agent with dependency-aware question graph
+
+Not yet:
+
+- Windows support (TUI portability)
+- `aidev update` self-updater
+- SHA256 checksum verification of downloaded release tarballs
+- Streaming TUI progress views
+- Ollama + Claude CLI Streamer implementations
+- Homebrew formula
+- PR-comment review-reading loop (aidev reacts to review comments on PRs it opened)
 
 ## Layout
 
 ```
-cmd/aidev/              entry point, flag handling, doctor subcommand
-internal/config/        YAML loader for models + principles
-internal/llm/           Provider interface, Ollama + Claude backends, Router
-internal/github/        REST client for fetching issues
-internal/repo/          Repo scanner + repo-local principle loader
-internal/agents/        Scout, Critic, Architect agents (shared Context, pure)
-internal/orchestrator/  State machine + Reporter interface + GitHubReporter (controller)
-internal/tui/           Bubble Tea model, update, view, keybindings
-internal/doctor/        Precondition checks: config, keys, claude CLI, Ollama daemon/models
-internal/plugin/        Claude Code slash command installer (embedded files)
-plugin/aidev/           Slash command source (also embedded in the binary)
-config/                 Shipped defaults: models.yaml, principles.yaml
+cmd/aidev/                entry point, flag handling, subcommand dispatch
+internal/config/          YAML loader for models + principles
+internal/llm/             Provider interface + Ollama/Claude/ClaudeCLI backends + Streamer
+internal/github/          REST client (read + write for the audit trail)
+internal/repo/            Repo scanner + repo-local principle loader
+internal/agents/          Scout · Critic · Architect · Charter · Clarifier ·
+                          Implementer · Tester · Reviewer (all pure; side effects
+                          live in the orchestrator)
+internal/orchestrator/    State machine + Reporter interface + GitHubReporter (controller)
+internal/tui/             Bubble Tea model / update / view / keybindings
+internal/doctor/          Precondition checks: config, keys, Claude CLI, Ollama
+internal/plugin/          Claude Code slash command installer (go:embed)
+internal/installpkg/      Default config installer (go:embed)
+internal/version/         Build-time version embedding
+config/                   Shipped defaults (canonical source)
+plugin/aidev/             Slash command source (canonical, also embedded in binary)
+install.sh                One-command installer (download + build modes)
+Makefile                  Minimal targets for developers who prefer make
+.github/workflows/        Release build pipeline (triggered by v* tags)
 ```
+
+## Contributing
+
+File issues against [`AiSU-AI/aidev`](https://github.com/AiSU-AI/aidev). PRs welcome but start with an issue first — aidev's own Critic may have opinions about whether your proposed change belongs.
+
+## License
+
+See [LICENSE](LICENSE).
