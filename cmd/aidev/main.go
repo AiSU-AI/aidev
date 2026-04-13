@@ -113,7 +113,7 @@ func main() {
 	}
 
 	var (
-		issueURL     = flag.String("issue", "", "GitHub issue URL (https://github.com/owner/repo/issues/123)")
+		issueURL     = flag.String("issue", "", "GitHub issue reference: full URL (https://github.com/owner/repo/issues/N) or a bare number when -repo points at a local clone with a github.com remote")
 		repoPath     = flag.String("repo", ".", "Path to the target repository")
 		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
 		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
@@ -153,13 +153,23 @@ func main() {
 		fatal(fmt.Sprintf("orchestrator: %v", err))
 	}
 
-	ctx := context.Background()
-	if err := orch.LoadIssue(ctx, *issueURL); err != nil {
-		fatal(fmt.Sprintf("load issue: %v", err))
-	}
+	// Resolve the repo path FIRST because the issue resolver may need
+	// it to turn a bare issue number into a full URL via git remote
+	// inference. Repo-less bare numbers fail loudly instead of silently
+	// running against the wrong target.
 	absRepo, err := filepath.Abs(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo path: %v", err))
+	}
+
+	resolvedIssueURL, _, _, _, err := github.ResolveIssueRef(*issueURL, absRepo)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve issue: %v", err))
+	}
+
+	ctx := context.Background()
+	if err := orch.LoadIssue(ctx, resolvedIssueURL); err != nil {
+		fatal(fmt.Sprintf("load issue: %v", err))
 	}
 	if err := orch.LoadRepo(absRepo); err != nil {
 		fatal(fmt.Sprintf("scan repo: %v", err))
@@ -209,7 +219,7 @@ func main() {
 // BEFORE the Architect when the Critic flagged ambiguities.
 func runClarifySubcommand() {
 	var (
-		issueURL  = flag.String("issue", "", "GitHub issue URL (required)")
+		issueURL  = flag.String("issue", "", "GitHub issue reference: full URL or a bare number (resolved against -repo's git remote)")
 		repoPath  = flag.String("repo", ".", "Path to the target repository")
 		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
 	)
@@ -223,13 +233,17 @@ func runClarifySubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("orchestrator: %v", err))
 	}
-	ctx := context.Background()
-	if err := orch.LoadIssue(ctx, *issueURL); err != nil {
-		fatal(fmt.Sprintf("load issue: %v", err))
-	}
 	absRepo, err := filepath.Abs(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+	resolvedIssueURL, _, _, _, err := github.ResolveIssueRef(*issueURL, absRepo)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve issue: %v", err))
+	}
+	ctx := context.Background()
+	if err := orch.LoadIssue(ctx, resolvedIssueURL); err != nil {
+		fatal(fmt.Sprintf("load issue: %v", err))
 	}
 	if err := orch.LoadRepo(absRepo); err != nil {
 		fatal(fmt.Sprintf("scan repo: %v", err))
@@ -483,7 +497,7 @@ func runPluginSubcommand() {
 // `<repo>/.aidev/followups.md` for manual triage.
 func runReviewSubcommand() {
 	var (
-		issueURL  = flag.String("issue", "", "GitHub issue URL (required for context)")
+		issueURL  = flag.String("issue", "", "GitHub issue reference: full URL or a bare number (resolved against -repo's git remote)")
 		repoPath  = flag.String("repo", ".", "Path to the target repository")
 		patchPath = flag.String("patch", "", "Path to the patch file to review (default: <repo>/.aidev/proposed.patch)")
 		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
@@ -498,13 +512,17 @@ func runReviewSubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("orchestrator: %v", err))
 	}
-	ctx := context.Background()
-	if err := orch.LoadIssue(ctx, *issueURL); err != nil {
-		fatal(fmt.Sprintf("load issue: %v", err))
-	}
 	absRepo, err := filepath.Abs(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
+	}
+	resolvedIssueURL, _, _, _, err := github.ResolveIssueRef(*issueURL, absRepo)
+	if err != nil {
+		fatal(fmt.Sprintf("resolve issue: %v", err))
+	}
+	ctx := context.Background()
+	if err := orch.LoadIssue(ctx, resolvedIssueURL); err != nil {
+		fatal(fmt.Sprintf("load issue: %v", err))
 	}
 	if err := orch.LoadRepo(absRepo); err != nil {
 		fatal(fmt.Sprintf("scan repo: %v", err))
