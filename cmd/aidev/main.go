@@ -196,7 +196,7 @@ func main() {
 	}
 
 	if *headless {
-		runHeadless(ctx, orch, *autoRun, *pickSketch)
+		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *pickSketch)
 		return
 	}
 
@@ -779,7 +779,15 @@ func discoverConfigDir() string {
 // recommends "build", so a CI pipeline can get the sketches in one pass.
 // With -sketch N, it additionally runs the Implementer against the chosen
 // sketch and prints the resulting patch.
-func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool, pickSketch int) {
+//
+// When the Critic returns "unclear" or "defer" AND stdin is a TTY,
+// runHeadless launches an in-line Clarifier interview instead of
+// halting. It asks the Critic's own sharp questions via the Clarifier,
+// collects stdin answers, writes them to .aidev/clarifier.md, and
+// re-runs the Critic. Up to 2 interview rounds total — if the Critic
+// still refuses, we halt and report the latest verdict. A "kill"
+// verdict always halts without an interview; killing is explicit.
+func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int) {
 	for ev := range orch.Run(ctx) {
 		if ev.Err != nil {
 			fatal(ev.Err.Error())
@@ -803,6 +811,14 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool
 		fmt.Println(rpt.Markdown)
 		fmt.Println()
 		fmt.Printf("RECOMMENDATION: %s\n", rpt.Recommendation)
+	}
+
+	// Interview loop on unclear/defer. Skipped when -auto is off
+	// (caller is a CI pipeline, not a human), when there's no TTY on
+	// stdin (headless without interactivity), or when the verdict is
+	// build/kill (nothing to clarify).
+	if auto && rpt != nil && doctor.IsTTY() {
+		rpt = runInterviewLoop(ctx, orch, cfg, absRepo, rpt)
 	}
 
 	if !auto || rpt == nil || rpt.Recommendation != "build" {
@@ -847,6 +863,158 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, auto bool
 			fmt.Printf("\n_Patch also written to %s_\n", p.Path)
 		}
 	}
+}
+
+// runInterviewLoop drives up to maxInterviewRounds Clarifier
+// interviews against a Critic that came back unclear/defer. Each round:
+//
+//  1. Run the Clarifier agent on the current Context to extract a
+//     structured QuestionGraph from the Critic's own sharp questions.
+//  2. Walk the graph in dependency-aware waves, collecting free-form
+//     stdin answers from the developer.
+//  3. Persist the session to .aidev/clarifier.md so downstream runs
+//     pick it up via the Scout.
+//  4. Stash the same markdown on ctx.ClarifierNotes and call
+//     orch.Recritique(ctx) to get a fresh verdict.
+//
+// Returns the latest Critic report (which the caller compares against
+// "build" to decide whether to proceed). Any fatal error along the
+// way short-circuits via fatal() just like the rest of main.go — the
+// user sees a clear message and the process exits.
+//
+// Design notes:
+//
+//   - kill is NEVER interviewed. A kill verdict is the Critic saying
+//     "this is a bad idea, full stop". The interview is for
+//     ambiguity, not for overriding rejection.
+//
+//   - build stops the loop immediately — no more questions to ask.
+//
+//   - If the Clarifier returns an empty question graph (nothing
+//     ambiguous) the loop terminates: we have no way to move the
+//     needle without inventing questions.
+//
+//   - Max 2 rounds. Past that, we print the latest verdict and let
+//     the developer decide out-of-band whether to override.
+const maxInterviewRounds = 2
+
+func runInterviewLoop(
+	ctx context.Context,
+	orch *orchestrator.Orchestrator,
+	cfg *config.Config,
+	absRepo string,
+	initial *agents.Report,
+) *agents.Report {
+	rpt := initial
+	if rpt == nil {
+		return nil
+	}
+
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("router: %v", err))
+	}
+	clarifier, err := agents.NewClarifier(router)
+	if err != nil {
+		fatal(fmt.Sprintf("clarifier: %v", err))
+	}
+	reader := bufio.NewReader(os.Stdin)
+
+	for round := 1; round <= maxInterviewRounds; round++ {
+		if rpt.Recommendation == "build" || rpt.Recommendation == "kill" {
+			return rpt
+		}
+
+		fmt.Println()
+		fmt.Printf("## Clarifier interview (round %d of %d — Critic said %q)\n\n",
+			round, maxInterviewRounds, rpt.Recommendation)
+		fmt.Fprintln(os.Stderr, "aidev: Critic returned "+rpt.Recommendation+". Running Clarifier to turn its sharp questions into an interview...")
+
+		graph, err := clarifier.Run(ctx, orch.AgentContext())
+		if err != nil {
+			fatal(fmt.Sprintf("clarifier: %v", err))
+		}
+		if len(graph.Questions) == 0 {
+			fmt.Fprintln(os.Stderr, "aidev: Clarifier produced no questions — nothing unambiguous to ask about. Halting with the current verdict.")
+			return rpt
+		}
+
+		waves := agents.BatchByDependencies(graph)
+		answers := make([]agents.Answer, 0, len(graph.Questions))
+		fmt.Fprintf(os.Stderr, "\n%d question(s) in %d wave(s). Answer each, then press enter. Leave blank to skip.\n\n",
+			len(graph.Questions), len(waves))
+		for wi, wave := range waves {
+			fmt.Fprintf(os.Stderr, "— Wave %d (%d question(s)) —\n\n", wi+1, len(wave))
+			for _, q := range wave {
+				fmt.Fprintf(os.Stderr, "%s: %s\n> ", q.ID, q.Text)
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil && line == "" {
+					fatal(fmt.Sprintf("read answer: %v", readErr))
+				}
+				answers = append(answers, agents.Answer{
+					ID:   q.ID,
+					Text: strings.TrimRight(line, "\n"),
+				})
+			}
+			fmt.Fprintln(os.Stderr)
+		}
+
+		path, err := agents.WriteClarifierMarkdown(absRepo, graph, answers)
+		if err != nil {
+			fatal(fmt.Sprintf("write clarifier: %v", err))
+		}
+		fmt.Fprintf(os.Stderr, "aidev: wrote clarifier session to %s\n", path)
+
+		orch.AgentContext().ClarifierNotes = formatClarifierNotes(graph, answers)
+
+		fmt.Fprintln(os.Stderr, "aidev: re-running Critic with clarifier answers...")
+		for ev := range orch.Recritique(ctx) {
+			if ev.Err != nil {
+				fatal(ev.Err.Error())
+			}
+		}
+		rpt = orch.CriticReport()
+		if rpt == nil {
+			fmt.Fprintln(os.Stderr, "aidev: Recritique returned no report; halting.")
+			return nil
+		}
+
+		fmt.Println()
+		fmt.Printf("## Critic report (round %d, after clarifier)\n\n", round)
+		fmt.Println(rpt.Markdown)
+		fmt.Println()
+		fmt.Printf("RECOMMENDATION: %s\n", rpt.Recommendation)
+	}
+
+	return rpt
+}
+
+// formatClarifierNotes renders a Clarifier session (graph + answers)
+// as compact markdown suitable for embedding in the Critic prompt.
+// Skips unanswered questions so the Critic doesn't mistake blanks for
+// negative signal. Walks in dependency wave order so the prose reads
+// top-down the same way the user typed it.
+func formatClarifierNotes(g *agents.QuestionGraph, answers []agents.Answer) string {
+	if g == nil || len(g.Questions) == 0 {
+		return ""
+	}
+	byID := make(map[string]string, len(answers))
+	for _, a := range answers {
+		byID[a.ID] = strings.TrimSpace(a.Text)
+	}
+	var b strings.Builder
+	waves := agents.BatchByDependencies(g)
+	for _, wave := range waves {
+		for _, q := range wave {
+			ans := byID[q.ID]
+			if ans == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "- **Q (%s):** %s\n", q.ID, q.Text)
+			fmt.Fprintf(&b, "  **A:** %s\n", ans)
+		}
+	}
+	return b.String()
 }
 
 func fatal(msg string) {

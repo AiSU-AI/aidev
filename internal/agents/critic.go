@@ -70,7 +70,14 @@ You MUST:
    or  RECOMMENDATION: unclear
 
 Do NOT hedge the recommendation. If the evidence is mixed, choose "unclear"
-and say what evidence would move you.`
+and say what evidence would move you.
+
+If a "Clarifier session" section is present in the input below, it contains
+the human's direct answers to sharp questions YOU raised in a prior pass.
+Treat those answers as authoritative: they are ground truth about intent,
+scope, and environment that overrides any assumption you might otherwise
+make. Re-decide the verdict in light of them — do NOT re-ask the same
+questions unless the answers themselves raised new ambiguities.`
 
 	// Marshal the principles into a compact, quotable block.
 	var principles strings.Builder
@@ -85,6 +92,10 @@ and say what evidence would move you.`
 	user.WriteString(cc.ScoutReport)
 	user.WriteString("\n\n## Engineering principles\n\n")
 	user.WriteString(principles.String())
+	if strings.TrimSpace(cc.ClarifierNotes) != "" {
+		user.WriteString("\n\n## Clarifier session (human answers to your previous sharp questions — authoritative)\n\n")
+		user.WriteString(cc.ClarifierNotes)
+	}
 
 	resp, err := c.Provider.Complete(ctx, llm.Request{
 		System: system,
