@@ -57,7 +57,13 @@ func checkOllama(ctx context.Context, cfg *config.Config, opts Options) []Result
 	if pingOllama(ctx, endpoint) {
 		daemonResult.Severity = OK
 		daemonResult.Message = "daemon reachable at " + endpoint
-	} else if opts.AutoSpawnOllama && opts.Interactive {
+	} else if opts.AutoSpawnOllama {
+		// Note: auto-spawn is gated only on opts.AutoSpawnOllama, not
+		// opts.Interactive. Spawning `ollama serve` is idempotent and
+		// the daemon persists beyond aidev's lifetime (we don't own
+		// it), so it is safe to do in non-interactive contexts like
+		// `aidev doctor`. Interactivity only gates user PROMPTS —
+		// pulling a model or swapping to an alternative.
 		fmt.Fprintf(opts.Out, "ollama daemon not reachable. spawning `ollama serve` in the background...\n")
 		spawnErr := spawnOllama()
 		if spawnErr != nil {
