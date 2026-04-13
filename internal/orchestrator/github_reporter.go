@@ -117,6 +117,10 @@ func (r *GitHubReporter) OnEvent(ctx context.Context, ev Event) error {
 		return r.transition(ctx, "tests-passed", "✅ Tests passed", ev.Message)
 	case StateTestsFailed:
 		return r.transition(ctx, "tests-failed", "❌ Tests failed", ev.Message)
+	case StateReviewing:
+		return r.transition(ctx, "reviewing", "👀 Reviewer auditing patch...", ev.Message)
+	case StateReviewDone:
+		return r.transition(ctx, "review-done", "📝 Review complete", ev.Message)
 	case StateKilled:
 		return r.transition(ctx, "killed", "🛑 Killed", ev.Message)
 	case StateError:
