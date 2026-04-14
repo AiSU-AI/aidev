@@ -84,16 +84,18 @@ const (
 
 	// inventoryCap is the maximum number of repo-relative file paths
 	// shown to the picker and to generateDiff's "file inventory"
-	// section. Bumped from the old 200-ish limit because a modern
-	// Next.js marketing site or TS monorepo routinely has 500-1500
-	// source files; a too-small inventory forces the picker to
-	// hallucinate paths it hasn't seen. 2000 is generous enough to
-	// cover almost every real codebase while keeping the prompt
-	// under ~80 KB of text — well inside the Claude-large context
-	// window. Oversized monorepos still get truncated, but the
-	// prompt explicitly tells the model to guess + expect a
-	// "missing path" response on the next turn as a fallback.
-	inventoryCap = 2000
+	// section. Bumped from 2000 to 3000 after a real monorepo
+	// (Next.js marketing site inside a larger product monorepo) hit
+	// the cap on alphabetically-earlier directories and never reached
+	// apps/marketing/src/components/ — leaving the Implementer with
+	// a truncated view of the tree and no TSX files from the
+	// component directory the Clarifier had explicitly cited. 3000
+	// is the next belt-and-braces step above 2000; the FUNDAMENTAL
+	// fix is in Run(), which now auto-harvests paths from upstream
+	// agent output (Scout, Critic, Clarifier, sketch) and loads
+	// them directly regardless of whether they're in the inventory.
+	// The inventory is now a hint, not a source of truth.
+	inventoryCap = 3000
 )
 
 // Run asks the LLM to produce a unified diff that implements the chosen
@@ -132,18 +134,59 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 		return nil, errors.New("implementer: no repo snapshot")
 	}
 
+	// Pre-load files that upstream agents (Scout, Critic, Clarifier,
+	// Architect) have already cited in their output. These paths are
+	// authoritative: if the Clarifier quotes
+	// `apps/marketing/src/components/sections/foo/bar.tsx:193` as
+	// evidence, we should load that file automatically instead of
+	// making the Implementer guess from the picker's inventory.
+	//
+	// This is the fix for the v0.3a.3 failure mode where the
+	// Implementer emitted `ERROR: files don't exist` because its
+	// inventory was truncated before reaching the directory the
+	// Clarifier had literally just cited. The inventory is
+	// necessarily bounded; upstream agent output is not, and it
+	// tends to contain exactly the paths that matter.
+	contents := make(map[string]string)
+	var missing []string
+	upstreamPaths := harvestPaths(
+		c.Issue.Body,
+		c.ScoutReport,
+		c.CriticReport,
+		chosen.Markdown,
+		c.ClarifierNotes,
+	)
+	if c.Snapshot != nil {
+		upstreamPaths = append(upstreamPaths, harvestPaths(c.Snapshot.ClarifierContent)...)
+	}
+	if len(upstreamPaths) > 0 {
+		harvested, harvestMissing := readFiles(c.Snapshot.Root, upstreamPaths)
+		for p, body := range harvested {
+			contents[p] = body
+		}
+		// harvestMissing represents upstream citations that
+		// couldn't be resolved — worth surfacing so the
+		// Implementer knows the Clarifier/Scout mentioned them
+		// but the harness couldn't find them on disk. This is
+		// useful feedback even though it's rare (upstream agents
+		// usually cite real paths).
+		missing = appendUniqueCapped(missing, harvestMissing, 40)
+	}
+
 	// Turn 1: ask the model which files it needs to see.
 	wanted, err := i.selectFiles(ctx, c, chosen)
 	if err != nil {
 		return nil, fmt.Errorf("implementer: file selection: %w", err)
 	}
 
-	// Load the requested file contents (size-capped, path-validated).
-	// Missing paths (hallucinated by the picker) are tracked
-	// separately so the next prompt turn can tell the model which
-	// guesses were wrong — the difference between "silent under-
-	// specification" and "actionable error signal".
-	contents, missing := readFiles(c.Snapshot.Root, wanted)
+	// Load the picker's requested file contents on top of the
+	// already-harvested upstream paths. Both go into the same
+	// contents map.
+	pickerContents, pickerMissing := readFiles(c.Snapshot.Root, wanted)
+	for p, body := range pickerContents {
+		contents[p] = body
+	}
+	missing = appendUniqueCapped(missing, pickerMissing, 40)
 
 	// Turn 2 (with up to maxNeedFilesRounds additional rounds): ask
 	// for the diff. If the model comes back with NEED_FILES instead,
@@ -518,12 +561,35 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		"   opt-in to seeing MORE of the codebase before you do the work.\n" +
 		"   Do not use it to defer writing the diff entirely.\n" +
 		"\n" +
-		"8. ERROR escape hatch. If the task is genuinely impossible\n" +
-		"   (required files don't exist on disk, the sketch contradicts\n" +
-		"   itself, the chosen approach would require migrations outside\n" +
-		"   this repository), emit a single line starting with 'ERROR: '\n" +
-		"   followed by a one-sentence explanation. The orchestrator will\n" +
-		"   surface the reason verbatim.\n" +
+		"   IMPORTANT: paths cited in the Clarifier session, Scout brief,\n" +
+		"   Critic report, or Architect sketch are KNOWN TO EXIST in the\n" +
+		"   repository — those agents ran against the same checkout you\n" +
+		"   are and verified those paths. You can NEED_FILES them even if\n" +
+		"   they are not listed in the 'Repository file inventory' section\n" +
+		"   below: the inventory may be truncated and absence from it is\n" +
+		"   NOT evidence that a file is missing. When in doubt, prefer\n" +
+		"   NEED_FILES over ERROR.\n" +
+		"\n" +
+		"8. ERROR escape hatch. Reserved for the NARROW case where the\n" +
+		"   task is genuinely impossible — for example, the sketch\n" +
+		"   contradicts itself, or it requires migrations outside this\n" +
+		"   repository. Emit a single line starting with 'ERROR: '\n" +
+		"   followed by a one-sentence explanation. The orchestrator\n" +
+		"   will surface the reason verbatim.\n" +
+		"\n" +
+		"   Do NOT emit ERROR claiming 'files do not exist' unless you\n" +
+		"   have FIRST tried to load them via NEED_FILES and the harness\n" +
+		"   reported them in the 'Paths you previously requested that DO\n" +
+		"   NOT EXIST' section. Absence from your current view is NOT\n" +
+		"   evidence of absence from the repository; the inventory is\n" +
+		"   necessarily bounded and you can always request more.\n" +
+		"\n" +
+		"   Concretely: if the Clarifier or Scout brief mentions a path\n" +
+		"   like apps/marketing/src/components/foo/bar.tsx and that path\n" +
+		"   is not in your current file contents, your next response\n" +
+		"   should be NEED_FILES requesting that path — NOT ERROR\n" +
+		"   declaring the file doesn't exist. The harness will tell you\n" +
+		"   on the next turn whether the path resolved.\n" +
 		"\n" +
 		"9. FORBIDDEN OUTPUTS — the following are failure modes, not\n" +
 		"   acceptable compromises. Prefer NEED_FILES or ERROR over any of\n" +
@@ -605,7 +671,7 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 	// order of 500-1500 source files).
 	inv := listSourceFiles(c.Snapshot.Root, inventoryCap)
 	if len(inv) > 0 {
-		user.WriteString("\n\n## Repository file inventory (pick NEED_FILES paths from this list — anything outside this list won't be found)\n\n")
+		user.WriteString("\n\n## Repository file inventory (may be truncated — prefer paths from this list, but the absence of a path here is NOT proof the file is missing)\n\n")
 		for _, f := range inv {
 			user.WriteString("- ")
 			user.WriteString(f)
@@ -838,6 +904,70 @@ func stripCodeFence(s string) string {
 		lines = lines[:n-1]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// harvestPathRe matches what LOOKS like a repo-relative source file
+// path: one or more path segments separated by forward slashes, ending
+// in a known source-file extension. Leading drive letters, absolute
+// paths, URL schemes, and trailing non-path characters are deliberately
+// excluded by the pattern.
+//
+// We intentionally accept false positives here (strings that look like
+// paths but aren't real files) — readFiles will reject any non-existent
+// path via its os.Stat check and route it to the missing list. The
+// cost of a false positive is one extra entry in the missing list; the
+// cost of a false negative is the Implementer emitting ERROR when it
+// should have loaded the file.
+var harvestPathRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_\-./])([A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-.]+)+\.(?:tsx?|jsx?|mjs|cjs|go|py|rs|java|kt|rb|php|c|cc|cpp|h|hpp|swift|m|md|mdx|ya?ml|toml|json|yaml))\b`)
+
+// harvestPaths extracts repo-relative source file paths that upstream
+// agents (Scout brief, Critic report, Clarifier session, Architect
+// sketch markdown) have cited in their prose. These paths are loaded
+// directly into the Implementer's contents map at the start of Run()
+// so the model never has to guess at paths that have already been
+// verified by an earlier stage of the pipeline.
+//
+// The regex is deliberately permissive — false positives (strings
+// that look like paths but aren't) are cheap because readFiles will
+// reject them via os.Stat and report them in the missing list. False
+// negatives (real paths the regex didn't match) are expensive because
+// they force the Implementer to fall back to NEED_FILES or, in the
+// worst case, emit ERROR claiming files don't exist.
+//
+// Capped at maxHarvestedPaths entries to keep the initial load
+// bounded on prose-heavy inputs. De-duplicated. Filtered through
+// isSafeRelPath.
+func harvestPaths(inputs ...string) []string {
+	const maxHarvestedPaths = 60
+	seen := make(map[string]bool)
+	var out []string
+	for _, input := range inputs {
+		if input == "" {
+			continue
+		}
+		matches := harvestPathRe.FindAllStringSubmatch(input, -1)
+		for _, m := range matches {
+			p := strings.TrimSpace(m[1])
+			// Strip a trailing `:` with a line-number annotation
+			// (e.g. "foo/bar.tsx:193-199" → "foo/bar.tsx"). This
+			// is how Clarifier evidence usually cites files.
+			if idx := strings.Index(p, ":"); idx >= 0 {
+				p = p[:idx]
+			}
+			if !isSafeRelPath(p) {
+				continue
+			}
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+			if len(out) >= maxHarvestedPaths {
+				return out
+			}
+		}
+	}
+	return out
 }
 
 // listSourceFiles returns up to `limit` source file paths from rootDir,
