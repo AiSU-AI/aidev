@@ -87,11 +87,21 @@ tiers:
 # definitions above differ — the roles themselves want the same
 # relative size of model regardless of whether the backend is local
 # or cloud.
+#
+# Note: in this fully-local preset, the Coordinator also runs on a
+# local model (qwen2.5:32b). If you have Claude CLI available and
+# want the "local horse, cloud jockey" shape — local Implementer
+# with a cloud-backed Coordinator that catches fabrication and
+# invalid-syntax failures — create your own `models.local-mixed.yaml`
+# with `coordinator` routed to a `cloud_large` tier that uses
+# `provider: claude-cli`. This preset is intentionally 100% offline
+# to serve the air-gapped / privacy-first use case.
 routing:
   scout: small
   critic: large
   architect: large
   charter: large
+  coordinator: large
   implementer: medium
   reviewer: medium
   tester: small

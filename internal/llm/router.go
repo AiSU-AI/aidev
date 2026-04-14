@@ -48,10 +48,27 @@ func buildProvider(t config.Tier) (Provider, error) {
 
 // For returns the Provider assigned to the given role. Unknown roles return
 // an error so callers are forced to update routing when a new agent is added.
+//
+// RoleCoordinator is the one exception: because it was added after users
+// already had models.yaml files on disk, an unrouted Coordinator role
+// transparently falls back to RoleCritic's tier (both are judgment tasks
+// that want the large tier). This keeps older configs working without a
+// config migration step. The fallback is logged nowhere because it's the
+// correct default; users who want a different tier for the Coordinator
+// specifically add 'coordinator: <tier>' to their routing block and the
+// fallback never fires.
 func (r *Router) For(role Role) (Provider, error) {
 	tier, ok := r.routing[string(role)]
 	if !ok {
-		return nil, fmt.Errorf("router: no tier configured for role %q", role)
+		if role == RoleCoordinator {
+			if fallback, haveCritic := r.routing[string(RoleCritic)]; haveCritic {
+				tier = fallback
+				ok = true
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("router: no tier configured for role %q", role)
+		}
 	}
 	p, ok := r.tiers[tier]
 	if !ok {

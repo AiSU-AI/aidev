@@ -27,6 +27,13 @@ const (
 	RoleImplementer Role = "implementer"
 	RoleReviewer    Role = "reviewer"
 	RoleTester      Role = "tester"
+	// RoleCoordinator is the cloud-backed safety net that reviews the
+	// Implementer's diff before it hits disk. Wired into the
+	// orchestrator's Implement loop at Gate 1 (post-Implementer,
+	// pre-WriteTo). Typically routed to the large tier because catching
+	// fabrication and invalid-syntax failures is a judgment task — the
+	// same reason the Critic and Architect run there.
+	RoleCoordinator Role = "coordinator"
 )
 
 // Message is a single turn in a conversation. Role is "user" or "assistant".

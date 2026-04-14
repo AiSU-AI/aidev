@@ -40,14 +40,24 @@ tiers:
     temperature: 0.3
 
 # Role -> tier routing. Roles that need deep reasoning (critic,
-# architect, charter, reviewer) use the large tier. Implementer uses
-# medium. Scout and tester are routed to the small local tier for speed
-# and cost.
+# architect, charter, coordinator) use the large tier. Implementer
+# and reviewer use medium. Scout and tester are routed to the small
+# local tier for speed and cost.
+#
+# coordinator is aidev's Gate-1 safety net: it reviews the
+# Implementer's diff before it's written to disk and catches common
+# failure modes (fabrication, invalid syntax for the file format,
+# auxiliary TODO files, partial scope). It runs on the large tier
+# because catching those failures is a judgment task — the same
+# reason the Critic runs there. If you're running a local
+# Implementer (see models.local.yaml), keeping the Coordinator on a
+# cloud tier is the recommended "local horse, cloud jockey" shape.
 routing:
   scout: small
   critic: large
   architect: large
   charter: large
+  coordinator: large
   implementer: medium
   reviewer: medium
   tester: small

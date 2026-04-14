@@ -80,10 +80,12 @@ type Orchestrator struct {
 	critic      *agents.Critic
 	architect   *agents.Architect
 	implementer *agents.Implementer
+	coordinator *agents.Coordinator
 	tester      *agents.Tester
 	reviewer    *agents.Reviewer
 	critRpt     *agents.Report
 	patch       *agents.Patch
+	coordReview *agents.CoordinatorReview
 	testResult  *agents.TestResult
 	review      *agents.Review
 
@@ -192,6 +194,10 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	coordinator, err := agents.NewCoordinator(router)
+	if err != nil {
+		return nil, err
+	}
 	tester, err := agents.NewTester(router)
 	if err != nil {
 		return nil, err
@@ -204,6 +210,7 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	o.critic = critic
 	o.architect = architect
 	o.implementer = implementer
+	o.coordinator = coordinator
 	o.tester = tester
 	o.reviewer = reviewer
 	return o, nil
@@ -308,10 +315,38 @@ func passedOrFailed(b bool) string {
 // Patch returns the last Implementer patch, if any.
 func (o *Orchestrator) Patch() *agents.Patch { return o.patch }
 
+// maxCoordinatorRounds is the cap on how many times the Implement
+// loop will send the Implementer back with Coordinator feedback
+// before giving up and writing the patch anyway (advisory mode).
+// Two extra rounds past the initial attempt means up to 3
+// Implementer runs per Implement() call in the worst case, which is
+// bounded cost and enough headroom for the model to respond to
+// specific concerns. If the Coordinator is still rejecting after
+// three rounds, something is wrong that further retries won't fix.
+const maxCoordinatorRounds = 2
+
 // Implement runs the Implementer against the chosen sketch index
 // (1-indexed into c.Sketches). Must be called after StateSketchesReady.
-// Emits a patch_ready event on success and writes the diff to
-// `<repo>/.aidev/proposed.patch` so the user can `git apply` it.
+//
+// The Implement flow is a bounded Implementer <-> Coordinator loop:
+//
+//  1. Implementer produces a diff.
+//  2. Coordinator reviews the diff against the rubric (fabrication,
+//     invalid syntax for the file format, auxiliary TODO files,
+//     partial scope, dangling references, missing tests, scope
+//     creep).
+//  3. If APPROVED, write the patch to disk and emit patch_ready.
+//  4. If CONCERNS and we're under the retry cap, stash the feedback
+//     on ctx.CoordinatorFeedback and call the Implementer again.
+//  5. If CONCERNS and we've hit the cap, write the patch anyway AND
+//     surface the Coordinator's concerns in the patch_ready event's
+//     advisory field. The user sees both the patch and the concerns
+//     and decides. This is the deliberate "teammate, not gatekeeper"
+//     default — we never silently drop work on the floor.
+//
+// Emits a patch_ready event on success (or on cap-reached advisory
+// mode) and writes the diff to `<repo>/.aidev/proposed.patch` so the
+// user can `git apply` it.
 func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan Event {
 	out := make(chan Event, 4)
 	go func() {
@@ -342,11 +377,51 @@ func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan E
 			Message: fmt.Sprintf("Implementing sketch %d: %s", chosen.Number, chosen.Title),
 		})
 
-		patch, err := o.implementer.Run(ctx, o.ctx, &chosen)
-		if err != nil {
-			o.state = StateError
-			o.emit(ctx, out, Event{State: StateError, Err: err})
-			return
+		// Clear any stale Coordinator feedback from a previous run
+		// so it can't leak into the first attempt of this sketch.
+		o.ctx.CoordinatorFeedback = ""
+		o.coordReview = nil
+
+		var patch *agents.Patch
+		var review *agents.CoordinatorReview
+
+		for round := 0; round <= maxCoordinatorRounds; round++ {
+			p, err := o.implementer.Run(ctx, o.ctx, &chosen)
+			if err != nil {
+				o.state = StateError
+				o.emit(ctx, out, Event{State: StateError, Err: err})
+				return
+			}
+			patch = p
+
+			// Gate 1: Coordinator review. A Coordinator error is
+			// non-fatal — we log it and proceed as if approved.
+			// The Coordinator is a safety net, not a gate; a broken
+			// cloud connection shouldn't block the user's patch.
+			r, cerr := o.coordinator.Review(ctx, o.ctx, &chosen, patch)
+			if cerr != nil {
+				fmt.Fprintf(o.reporterLog, "aidev coordinator: review failed, proceeding without: %v\n", cerr)
+				review = nil
+				break
+			}
+			review = r
+
+			if review.Approved {
+				break
+			}
+
+			// CONCERNS. If we still have retry budget, send the
+			// Implementer back with the feedback.
+			if round == maxCoordinatorRounds {
+				// Cap reached. Fall through with the latest patch
+				// and the latest review so the user sees both.
+				break
+			}
+			o.emit(ctx, out, Event{
+				State:   o.state,
+				Message: fmt.Sprintf("Coordinator flagged concerns (round %d/%d); re-running Implementer with feedback", round+1, maxCoordinatorRounds+1),
+			})
+			o.ctx.CoordinatorFeedback = review.Feedback
 		}
 
 		// Write the patch to disk so the user can git apply it. Failure
@@ -357,16 +432,29 @@ func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan E
 			}
 		}
 		o.patch = patch
+		o.coordReview = review
 
 		o.state = StatePatchReady
 		msg := fmt.Sprintf("Patch ready: %d files touched.", len(patch.FilesTouched))
 		if patch.Path != "" {
 			msg += " Saved to " + patch.Path
 		}
+		if review != nil && !review.Approved {
+			msg += "\n\n⚠️ Coordinator still has concerns after " + fmt.Sprint(maxCoordinatorRounds+1) + " attempts — see Coordinator review below. Patch is advisory; review carefully before applying."
+		} else if review != nil && review.Approved {
+			msg += "\nCoordinator: APPROVED — " + review.Rationale
+		}
 		o.emit(ctx, out, Event{State: o.state, Message: msg})
 	}()
 	return out
 }
+
+// CoordinatorReview returns the last Coordinator review, if any.
+// Nil when no Implement() call has run yet or when the Coordinator
+// was unavailable on the most recent attempt (errors are logged, not
+// propagated; the patch is still produced and this method returns
+// nil in that case).
+func (o *Orchestrator) CoordinatorReview() *agents.CoordinatorReview { return o.coordReview }
 
 // Router exposes the router so the TUI can display provider health.
 func (o *Orchestrator) Router() *llm.Router { return o.router }

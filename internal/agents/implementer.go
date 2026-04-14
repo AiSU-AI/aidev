@@ -533,6 +533,18 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		fmt.Fprintf(&user, "- **%s** — %s\n", p.Name, p.Summary)
 	}
 
+	// If the Coordinator reviewed a previous attempt at this sketch
+	// and flagged concerns, surface them as the LAST section of the
+	// prompt so they're the most recent thing the model sees. The
+	// feedback is authoritative — it represents the user's quality
+	// bar as enforced by a cloud-backed reviewer — and must be
+	// addressed one-by-one before another response is emitted.
+	if strings.TrimSpace(c.CoordinatorFeedback) != "" {
+		user.WriteString("\n\n## Coordinator feedback on your previous attempt (AUTHORITATIVE — address each item)\n\n")
+		user.WriteString(c.CoordinatorFeedback)
+		user.WriteString("\n\nRe-emit a COMPLETE diff that addresses every concern above. If any concern requires reading additional files, use NEED_FILES. Do NOT re-submit the same diff with minor tweaks — the Coordinator will catch it again.\n")
+	}
+
 	resp, err := i.Provider.Complete(ctx, llm.Request{
 		System: system,
 		Messages: []llm.Message{
