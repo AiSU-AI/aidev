@@ -7,6 +7,7 @@ import (
 
 	"github.com/aisu-ai/aidev/internal/github"
 	"github.com/aisu-ai/aidev/internal/llm"
+	"github.com/aisu-ai/aidev/internal/repo"
 )
 
 // capturingProvider records the last Request it was asked to
@@ -78,9 +79,10 @@ func TestCriticPromptIncludesClarifierNotes(t *testing.T) {
 }
 
 // TestCriticPromptOmitsClarifierSectionWhenEmpty is the negative
-// case: if ClarifierNotes is empty, the user message must NOT contain
-// the Clarifier heading (otherwise we'd be teaching the model to
-// expect authoritative human input that isn't there).
+// case: if both in-memory ClarifierNotes AND the on-disk
+// Snapshot.ClarifierContent are empty, the user message must NOT
+// contain the Clarifier heading (otherwise we'd be teaching the
+// model to expect authoritative human input that isn't there).
 func TestCriticPromptOmitsClarifierSectionWhenEmpty(t *testing.T) {
 	p := &capturingProvider{reply: "body\nRECOMMENDATION: unclear\n"}
 	c := &Critic{Provider: p}
@@ -96,5 +98,73 @@ func TestCriticPromptOmitsClarifierSectionWhenEmpty(t *testing.T) {
 	}
 	if strings.Contains(p.req.Messages[0].Content, "## Clarifier session") {
 		t.Error("critic user message should not contain '## Clarifier session' when ClarifierNotes is empty")
+	}
+}
+
+// TestCriticPromptFallsBackToSnapshotClarifier is the regression
+// guard for the slash-command interview path: when the user's Claude
+// session writes .aidev/clarifier.md and re-invokes aidev, the
+// Snapshot will contain ClarifierContent but ClarifierNotes will be
+// empty. The Critic must still surface the disk-loaded clarifier
+// under the AUTHORITATIVE GROUND TRUTH heading — otherwise the
+// authoritative-input plumbing only fires for the in-process TTY
+// flow and the slash-command path silently bypasses it.
+func TestCriticPromptFallsBackToSnapshotClarifier(t *testing.T) {
+	p := &capturingProvider{reply: "body\nRECOMMENDATION: build\n"}
+	c := &Critic{Provider: p}
+	cc := &Context{
+		Issue: &github.Issue{
+			Owner: "aisu-ai", Repo: "aidev", Number: 1,
+			Title: "T", Body: "issue body",
+		},
+		ScoutReport: "scout brief body",
+		Snapshot: &repo.Snapshot{
+			ClarifierContent: "## Wave 1\n\n### q1 — is contactSales body copy?\n\n**Answer:** yes, body copy, exclude from refactor",
+		},
+		// ClarifierNotes intentionally left empty.
+	}
+	if _, err := c.Run(context.Background(), cc); err != nil {
+		t.Fatalf("Critic.Run error: %v", err)
+	}
+	userMsg := p.req.Messages[0].Content
+	if !strings.Contains(userMsg, "## Clarifier session") {
+		t.Errorf("critic user message missing '## Clarifier session' heading despite Snapshot fallback; got:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "is contactSales body copy?") {
+		t.Errorf("critic user message missing the snapshot clarifier Q text; got:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "exclude from refactor") {
+		t.Errorf("critic user message missing the snapshot clarifier A text; got:\n%s", userMsg)
+	}
+}
+
+// TestCriticPromptInMemoryClarifierWinsOverSnapshot guards the
+// priority: when both sources are present (e.g. an in-process
+// interview happens in the same run that already had a stale
+// .aidev/clarifier.md on disk), the in-memory copy reflects the
+// latest answers and MUST take precedence.
+func TestCriticPromptInMemoryClarifierWinsOverSnapshot(t *testing.T) {
+	p := &capturingProvider{reply: "body\nRECOMMENDATION: build\n"}
+	c := &Critic{Provider: p}
+	cc := &Context{
+		Issue: &github.Issue{
+			Owner: "aisu-ai", Repo: "aidev", Number: 1,
+			Title: "T", Body: "issue body",
+		},
+		ScoutReport: "scout brief body",
+		Snapshot: &repo.Snapshot{
+			ClarifierContent: "STALE-DISK-COPY",
+		},
+		ClarifierNotes: "FRESH-IN-MEMORY-ANSWERS",
+	}
+	if _, err := c.Run(context.Background(), cc); err != nil {
+		t.Fatalf("Critic.Run error: %v", err)
+	}
+	userMsg := p.req.Messages[0].Content
+	if !strings.Contains(userMsg, "FRESH-IN-MEMORY-ANSWERS") {
+		t.Errorf("critic user message missing in-memory clarifier; got:\n%s", userMsg)
+	}
+	if strings.Contains(userMsg, "STALE-DISK-COPY") {
+		t.Errorf("critic user message should not contain stale disk copy when in-memory is set; got:\n%s", userMsg)
 	}
 }

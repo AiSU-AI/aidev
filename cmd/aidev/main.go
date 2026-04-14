@@ -120,6 +120,7 @@ func main() {
 		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
 		pickSketch   = flag.Int("sketch", 0, "Headless only: after Architect produces sketches, automatically run the Implementer on this sketch number (1-indexed). 0 disables.")
 		autoRun      = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
+		forceVerdict = flag.String("force-verdict", "", "Headless only: ESCAPE HATCH. After running Scout+Critic (and any interview rounds), override the Critic's verdict with this value: build|defer|kill. Use ONLY when you have answered the Critic's questions and the Critic is still hedging. Always logged loudly so you can see when the override fired.")
 		skipDoctor   = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
 		noAuditTrail = flag.Bool("no-audit-trail", false, "Disable posting aidev progress + artifacts to the GitHub issue")
 	)
@@ -196,7 +197,16 @@ func main() {
 	}
 
 	if *headless {
-		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *pickSketch)
+		// Validate -force-verdict early so a typo fails fast instead of
+		// silently being treated as "no override". Empty string means
+		// the flag isn't set; otherwise it must be a recognised verdict.
+		switch *forceVerdict {
+		case "", "build", "defer", "kill":
+			// ok
+		default:
+			fatal(fmt.Sprintf("invalid -force-verdict %q (must be build, defer, or kill)", *forceVerdict))
+		}
+		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *pickSketch, *forceVerdict)
 		return
 	}
 
@@ -787,7 +797,13 @@ func discoverConfigDir() string {
 // re-runs the Critic. Up to 2 interview rounds total — if the Critic
 // still refuses, we halt and report the latest verdict. A "kill"
 // verdict always halts without an interview; killing is explicit.
-func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int) {
+//
+// forceVerdict ("build" / "defer" / "kill" / "") is the escape hatch
+// for cases where the Critic keeps hedging despite answered questions.
+// When non-empty it overrides the Critic's recommendation AFTER the
+// normal pipeline (and any interview rounds) have run, and the
+// override is logged loudly so the user always sees it fired.
+func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int, forceVerdict string) {
 	for ev := range orch.Run(ctx) {
 		if ev.Err != nil {
 			fatal(ev.Err.Error())
@@ -819,6 +835,23 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 	// build/kill (nothing to clarify).
 	if auto && rpt != nil && doctor.IsTTY() {
 		rpt = runInterviewLoop(ctx, orch, cfg, absRepo, rpt)
+	}
+
+	// Apply the user's escape-hatch override AFTER the natural Critic
+	// + interview pipeline has run. We always run the Critic first so
+	// the override is informed (you see what the Critic actually said
+	// before you overrule it), and so the on-disk audit trail and any
+	// downstream tooling that reads o.CriticReport() still has the
+	// real verdict for context.
+	if forceVerdict != "" && rpt != nil && rpt.Recommendation != forceVerdict {
+		fmt.Println()
+		fmt.Printf("## Verdict overridden by user\n\n")
+		fmt.Printf("Critic recommended **%s**.\n", rpt.Recommendation)
+		fmt.Printf("User passed `-force-verdict %s`. Proceeding as if the Critic had said %s.\n",
+			forceVerdict, forceVerdict)
+		fmt.Println()
+		fmt.Println("This is the escape hatch. The Critic's report above is the audit trail; the override is your call and your responsibility.")
+		rpt.Recommendation = forceVerdict
 	}
 
 	if !auto || rpt == nil || rpt.Recommendation != "build" {
