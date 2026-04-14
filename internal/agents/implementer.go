@@ -81,6 +81,19 @@ const (
 	maxRequestedFiles  = 40
 	maxFileBytes       = 128 * 1024
 	maxNeedFilesRounds = 2
+
+	// inventoryCap is the maximum number of repo-relative file paths
+	// shown to the picker and to generateDiff's "file inventory"
+	// section. Bumped from the old 200-ish limit because a modern
+	// Next.js marketing site or TS monorepo routinely has 500-1500
+	// source files; a too-small inventory forces the picker to
+	// hallucinate paths it hasn't seen. 2000 is generous enough to
+	// cover almost every real codebase while keeping the prompt
+	// under ~80 KB of text — well inside the Claude-large context
+	// window. Oversized monorepos still get truncated, but the
+	// prompt explicitly tells the model to guess + expect a
+	// "missing path" response on the next turn as a fallback.
+	inventoryCap = 2000
 )
 
 // Run asks the LLM to produce a unified diff that implements the chosen
@@ -126,15 +139,24 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	}
 
 	// Load the requested file contents (size-capped, path-validated).
-	// File read errors are logged into the contents map rather than
-	// aborting — the model can still work with partial information.
-	contents := readFiles(c.Snapshot.Root, wanted)
+	// Missing paths (hallucinated by the picker) are tracked
+	// separately so the next prompt turn can tell the model which
+	// guesses were wrong — the difference between "silent under-
+	// specification" and "actionable error signal".
+	contents, missing := readFiles(c.Snapshot.Root, wanted)
 
 	// Turn 2 (with up to maxNeedFilesRounds additional rounds): ask
 	// for the diff. If the model comes back with NEED_FILES instead,
 	// load the requested paths and retry with the expanded context.
+	//
+	// missing is threaded through every round so the model always
+	// knows exactly which paths it guessed wrong on the previous
+	// turn. Without this feedback the model keeps asking for
+	// hallucinated paths, burns the NEED_FILES budget, and the run
+	// dies with "NEED_FILES limit reached" while the real paths
+	// sit in the inventory unread.
 	for round := 0; round <= maxNeedFilesRounds; round++ {
-		patch, need, err := i.generateDiff(ctx, c, chosen, contents)
+		patch, need, err := i.generateDiff(ctx, c, chosen, contents, missing)
 		if err != nil {
 			return nil, err
 		}
@@ -160,9 +182,20 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 		if len(fresh) == 0 {
 			return nil, fmt.Errorf("implementer: NEED_FILES requested only files that were already provided: %v", need)
 		}
-		more := readFiles(c.Snapshot.Root, fresh)
+		more, missedNow := readFiles(c.Snapshot.Root, fresh)
+		// Update the missing list for the next turn: keep both the
+		// paths we couldn't load this round AND the paths we've
+		// failed to load on earlier rounds (capped at a reasonable
+		// size so the prompt doesn't balloon).
+		missing = appendUniqueCapped(missing, missedNow, 40)
 		if len(more) == 0 {
-			return nil, fmt.Errorf("implementer: NEED_FILES requested %v but none of those paths exist on disk", fresh)
+			// Every path the model asked for on this round was
+			// missing. We don't fail here any more — missingNow is
+			// now in the prompt, so next round the model has the
+			// actual feedback signal it needs to try again. But we
+			// still don't let the loop be infinite — the round cap
+			// above covers that.
+			continue
 		}
 		for p, body := range more {
 			contents[p] = body
@@ -170,6 +203,28 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	}
 	// Unreachable — the loop above either returns a patch or errors.
 	return nil, errors.New("implementer: loop fell through unexpectedly")
+}
+
+// appendUniqueCapped appends every string in extras to base that
+// isn't already there, and returns a slice capped at cap elements
+// (dropping oldest entries first). Used by the NEED_FILES loop to
+// track missing-path history across rounds without unbounded growth.
+func appendUniqueCapped(base, extras []string, cap int) []string {
+	seen := make(map[string]bool, len(base))
+	for _, s := range base {
+		seen[s] = true
+	}
+	out := base
+	for _, s := range extras {
+		if !seen[s] {
+			out = append(out, s)
+			seen[s] = true
+		}
+	}
+	if len(out) > cap {
+		out = out[len(out)-cap:]
+	}
+	return out
 }
 
 // fileSelectionJSONRe extracts a JSON array from a potentially messy
@@ -219,7 +274,7 @@ func (i *Implementer) selectFiles(ctx context.Context, c *Context, chosen *Sketc
 	fmt.Fprintf(&user, "\n\n## Chosen sketch %d: %s\n\n", chosen.Number, chosen.Title)
 	user.WriteString(chosen.Markdown)
 
-	files := listSourceFiles(c.Snapshot.Root, 200)
+	files := listSourceFiles(c.Snapshot.Root, inventoryCap)
 	if len(files) > 0 {
 		user.WriteString("\n\n## File inventory (paths only, pick from this list)\n\n")
 		for _, f := range files {
@@ -330,15 +385,29 @@ func isSafeRelPath(p string) bool {
 }
 
 // readFiles loads the file contents for the given paths, relative to
-// repoRoot. Missing files are skipped silently (they may have been
-// requested by the model but don't exist on disk). Files larger than
-// maxFileBytes are truncated with a marker at the end.
+// repoRoot. Files larger than maxFileBytes are truncated with a
+// marker at the end. Returns two values:
 //
-// The returned map is keyed by the ORIGINAL requested path (not the
-// resolved absolute path), so the second-turn prompt can cite the same
-// strings the first turn returned.
-func readFiles(repoRoot string, paths []string) map[string]string {
+//  1. a map of successfully-loaded content, keyed by the ORIGINAL
+//     requested path (not the resolved absolute path), so the
+//     second-turn prompt can cite the same strings the first turn
+//     returned.
+//
+//  2. a slice of paths that were requested but could NOT be loaded
+//     because they don't exist on disk, are directories, or failed
+//     to read. The caller surfaces this list back to the model on
+//     the next turn so it knows its guess was wrong — without this
+//     feedback signal, a model hallucinating paths will silently
+//     get empty responses and keep guessing until the NEED_FILES
+//     cap trips.
+//
+// Paths that fail isSafeRelPath are silently dropped (rejected at
+// the boundary, not reported). We never surface "you asked for
+// ../../etc/passwd" to the model because that's a red-flag path
+// that should be killed at the edge.
+func readFiles(repoRoot string, paths []string) (map[string]string, []string) {
 	out := make(map[string]string, len(paths))
+	var missing []string
 	for _, p := range paths {
 		if !isSafeRelPath(p) {
 			continue
@@ -346,10 +415,12 @@ func readFiles(repoRoot string, paths []string) map[string]string {
 		abs := filepath.Join(repoRoot, p)
 		info, err := os.Stat(abs)
 		if err != nil || info.IsDir() {
+			missing = append(missing, p)
 			continue
 		}
 		data, err := os.ReadFile(abs)
 		if err != nil {
+			missing = append(missing, p)
 			continue
 		}
 		if len(data) > maxFileBytes {
@@ -357,7 +428,7 @@ func readFiles(repoRoot string, paths []string) map[string]string {
 		}
 		out[p] = string(data)
 	}
-	return out
+	return out, missing
 }
 
 // generateDiff is turn 2. Returns (patch, nil, nil) on success, or
@@ -366,9 +437,16 @@ func readFiles(repoRoot string, paths []string) map[string]string {
 // Run() loop interprets the three-way return to decide whether to
 // retry with expanded file context or surface a terminal error.
 //
+// The missing argument is the running list of paths the model has
+// requested on prior rounds that the harness could not load
+// (because they don't exist on disk, are directories, or failed to
+// read). The prompt surfaces these to the model under a "DO NOT
+// REQUEST AGAIN" heading so it stops guessing at paths that aren't
+// in the repo.
+//
 // Kept separate from selectFiles so tests and callers can exercise
 // the two phases independently.
-func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sketch, contents map[string]string) (*Patch, []string, error) {
+func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sketch, contents map[string]string, missing []string) (*Patch, []string, error) {
 
 	system := "You are the Implementer for aidev, a multi-agent coding tool.\n" +
 		"\n" +
@@ -513,19 +591,44 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		for _, p := range paths {
 			fmt.Fprintf(&user, "### %s\n\n```\n%s\n```\n\n", p, contents[p])
 		}
-		user.WriteString("Only the files above have been loaded for you. If you need to read additional repo-relative files to produce a COMPLETE and VALID diff — for example to copy a canonical translation value from another locale, or to see the exact call site of a function you're rewriting — respond with `NEED_FILES: [\"path/a.json\", \"path/b.tsx\"]` per rule 7 and the harness will load them and call you again. Do NOT fabricate values, annotate TODOs inside the diff, or hand back a partial starting point.\n")
-	} else {
-		// Fallback to the v0.3a behaviour (paths only) when the picker
-		// returned nothing useful. Degrades gracefully.
-		files := listSourceFiles(c.Snapshot.Root, 150)
-		if len(files) > 0 {
-			user.WriteString("\n\n## File inventory (paths only — the file picker did not identify any files to load)\n\n")
-			for _, f := range files {
-				user.WriteString("- ")
-				user.WriteString(f)
-				user.WriteString("\n")
-			}
+		user.WriteString("These are the files already loaded for you. If you need to read additional repo-relative files to produce a COMPLETE and VALID diff, respond with `NEED_FILES: [\"path/a.json\", \"path/b.tsx\"]` per rule 7 and the harness will load them and call you again. Do NOT fabricate values, annotate TODOs inside the diff, or hand back a partial starting point.\n")
+	}
+
+	// ALWAYS surface a file inventory, even when contents is
+	// populated. On NEED_FILES retries the model needs a list of
+	// real paths to pick from — otherwise it guesses, burns the
+	// retry budget on hallucinated paths, and the run dies with
+	// "NEED_FILES limit reached" while the actual files sit in the
+	// inventory unread. Cap at inventoryCap so the prompt can't
+	// balloon on huge monorepos, but the cap is generous enough for
+	// most codebases (a standard Next.js marketing site has on the
+	// order of 500-1500 source files).
+	inv := listSourceFiles(c.Snapshot.Root, inventoryCap)
+	if len(inv) > 0 {
+		user.WriteString("\n\n## Repository file inventory (pick NEED_FILES paths from this list — anything outside this list won't be found)\n\n")
+		for _, f := range inv {
+			user.WriteString("- ")
+			user.WriteString(f)
+			user.WriteString("\n")
 		}
+		if len(inv) >= inventoryCap {
+			fmt.Fprintf(&user, "\n_(Inventory truncated at %d files. If you need a file not listed here, guess the path and the harness will tell you if it doesn't exist — but prefer picking from the list above.)_\n", inventoryCap)
+		}
+	}
+
+	// Thread missing paths back to the model so it stops asking for
+	// the same hallucinated paths over and over. This is the
+	// feedback signal that was silently missing in v0.3a.2: without
+	// it, the model had no way to know its picker+NEED_FILES
+	// guesses were wrong, and it just kept guessing.
+	if len(missing) > 0 {
+		user.WriteString("\n\n## Paths you previously requested that DO NOT EXIST in this repo — DO NOT request these again\n\n")
+		for _, m := range missing {
+			user.WriteString("- ")
+			user.WriteString(m)
+			user.WriteString("\n")
+		}
+		user.WriteString("\nThese paths are NOT in the repository. If you still need more files, pick from the repository file inventory above — do not guess at plausible-sounding paths.\n")
 	}
 
 	user.WriteString("\n\n## Principles\n\n")

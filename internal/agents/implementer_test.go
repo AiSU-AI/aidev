@@ -293,12 +293,29 @@ func TestReadFilesSkipsMissingAndDirs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "exists.go"), []byte("package main"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := readFiles(dir, []string{"exists.go", "missing.go", "sub"})
+	got, missing := readFiles(dir, []string{"exists.go", "missing.go", "sub"})
 	if len(got) != 1 {
 		t.Errorf("got %d files, want 1", len(got))
 	}
 	if got["exists.go"] != "package main" {
 		t.Errorf("content mismatch: %q", got["exists.go"])
+	}
+	// missing.go and sub (directory) should both be in the missing list
+	// so the caller can tell the model they're unavailable.
+	if len(missing) != 2 {
+		t.Errorf("missing list = %v, want 2 entries", missing)
+	}
+	var haveMissing, haveSub bool
+	for _, m := range missing {
+		if m == "missing.go" {
+			haveMissing = true
+		}
+		if m == "sub" {
+			haveSub = true
+		}
+	}
+	if !haveMissing || !haveSub {
+		t.Errorf("expected missing list to contain 'missing.go' and 'sub', got %v", missing)
 	}
 }
 
@@ -308,7 +325,7 @@ func TestReadFilesTruncatesLargeFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(big), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := readFiles(dir, []string{"big.txt"})
+	got, _ := readFiles(dir, []string{"big.txt"})
 	content := got["big.txt"]
 	if !strings.Contains(content, "truncated") {
 		t.Errorf("expected truncation marker, got first 100 chars: %q", content[:100])
@@ -330,9 +347,16 @@ func TestReadFilesRefusesUnsafePaths(t *testing.T) {
 	}
 	defer os.Remove(secret)
 
-	got := readFiles(dir, []string{"../" + filepath.Base(secret), "/etc/passwd"})
+	got, missing := readFiles(dir, []string{"../" + filepath.Base(secret), "/etc/passwd"})
 	if len(got) != 0 {
 		t.Errorf("unsafe paths should have been rejected, got %v", got)
+	}
+	// Unsafe paths are silently dropped at the boundary — they do
+	// NOT go into the "missing" list, because we don't want to
+	// surface red-flag paths back to the model. The missing list is
+	// for legitimate typos and hallucinations, not for probing.
+	if len(missing) != 0 {
+		t.Errorf("unsafe paths should not be reported as 'missing', got %v", missing)
 	}
 }
 
@@ -654,6 +678,90 @@ func (p *captureAllProvider) Complete(_ context.Context, req llm.Request) (llm.R
 		idx = len(p.responses) - 1
 	}
 	return llm.Response{Content: p.responses[idx]}, nil
+}
+
+// TestImplementerRunSurfacesMissingPathsAndRecovers is the
+// regression guard for the real failure the user hit: the picker
+// hallucinated plausible-but-nonexistent paths (apps/marketing/src/
+// pages/Sectors.tsx) and the harness silently dropped them from
+// readFiles, leaving the model with no feedback signal. It kept
+// asking for more hallucinated paths until the NEED_FILES cap
+// tripped, while the REAL paths sat in the inventory unread.
+//
+// After this fix, readFiles reports missing paths, Run threads
+// them into the next generateDiff turn under a 'DO NOT request
+// these again' section, and the model can self-correct on the
+// retry. This test drives that exact flow: hallucinated path in
+// the picker, real path on the NEED_FILES round, success.
+func TestImplementerRunSurfacesMissingPathsAndRecovers(t *testing.T) {
+	dir := t.TempDir()
+	// Real file that the model SHOULD have asked for from the start.
+	realPath := filepath.Join(dir, "apps", "marketing", "src", "components", "pages", "pricing", "pricing.tsx")
+	if err := os.MkdirAll(filepath.Dir(realPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(realPath, []byte("export const Pricing = () => <div>hello</div>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &captureAllProvider{
+		responses: []string{
+			// Turn 1 (picker): hallucinated path. This is the real
+			// failure mode — the picker guessed a plausible-looking
+			// path structure that doesn't match the actual repo.
+			`["apps/marketing/src/pages/Pricing.tsx"]`,
+			// Turn 2 (generateDiff round 0): model sees the
+			// hallucinated path in its missing list and correctly
+			// requests the REAL path.
+			`NEED_FILES: ["apps/marketing/src/components/pages/pricing/pricing.tsx"]`,
+			// Turn 2 (generateDiff round 1): real diff with the
+			// loaded file contents.
+			"diff --git a/apps/marketing/src/components/pages/pricing/pricing.tsx b/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"--- a/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"+++ b/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"@@ -1 +1 @@\n" +
+				"-export const Pricing = () => <div>hello</div>\n" +
+				"+export const Pricing = () => <div>contact sales</div>\n",
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "T", Body: "body"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "consolidate CTA", Markdown: "## Plan\n- update pricing CTA"}
+
+	patch, err := impl.Run(context.Background(), ctx, sketch)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if patch == nil {
+		t.Fatal("nil patch")
+	}
+	if !strings.Contains(patch.Diff, "contact sales") {
+		t.Errorf("patch missing expected content, got:\n%s", patch.Diff)
+	}
+
+	// Verify the second prompt (generateDiff round 0) surfaced the
+	// missing path under the DO NOT request again heading. Without
+	// that surfacing the model has no feedback signal and the fix
+	// is moot.
+	if len(provider.prompts) < 2 {
+		t.Fatalf("want at least 2 prompts, got %d", len(provider.prompts))
+	}
+	secondPrompt := provider.prompts[1]
+	if !strings.Contains(secondPrompt, "DO NOT EXIST") {
+		t.Errorf("second prompt missing 'DO NOT EXIST' missing-paths header; got:\n%s", secondPrompt)
+	}
+	if !strings.Contains(secondPrompt, "apps/marketing/src/pages/Pricing.tsx") {
+		t.Errorf("second prompt should list the hallucinated path as missing; got:\n%s", secondPrompt)
+	}
+	// The inventory should also appear in every generateDiff turn,
+	// not just the picker. This is what gives the model something
+	// real to pick from on the retry.
+	if !strings.Contains(secondPrompt, "Repository file inventory") {
+		t.Errorf("second prompt missing file inventory; got:\n%s", secondPrompt)
+	}
 }
 
 // TestImplementerRunRejectsRepeatedFileRequests guards against a
