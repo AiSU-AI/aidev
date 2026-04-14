@@ -116,6 +116,7 @@ func main() {
 		issueURL     = flag.String("issue", "", "GitHub issue reference: full URL (https://github.com/owner/repo/issues/N) or a bare number when -repo points at a local clone with a github.com remote")
 		repoPath     = flag.String("repo", ".", "Path to the target repository")
 		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		preset       = flag.String("preset", "", "Optional model preset name. Loads models.<name>.yaml from the config directory instead of models.yaml. Shipped presets: 'local' (fully offline via Ollama). Add your own by dropping models.<name>.yaml into the config dir.")
 		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
 		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
 		pickSketch   = flag.Int("sketch", 0, "Headless only: after Architect produces sketches, automatically run the Implementer on this sketch number (1-indexed). 0 disables.")
@@ -130,7 +131,10 @@ func main() {
 		fatal("missing required flag: -issue")
 	}
 
-	cfg := mustLoadConfig(*configDir)
+	cfg := mustLoadConfigPreset(*configDir, *preset)
+	if *preset != "" {
+		fmt.Fprintf(os.Stderr, "aidev: using model preset %q (models.%s.yaml)\n", *preset, *preset)
+	}
 
 	// Precondition audit. In headless mode the doctor never prompts —
 	// it just reports and either fails or passes. In TTY mode we enable
@@ -739,7 +743,18 @@ func runDoctorSubcommand() {
 //  6. ./config (cwd — matches the dev workflow for "go run")
 //
 // The first directory that exists and contains models.yaml wins.
+//
+// Equivalent to mustLoadConfigPreset(dir, ""). Kept as a thin wrapper
+// for the subcommands that don't expose a --preset flag.
 func mustLoadConfig(configDir string) *config.Config {
+	return mustLoadConfigPreset(configDir, "")
+}
+
+// mustLoadConfigPreset is the preset-aware form. When preset is
+// non-empty, config.LoadPreset reads models.<preset>.yaml instead of
+// models.yaml from the resolved directory. Missing preset files are a
+// loud error — we never silently fall back to the default.
+func mustLoadConfigPreset(configDir, preset string) *config.Config {
 	if configDir == "" {
 		configDir = os.Getenv("AIDEV_CONFIG")
 	}
@@ -747,9 +762,13 @@ func mustLoadConfig(configDir string) *config.Config {
 		configDir = discoverConfigDir()
 	}
 
-	cfg, err := config.Load(configDir)
+	cfg, err := config.LoadPreset(configDir, preset)
 	if err != nil {
-		fatal(fmt.Sprintf("load config: %v\n  searched: %s\n  hint: run `aidev install` to lay down the default config in ~/.config/aidev", err, configDir))
+		hint := "hint: run `aidev install` to lay down the default config in ~/.config/aidev"
+		if preset != "" {
+			hint = fmt.Sprintf("hint: preset %q needs models.%s.yaml in the config directory — ship it via `aidev install` or drop your own copy there", preset, preset)
+		}
+		fatal(fmt.Sprintf("load config: %v\n  searched: %s\n  %s", err, configDir, hint))
 	}
 	return cfg
 }

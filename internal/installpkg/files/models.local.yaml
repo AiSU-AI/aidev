@@ -1,0 +1,97 @@
+# Fully-local model preset for aidev.
+#
+# Routes every role to an Ollama model so the entire pipeline runs
+# offline. Zero cloud calls, zero per-token cost, 100% private.
+# Slower than the default (which sends the Critic/Architect/Charter
+# roles to Claude CLI for deep reasoning), but appropriate for:
+#
+#   - proprietary/sensitive codebases you cannot send to Anthropic
+#   - offline development (plane, train, bunker, restricted network)
+#   - privacy-conscious users who want zero cloud calls
+#   - people tinkering without a Claude subscription
+#
+# ---
+#
+# Hardware expectations (approximate, Q4 quantisation):
+#
+#   small tier  (qwen2.5-coder:7b):   ~5 GB VRAM (or CPU with patience)
+#   medium tier (qwen2.5-coder:14b):  ~9 GB VRAM
+#   large tier  (qwen2.5:32b):       ~20 GB VRAM
+#
+# Total if the whole pipeline runs the same day: ~20 GB VRAM peak
+# (Ollama will swap models in and out; only one tier runs at a time).
+#
+# If your hardware can't fit the 32B large tier, drop `large` to
+# `qwen2.5-coder:14b` so every tier fits in ~9 GB. You'll lose some
+# Critic/Architect depth (those roles benefit most from generalist
+# reasoning) but the pipeline still works end-to-end.
+#
+# ---
+#
+# Before first run, pull the models:
+#
+#   ollama pull qwen2.5-coder:7b
+#   ollama pull qwen2.5-coder:14b
+#   ollama pull qwen2.5:32b
+#
+# Then invoke aidev with --preset local, e.g.:
+#
+#   aidev --preset local -headless -auto -sketch 1 -issue ... -repo ...
+#
+# ---
+#
+# Quality expectations vs. the default (cloud-large) preset:
+#
+#   - Scout brief: indistinguishable — the Scout's task is factual
+#     extraction, which local 7B models handle well.
+#   - Implementer diffs: 80-90% of cloud quality for focused,
+#     single-feature changes. The NEED_FILES loop helps by letting
+#     the model iteratively discover context instead of trying to
+#     hold a whole repo in one window.
+#   - Critic sharp questions: 60-75% of cloud quality. Local
+#     generalist models produce less adversarial analysis than
+#     Claude Opus; expect a gentler Critic.
+#   - Architect sketches: 70-85% of cloud quality. Sketches are
+#     usually sensible but less creative about splitting work.
+#
+# The Coordinator agent (future PR) acts as a cloud-backed safety
+# net for this preset: it reviews Implementer output and catches
+# the common local-model failure modes (fabrication, invalid
+# syntax, half-finished work) before the patch hits disk. If
+# you're running this preset AND have Claude CLI available for the
+# Coordinator role alone, that's the recommended shape.
+
+tiers:
+  small:
+    provider: ollama
+    model: qwen2.5-coder:7b
+    endpoint: http://localhost:11434
+    max_tokens: 2048
+    temperature: 0.2
+
+  medium:
+    provider: ollama
+    model: qwen2.5-coder:14b
+    endpoint: http://localhost:11434
+    max_tokens: 8192
+    temperature: 0.2
+
+  large:
+    provider: ollama
+    model: qwen2.5:32b
+    endpoint: http://localhost:11434
+    max_tokens: 8192
+    temperature: 0.3
+
+# Same role -> tier routing as the default preset. Only the tier
+# definitions above differ — the roles themselves want the same
+# relative size of model regardless of whether the backend is local
+# or cloud.
+routing:
+  scout: small
+  critic: large
+  architect: large
+  charter: large
+  implementer: medium
+  reviewer: medium
+  tester: small
