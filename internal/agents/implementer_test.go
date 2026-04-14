@@ -496,6 +496,166 @@ func TestImplementerRunRejectsInfiniteNeedFiles(t *testing.T) {
 	}
 }
 
+// TestImplementerRunRecoversFromProsePrefixViolation drives the
+// format-correction retry: the Implementer's first diff-generation
+// turn responds with prose ("Looking at this, I need the TSX call
+// sites to anchor edits precisely...") instead of a valid prefix.
+// The harness must catch the violation, send the model back with a
+// corrective message that quotes the broken response, and recover
+// on the retry. This is the exact failure mode the user hit on
+// their real run — model had the right intent, wrong format.
+func TestImplementerRunRecoversFromProsePrefixViolation(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.tsx"), []byte("const Foo = () => <>hi</>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &scriptedProvider{
+		responses: []string{
+			// Turn 1 (picker): normal JSON array.
+			`["x.tsx"]`,
+			// Turn 2 (generateDiff, initial): prose instead of a
+			// valid prefix. This is the real-world failure mode.
+			"Looking at this, I need the TSX call sites to anchor edits precisely. Could you send me the component file?",
+			// Turn 2b (generateDiff, format-corrected retry):
+			// the model now emits a valid NEED_FILES directive.
+			`NEED_FILES: ["x.tsx"]`,
+			// Turn 2c (generateDiff, post-NEED_FILES): real diff.
+			// x.tsx is already in the initial picker's contents so
+			// the NEED_FILES short-circuits on duplicate...
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "T", Body: "b"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	// The scripted NEED_FILES re-requests x.tsx which is already
+	// loaded. The Run loop will reject that with
+	// "already provided" — exercising BOTH the format-correction
+	// path AND the dedup guard. We assert we make it that far (i.e.
+	// the prose didn't kill the run) by checking the error message.
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("expected a later error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already provided") {
+		t.Errorf("expected the NEED_FILES dedup guard to fire after format recovery, got: %v", err)
+	}
+	// Provider should have been called for: picker(1) + first
+	// generateDiff(1, prose) + format-corrected retry(1, NEED_FILES) = 3 calls.
+	if provider.calls != 3 {
+		t.Errorf("provider called %d times, want 3 (picker + prose + recovery)", provider.calls)
+	}
+}
+
+// TestImplementerRunFailsAfterRepeatedFormatViolations guards the
+// retry cap: a model that responds with prose twice in a row (once
+// on the initial turn, once on the correction) must fail hard
+// rather than loop forever. Format-correction is bounded at 1 retry
+// — past that, something is deeply wrong and more retries waste
+// tokens without fixing it.
+func TestImplementerRunFailsAfterRepeatedFormatViolations(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &scriptedProvider{
+		responses: []string{
+			`["x.go"]`, // picker
+			"Here's what I think we should do: first, we'd need to check the existing call sites...",
+			"Actually, let me think about this differently. The consolidation should...",
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "T", Body: "b"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("expected error after repeated format violations")
+	}
+	if !strings.Contains(err.Error(), "format-correction attempts") {
+		t.Errorf("expected format-correction cap error, got: %v", err)
+	}
+}
+
+// TestImplementerRunFormatCorrectionPromptQuotesOriginal verifies
+// the correction message actually quotes the model's broken
+// response back at it. This is what makes the correction effective:
+// the model sees exactly what it wrote and can compare it to the
+// format rule. We check by using a scripted provider that records
+// the last Request it received.
+func TestImplementerRunFormatCorrectionPromptQuotesOriginal(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a provider that captures the user message on each call.
+	captures := &captureAllProvider{
+		responses: []string{
+			`["x.go"]`,
+			"Looking at this, I need the TSX call sites to anchor edits precisely.",
+			"diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-package x\n+package y\n",
+		},
+	}
+	impl := &Implementer{Provider: captures}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "T", Body: "b"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	patch, err := impl.Run(context.Background(), ctx, sketch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if patch == nil {
+		t.Fatal("nil patch")
+	}
+
+	// The third call should be the format-corrected retry — it
+	// should contain the broken quote from the second call.
+	if len(captures.prompts) < 3 {
+		t.Fatalf("want 3 captured prompts, got %d", len(captures.prompts))
+	}
+	retryPrompt := captures.prompts[2]
+	if !strings.Contains(retryPrompt, "YOUR PREVIOUS RESPONSE VIOLATED THE OUTPUT FORMAT") {
+		t.Errorf("correction prompt missing violation header; got:\n%s", retryPrompt)
+	}
+	if !strings.Contains(retryPrompt, "Looking at this, I need the TSX call sites") {
+		t.Errorf("correction prompt did not quote the broken response back to the model; got:\n%s", retryPrompt)
+	}
+}
+
+// captureAllProvider records every user message passed to Complete
+// and returns scripted responses in order. Used by
+// TestImplementerRunFormatCorrectionPromptQuotesOriginal to verify
+// the retry prompt actually quotes the original violation.
+type captureAllProvider struct {
+	responses []string
+	prompts   []string
+}
+
+func (p *captureAllProvider) Name() string { return "captureAll" }
+func (p *captureAllProvider) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
+	if len(req.Messages) > 0 {
+		p.prompts = append(p.prompts, req.Messages[0].Content)
+	}
+	idx := len(p.prompts) - 1
+	if idx >= len(p.responses) {
+		idx = len(p.responses) - 1
+	}
+	return llm.Response{Content: p.responses[idx]}, nil
+}
+
 // TestImplementerRunRejectsRepeatedFileRequests guards against a
 // model that keeps re-requesting paths the harness already loaded.
 // We de-duplicate inside Run; if the model asks for ONLY files that

@@ -545,10 +545,37 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		user.WriteString("\n\nRe-emit a COMPLETE diff that addresses every concern above. If any concern requires reading additional files, use NEED_FILES. Do NOT re-submit the same diff with minor tweaks — the Coordinator will catch it again.\n")
 	}
 
+	// End-of-prompt format reminder. Models attend more strongly to
+	// the most recent context, so repeating the output-format rule
+	// here significantly reduces the chance of a prose response when
+	// the main system prompt is long. This is the first line of
+	// defense; tryGenerateDiff() below adds a format-correction retry
+	// for the remaining cases.
+	user.WriteString("\n\n---\nFORMAT REMINDER: the FIRST LINE of your response MUST be EXACTLY ONE of:\n  diff --git        (a real unified diff)\n  NEED_FILES: [...] (JSON array of repo-relative paths you need to see)\n  ERROR: <reason>   (genuinely impossible, explain why)\nNo prose preamble. No 'Looking at this, I need...'. No 'Here is the diff:'. The first characters of your response MUST match one of those three prefixes.")
+
+	return i.tryGenerateDiff(ctx, system, user.String(), 0)
+}
+
+// maxFormatRetries is how many times we'll nudge the model to use a
+// valid output prefix after it produces prose. One retry is enough
+// in practice — cloud models comply with a direct 'your previous
+// response violated the format, here's what you wrote, here's what
+// to do' follow-up almost always. Past one retry, something is
+// deeply wrong and further retries waste tokens without fixing it.
+const maxFormatRetries = 1
+
+// tryGenerateDiff is the underlying single-shot call. It inspects
+// the model's response against the prefix grammar and, if the model
+// wrote prose instead of a valid prefix, self-corrects by re-calling
+// with a specific follow-up message that quotes the broken response
+// back to the model and tells it to use the format. Bounded at
+// maxFormatRetries so we can't loop on a model that refuses to
+// comply.
+func (i *Implementer) tryGenerateDiff(ctx context.Context, system, userMsg string, retries int) (*Patch, []string, error) {
 	resp, err := i.Provider.Complete(ctx, llm.Request{
 		System: system,
 		Messages: []llm.Message{
-			{Role: "user", Content: user.String()},
+			{Role: "user", Content: userMsg},
 		},
 	})
 	if err != nil {
@@ -593,7 +620,29 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		}, nil, nil
 
 	default:
-		return nil, nil, fmt.Errorf("implementer: expected 'diff --git', 'NEED_FILES:', or 'ERROR:', got %q", firstLine(raw))
+		// Format violation — the model wrote prose instead of one of
+		// the three required prefixes. This is a common failure mode
+		// when the model wants to request more files but phrases the
+		// intent in natural language ("Looking at this, I need the
+		// TSX call sites...") instead of `NEED_FILES: [...]`.
+		//
+		// Recover by re-sending with a specific correction that
+		// quotes the broken response back and tells the model
+		// exactly how to fix it. Bounded at maxFormatRetries so we
+		// can't loop forever on a non-compliant model.
+		if retries >= maxFormatRetries {
+			return nil, nil, fmt.Errorf("implementer: expected 'diff --git', 'NEED_FILES:', or 'ERROR:' after %d format-correction attempts, got %q", retries, firstLine(raw))
+		}
+		corrected := userMsg +
+			"\n\n---\n## YOUR PREVIOUS RESPONSE VIOLATED THE OUTPUT FORMAT\n\n" +
+			"You wrote:\n\n> " + firstLine(raw) + "\n\n" +
+			"This is not one of the three valid prefixes. You MUST respond with EXACTLY ONE of:\n\n" +
+			"  diff --git        — if you can produce a complete unified diff now\n" +
+			"  NEED_FILES: [...] — if you need to read more repo files first (JSON array of paths)\n" +
+			"  ERROR: <reason>   — if the task is genuinely impossible\n\n" +
+			"Reading your previous response, it looks like you wanted to request more files. Re-emit your response as a literal `NEED_FILES: [\"path/one.tsx\", \"path/two.tsx\"]` directive (a single line, JSON array of repo-relative paths). No prose. The harness will load those files and call you again with the expanded context.\n\n" +
+			"If you do NOT need more files and can produce the diff directly, re-emit starting with `diff --git` on the first line and no prose preamble."
+		return i.tryGenerateDiff(ctx, system, corrected, retries+1)
 	}
 }
 
