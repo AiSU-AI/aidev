@@ -27,6 +27,25 @@ tiers:
     max_tokens: 2048
     temperature: 0.2
 
+  # The medium tier hosts the Implementer and Reviewer. v0.4 added
+  # native tool use (read_file, glob, grep, list_dir) for providers
+  # that implement llm.ToolAwareProvider. Currently only the
+  # `anthropic` provider supports tool use; `claude-cli` and
+  # `ollama` fall back to the legacy picker + NEED_FILES path,
+  # which still works but is less robust.
+  #
+  # To unlock v0.4 tool use for the Implementer specifically, set
+  # ANTHROPIC_API_KEY and swap this tier:
+  #
+  #   medium:
+  #     provider: anthropic
+  #     model: claude-sonnet-4-6       # or claude-opus-4-6
+  #     max_tokens: 8192
+  #     temperature: 0.2
+  #
+  # Tool use eliminates entire categories of failures that the
+  # legacy path hits on large monorepos (see aidev#37 for the
+  # motivating diagnosis).
   medium:
     provider: claude-cli
     model: ""

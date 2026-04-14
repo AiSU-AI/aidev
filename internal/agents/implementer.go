@@ -134,6 +134,15 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 		return nil, errors.New("implementer: no repo snapshot")
 	}
 
+	// v0.4: if the provider supports native tool use, use the real
+	// agentic loop. The legacy picker + NEED_FILES path below is
+	// kept as the fallback for providers without tool support
+	// (Ollama, claude-cli) so swapping to a fully-local preset
+	// still works end-to-end — slower, less reliable, but functional.
+	if toolAware, ok := i.Provider.(llm.ToolAwareProvider); ok {
+		return i.runWithTools(ctx, toolAware, c, chosen)
+	}
+
 	// Pre-load files that upstream agents (Scout, Critic, Clarifier,
 	// Architect) have already cited in their output. These paths are
 	// authoritative: if the Clarifier quotes
