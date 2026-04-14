@@ -56,23 +56,53 @@ type Patch struct {
 // Size and count limits for the file-content loading pass. These keep
 // the second-turn prompt bounded regardless of what the first-turn
 // file picker returns.
+//
+// maxFileBytes is 128 KiB — large enough to fit a full locale JSON, a
+// large React component, or a non-trivial Go source file without
+// truncation. Truncation was the root cause of the v0.3a.1
+// "placeholder non-English translations" regression: the Implementer
+// saw a clipped copy of en/common.json and couldn't resolve the
+// canonical "Contact Sales" value in any other locale, so it
+// fabricated placeholders instead. 128 KiB eliminates that failure
+// mode for every realistic source file we've seen; anything beyond
+// that almost certainly shouldn't be in a single diff anyway.
+//
+// maxRequestedFiles is 40 — raised from 15 so a consolidation task
+// across N locales + M call sites still fits in the picker's budget.
+// Taskes that need more than 40 files should almost certainly be
+// split by the Architect into multiple sketches.
+//
+// maxNeedFilesRounds is the cap on the iterative NEED_FILES loop
+// (see generateDiff). Two extra rounds beyond the initial picker
+// means up to 3 generateDiff LLM calls per implementer run in the
+// worst case, which keeps cost predictable while giving the model
+// enough headroom to discover it needs files the picker missed.
 const (
-	maxRequestedFiles = 15
-	maxFileBytes      = 10 * 1024 // 10 KiB per file
+	maxRequestedFiles  = 40
+	maxFileBytes       = 128 * 1024
+	maxNeedFilesRounds = 2
 )
 
 // Run asks the LLM to produce a unified diff that implements the chosen
-// Sketch. v0.3a.1 drives a **two-turn conversation**:
+// Sketch. v0.3a.2 drives an **iterative agentic loop** on top of the
+// existing single-shot Provider interface:
 //
 //	Turn 1: send the full context chain plus a file inventory and ask
 //	        the model to list (as a JSON array) the files it needs to
 //	        see the contents of to write a correct patch.
 //	Turn 2: read those files from disk, embed their contents in the
 //	        prompt, and ask for the unified diff.
+//	Turn 2b (up to maxNeedFilesRounds times): if the model responds
+//	        with `NEED_FILES: [...]` instead of a diff, load those
+//	        files, merge them with the already-loaded contents, and
+//	        re-ask. This is the poor-man's tool-use loop aidev uses
+//	        until the llm.Provider interface gains native tool calls.
 //
-// This dramatically improves diff quality compared to v0.3a, which only
-// sent file names and not contents — the resulting diffs often failed
-// to apply cleanly because the model guessed at context lines.
+// The loop is bounded — no runaway cost, no accidental hallucination
+// of fresh requests — and every response must eventually terminate at
+// either `diff --git` (success) or `ERROR:` (hard fail). Silent punts
+// like `# no-op`, placeholder strings, or "I wrote a TODO.md for you"
+// are not allowed by the prompt and are rejected by the validator.
 //
 // chosen must be non-nil and must be one of the sketches already
 // produced by the Architect (live in c.Sketches). The caller is
@@ -100,8 +130,46 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	// aborting — the model can still work with partial information.
 	contents := readFiles(c.Snapshot.Root, wanted)
 
-	// Turn 2: produce the diff with real file contents in hand.
-	return i.generateDiff(ctx, c, chosen, contents)
+	// Turn 2 (with up to maxNeedFilesRounds additional rounds): ask
+	// for the diff. If the model comes back with NEED_FILES instead,
+	// load the requested paths and retry with the expanded context.
+	for round := 0; round <= maxNeedFilesRounds; round++ {
+		patch, need, err := i.generateDiff(ctx, c, chosen, contents)
+		if err != nil {
+			return nil, err
+		}
+		if patch != nil {
+			return patch, nil
+		}
+		// The model responded with NEED_FILES. If we're already at
+		// the loop cap, fail loudly instead of quietly returning a
+		// half-cooked diff — the prompt promised a real diff and
+		// we're not going to let it slide.
+		if round == maxNeedFilesRounds {
+			return nil, fmt.Errorf("implementer: NEED_FILES limit reached (%d rounds) — model still requesting %v", maxNeedFilesRounds, need)
+		}
+		// De-duplicate against files already loaded so the model can't
+		// just keep asking for the same path over and over.
+		fresh := make([]string, 0, len(need))
+		for _, p := range need {
+			if _, have := contents[p]; have {
+				continue
+			}
+			fresh = append(fresh, p)
+		}
+		if len(fresh) == 0 {
+			return nil, fmt.Errorf("implementer: NEED_FILES requested only files that were already provided: %v", need)
+		}
+		more := readFiles(c.Snapshot.Root, fresh)
+		if len(more) == 0 {
+			return nil, fmt.Errorf("implementer: NEED_FILES requested %v but none of those paths exist on disk", fresh)
+		}
+		for p, body := range more {
+			contents[p] = body
+		}
+	}
+	// Unreachable — the loop above either returns a patch or errors.
+	return nil, errors.New("implementer: loop fell through unexpectedly")
 }
 
 // fileSelectionJSONRe extracts a JSON array from a potentially messy
@@ -292,17 +360,24 @@ func readFiles(repoRoot string, paths []string) map[string]string {
 	return out
 }
 
-// generateDiff is turn 2. Same prompt shape as the old single-turn
-// Run() but with the requested file contents embedded. Kept separate
-// from selectFiles so tests and callers can exercise the two phases
-// independently.
-func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sketch, contents map[string]string) (*Patch, error) {
+// generateDiff is turn 2. Returns (patch, nil, nil) on success, or
+// (nil, neededPaths, nil) if the model asked for more files via the
+// NEED_FILES protocol, or (nil, nil, err) on any hard failure. The
+// Run() loop interprets the three-way return to decide whether to
+// retry with expanded file context or surface a terminal error.
+//
+// Kept separate from selectFiles so tests and callers can exercise
+// the two phases independently.
+func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sketch, contents map[string]string) (*Patch, []string, error) {
 
 	system := "You are the Implementer for aidev, a multi-agent coding tool.\n" +
 		"\n" +
-		"The developer has chosen one of the Architect's sketches. Your job is to\n" +
-		"produce a UNIFIED GIT DIFF that implements the sketch against the target\n" +
-		"repository.\n" +
+		"You are a senior engineer pairing with a teammate. The developer has\n" +
+		"chosen one of the Architect's sketches and is asking you to do the\n" +
+		"work — not to write a checklist, not to hand back a draft for the\n" +
+		"human to finish, not to file a TODO. Produce a UNIFIED GIT DIFF\n" +
+		"that implements the sketch against the target repository, and make\n" +
+		"it complete, valid, and ready to apply.\n" +
 		"\n" +
 		"REQUIREMENTS:\n" +
 		"\n" +
@@ -321,9 +396,11 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		"2. Use the EXACT file paths the target repository already uses. Do not\n" +
 		"   invent directories. Do not prefix with './' — use bare paths.\n" +
 		"\n" +
-		"3. Keep the diff MINIMAL. Only include files the chosen sketch actually\n" +
-		"   needs to touch. Do not reformat unrelated code. Follow the Boy Scout\n" +
-		"   Rule but stay inside the boundary of the change.\n" +
+		"3. Keep the diff MINIMAL in SCOPE but COMPLETE in EXECUTION. Only\n" +
+		"   include files the chosen sketch actually needs to touch, but\n" +
+		"   within that scope do the whole job — do not leave dangling\n" +
+		"   references, half-migrated call sites, or unfinished locale\n" +
+		"   rollouts. A diff that covers 8 of 9 locales is a regression.\n" +
 		"\n" +
 		"4. Include docstrings / comments where the sketch implies new public\n" +
 		"   API. Follow the repository's existing conventions (go doc comments,\n" +
@@ -332,31 +409,83 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		"5. Include tests for every meaningful behaviour the diff adds. Tests\n" +
 		"   belong in the same diff, not a follow-up.\n" +
 		"\n" +
-		"6. Do NOT wrap the diff in a Markdown code fence. Do NOT prefix the diff\n" +
-		"   with commentary. The first line of your response MUST be\n" +
-		"   'diff --git'. There is no opt-out. If the sketch genuinely\n" +
-		"   requires no code changes (e.g. a pure doc-only task), you still\n" +
-		"   produce a real diff against a doc file — silence is not an\n" +
-		"   acceptable answer.\n" +
+		"6. Do NOT wrap the diff in a Markdown code fence. Do NOT prefix the\n" +
+		"   diff with commentary. The first line of your response MUST be\n" +
+		"   EXACTLY ONE of:\n" +
 		"\n" +
-		"7. If you are unsure about a file's current content and need more\n" +
-		"   context, do your best with what you know and annotate uncertain\n" +
-		"   regions with '# TODO(aidev): verify ...' inside the diff content.\n" +
-		"   A partially-correct starting point is strictly more useful than\n" +
-		"   an empty response; the user will review and fix the rough edges.\n" +
+		"     'diff --git'     (the common case — a real patch)\n" +
+		"     'NEED_FILES:'    (see rule 7)\n" +
+		"     'ERROR:'         (see rule 8)\n" +
 		"\n" +
-		"8. ESCAPE HATCH (use sparingly): if and only if you cannot produce\n" +
-		"   ANY diff because the request is fundamentally impossible from\n" +
-		"   the context provided (e.g. the sketch references files that\n" +
-		"   don't exist and no reasonable substitute is visible), emit a\n" +
-		"   single line starting with 'ERROR: ' followed by a one-sentence\n" +
-		"   explanation of exactly what blocked you. Do NOT use this to\n" +
-		"   sidestep uncertainty — uncertainty is what the TODO annotations\n" +
-		"   in rule 7 are for.\n" +
+		"   Silence, prose apologies, # no-op sentinels, and 'here's a\n" +
+		"   starting point' drafts are all rejected by the validator.\n" +
 		"\n" +
-		"Stay realistic. The user will apply this diff with 'git apply' and\n" +
-		"review it; a partially-correct starting point is more useful than an\n" +
-		"attempt at a whole-repo rewrite."
+		"7. NEED_FILES protocol. If you cannot write a COMPLETE, VALID diff\n" +
+		"   from the files you've already been shown because the real\n" +
+		"   content of some other file is required (for example: you need\n" +
+		"   the canonical translation string from fr/common.json to copy\n" +
+		"   into a new key, or you need to see the actual call site in a\n" +
+		"   .tsx component to anchor the patch correctly), emit the\n" +
+		"   following exactly:\n" +
+		"\n" +
+		"     NEED_FILES: [\"path/one.json\", \"path/two.tsx\"]\n" +
+		"\n" +
+		"   on a single line — a JSON array of repo-relative paths after\n" +
+		"   the 'NEED_FILES:' marker, no prose, no code fence. The harness\n" +
+		"   will load those files and re-invoke you with the expanded\n" +
+		"   context. You get up to two NEED_FILES rounds, so plan ahead:\n" +
+		"   request everything you need in one go, not one file at a time.\n" +
+		"\n" +
+		"   NEED_FILES is NOT an opt-out from doing the work. It is an\n" +
+		"   opt-in to seeing MORE of the codebase before you do the work.\n" +
+		"   Do not use it to defer writing the diff entirely.\n" +
+		"\n" +
+		"8. ERROR escape hatch. If the task is genuinely impossible\n" +
+		"   (required files don't exist on disk, the sketch contradicts\n" +
+		"   itself, the chosen approach would require migrations outside\n" +
+		"   this repository), emit a single line starting with 'ERROR: '\n" +
+		"   followed by a one-sentence explanation. The orchestrator will\n" +
+		"   surface the reason verbatim.\n" +
+		"\n" +
+		"9. FORBIDDEN OUTPUTS — the following are failure modes, not\n" +
+		"   acceptable compromises. Prefer NEED_FILES or ERROR over any of\n" +
+		"   them:\n" +
+		"\n" +
+		"   9a. Creating auxiliary checklist/notes files alongside the real\n" +
+		"       change (AIDEV_TODO_*.md, NOTES.md, CHECKLIST.md,\n" +
+		"       HUMAN_FOLLOWUP.md). The diff is the work. If a human has\n" +
+		"       to finish the job from your output, you have failed. Do\n" +
+		"       NOT create helper markdown files to track work you\n" +
+		"       decided not to do.\n" +
+		"\n" +
+		"   9b. Comments in file formats that don't support them. JSON\n" +
+		"       does NOT have comments — '// TODO' or '/* ... */' lines\n" +
+		"       inside a .json hunk produce invalid JSON and the diff\n" +
+		"       won't apply. If you think you need to annotate a JSON\n" +
+		"       region, you either request the real content via\n" +
+		"       NEED_FILES or emit ERROR. Check the file extension before\n" +
+		"       adding any kind of comment. TOML, YAML, Python, Go, TS,\n" +
+		"       JS allow comments; JSON, JSON5 (mostly), and CSV do not.\n" +
+		"\n" +
+		"   9c. Placeholder or fabricated string values. If the diff\n" +
+		"       needs a specific translation, brand name, API key name,\n" +
+		"       or any content-bearing literal, READ the real value from\n" +
+		"       the repo — via the files you already have or via\n" +
+		"       NEED_FILES. Never invent 'Kontakt Vertrieb' as a stand-in\n" +
+		"       for a German translation that already exists elsewhere in\n" +
+		"       the repo. If you genuinely cannot find the real value,\n" +
+		"       emit ERROR and explain which file you looked for it in.\n" +
+		"\n" +
+		"   9d. 'Partial starting points' that expect the human to finish\n" +
+		"       the job. You are not generating homework. Finish the\n" +
+		"       scope the sketch asked for, end to end. If the scope is\n" +
+		"       too large for a clean diff, emit ERROR and explain what\n" +
+		"       needs to be split — do not silently hand back half the\n" +
+		"       work.\n" +
+		"\n" +
+		"Stay realistic: the user will apply this diff with 'git apply'\n" +
+		"and review it. A diff that applies cleanly and finishes the\n" +
+		"scope is worth ten drafts that need human cleanup."
 
 	// Assemble the user message. v0.3a.1 includes the CONTENTS of the
 	// files the first turn's picker asked for, so the model can anchor
@@ -384,7 +513,7 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		for _, p := range paths {
 			fmt.Fprintf(&user, "### %s\n\n```\n%s\n```\n\n", p, contents[p])
 		}
-		user.WriteString("Only the files above are shown. If you need others to write a correct diff, annotate TODOs in your response — the user can re-run after adding them to the Scout's file inventory.\n")
+		user.WriteString("Only the files above have been loaded for you. If you need to read additional repo-relative files to produce a COMPLETE and VALID diff — for example to copy a canonical translation value from another locale, or to see the exact call site of a function you're rewriting — respond with `NEED_FILES: [\"path/a.json\", \"path/b.tsx\"]` per rule 7 and the harness will load them and call you again. Do NOT fabricate values, annotate TODOs inside the diff, or hand back a partial starting point.\n")
 	} else {
 		// Fallback to the v0.3a behaviour (paths only) when the picker
 		// returned nothing useful. Degrades gracefully.
@@ -411,35 +540,82 @@ func (i *Implementer) generateDiff(ctx context.Context, c *Context, chosen *Sket
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("implementer: %w", err)
+		return nil, nil, fmt.Errorf("implementer: %w", err)
 	}
 
-	diff := strings.TrimSpace(resp.Content)
-	if diff == "" {
-		return nil, errors.New("implementer: empty response")
+	raw := strings.TrimSpace(resp.Content)
+	if raw == "" {
+		return nil, nil, errors.New("implementer: empty response")
 	}
 	// Strip a leading markdown code fence if the model ignored the
 	// "no code fence" instruction — we've seen it happen in practice.
-	diff = stripCodeFence(diff)
+	raw = stripCodeFence(raw)
 
-	if strings.HasPrefix(diff, "ERROR:") {
+	switch {
+	case strings.HasPrefix(raw, "NEED_FILES:"):
+		// Iterative file request. Parse the JSON array that follows
+		// the marker. The caller (Run) loads those files and re-asks.
+		need, parseErr := parseNeedFiles(raw)
+		if parseErr != nil {
+			return nil, nil, fmt.Errorf("implementer: NEED_FILES parse: %w", parseErr)
+		}
+		if len(need) == 0 {
+			return nil, nil, errors.New("implementer: NEED_FILES directive had no paths")
+		}
+		return nil, need, nil
+
+	case strings.HasPrefix(raw, "ERROR:"):
 		// Hard-fail escape hatch. The Implementer has declared it cannot
 		// produce a diff at all. Surface the reason verbatim to the
 		// orchestrator so the user sees exactly what blocked it.
-		reason := strings.TrimSpace(strings.TrimPrefix(firstLine(diff), "ERROR:"))
+		reason := strings.TrimSpace(strings.TrimPrefix(firstLine(raw), "ERROR:"))
 		if reason == "" {
 			reason = "(no reason given)"
 		}
-		return nil, fmt.Errorf("implementer: declared ERROR: %s", reason)
-	}
-	if !strings.HasPrefix(diff, "diff --git") {
-		return nil, fmt.Errorf("implementer: expected 'diff --git', got %q", firstLine(diff))
-	}
+		return nil, nil, fmt.Errorf("implementer: declared ERROR: %s", reason)
 
-	return &Patch{
-		Diff:         diff,
-		FilesTouched: parseFilesFromDiff(diff),
-	}, nil
+	case strings.HasPrefix(raw, "diff --git"):
+		return &Patch{
+			Diff:         raw,
+			FilesTouched: parseFilesFromDiff(raw),
+		}, nil, nil
+
+	default:
+		return nil, nil, fmt.Errorf("implementer: expected 'diff --git', 'NEED_FILES:', or 'ERROR:', got %q", firstLine(raw))
+	}
+}
+
+// needFilesJSONRe matches the `[...]` JSON array that follows a
+// `NEED_FILES:` marker line. Shared with parseFileSelection in spirit
+// but kept separate so the grammar is clear: `NEED_FILES:` is a
+// dedicated protocol, not a general-purpose JSON extractor.
+var needFilesJSONRe = regexp.MustCompile(`(?s)\[.*\]`)
+
+// parseNeedFiles extracts the repo-relative paths the Implementer
+// asked for from a `NEED_FILES: [...]` response. Tolerates:
+//
+//   - extra whitespace before/after the JSON array
+//   - a single trailing newline or prose after the array (we match the
+//     first bracketed block only)
+//
+// Rejects malformed or unsafe paths the same way cleanFileList does.
+// Exported indirectly via tests in implementer_test.go.
+func parseNeedFiles(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "NEED_FILES:")
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("empty NEED_FILES directive")
+	}
+	match := needFilesJSONRe.FindString(raw)
+	if match == "" {
+		return nil, fmt.Errorf("no JSON array in NEED_FILES directive: %q", firstLine(raw))
+	}
+	var arr []string
+	if err := json.Unmarshal([]byte(match), &arr); err != nil {
+		return nil, fmt.Errorf("parse NEED_FILES JSON: %w", err)
+	}
+	return cleanFileList(arr), nil
 }
 
 // WriteTo persists a Patch to a file (default: `<repo>/.aidev/proposed.patch`).

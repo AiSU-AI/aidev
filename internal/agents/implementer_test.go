@@ -1,11 +1,36 @@
 package agents
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aisu-ai/aidev/internal/github"
+	"github.com/aisu-ai/aidev/internal/llm"
+	"github.com/aisu-ai/aidev/internal/repo"
 )
+
+// scriptedProvider returns a canned response for each Complete call
+// in order. The last response is used for every call past the end of
+// the script so tests can decouple "how many LLM calls happened" from
+// "what the scripted turns look like" — the loop termination assertion
+// is what we're checking.
+type scriptedProvider struct {
+	responses []string
+	calls     int
+}
+
+func (p *scriptedProvider) Name() string { return "scripted" }
+func (p *scriptedProvider) Complete(_ context.Context, _ llm.Request) (llm.Response, error) {
+	idx := p.calls
+	if idx >= len(p.responses) {
+		idx = len(p.responses) - 1
+	}
+	p.calls++
+	return llm.Response{Content: p.responses[idx]}, nil
+}
 
 func TestParseFilesFromDiff(t *testing.T) {
 	diff := `diff --git a/cmd/main.go b/cmd/main.go
@@ -225,7 +250,10 @@ func TestCleanFileListDropsUnsafePaths(t *testing.T) {
 }
 
 func TestCleanFileListCapsLength(t *testing.T) {
-	in := make([]string, 30)
+	// Generate comfortably more than maxRequestedFiles so the cap is
+	// actually exercised rather than the slice just being the same
+	// size as the limit.
+	in := make([]string, maxRequestedFiles*2)
 	for j := range in {
 		in[j] = "file" + intoa(j) + ".go"
 	}
@@ -313,5 +341,211 @@ func TestSortStrings(t *testing.T) {
 	sortStrings(a)
 	if a[0] != "a" || a[1] != "b" || a[2] != "c" {
 		t.Errorf("sortStrings result: %v", a)
+	}
+}
+
+// parseNeedFiles tests — the NEED_FILES protocol is the
+// Implementer's recourse when the first-turn picker under-specified
+// and the model needs more repo context to produce a valid diff.
+// Tolerance for formatting variations (prose, stray fences, extra
+// whitespace) matters because models don't emit these directives
+// cleanly on every response.
+
+func TestParseNeedFilesBareDirective(t *testing.T) {
+	got, err := parseNeedFiles(`NEED_FILES: ["de/common.json", "fr/common.json"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "de/common.json" || got[1] != "fr/common.json" {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseNeedFilesWithExtraWhitespace(t *testing.T) {
+	got, err := parseNeedFiles("   NEED_FILES:    [\"a.tsx\" , \"b.tsx\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "a.tsx" || got[1] != "b.tsx" {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseNeedFilesRejectsMissingArray(t *testing.T) {
+	_, err := parseNeedFiles("NEED_FILES:")
+	if err == nil {
+		t.Error("expected error when the directive has no JSON array")
+	}
+}
+
+func TestParseNeedFilesRejectsBrokenJSON(t *testing.T) {
+	_, err := parseNeedFiles(`NEED_FILES: [not valid json]`)
+	if err == nil {
+		t.Error("expected error on broken JSON")
+	}
+}
+
+func TestParseNeedFilesDropsUnsafePaths(t *testing.T) {
+	got, err := parseNeedFiles(`NEED_FILES: ["../../etc/passwd", "ok.go", "/abs/path"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "ok.go" {
+		t.Errorf("expected only ok.go to survive sanitisation, got %v", got)
+	}
+}
+
+// TestImplementerRunSucceedsAfterNeedFiles drives the agentic loop:
+// the picker names one file, the first generateDiff turn requests
+// MORE files via NEED_FILES, and the second generateDiff turn emits
+// the real diff. Success means the Run method followed the
+// three-turn dance and came back with a Patch.
+func TestImplementerRunSucceedsAfterNeedFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "locales", "en"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "locales", "fr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "locales", "en", "common.json"), []byte(`{"contactSales":"Contact Sales"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "locales", "fr", "common.json"), []byte(`{"contactSales":"Contacter les ventes"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &scriptedProvider{
+		responses: []string{
+			// Turn 1 (picker): request the English locale file only.
+			`["locales/en/common.json"]`,
+			// Turn 2 (generateDiff, round 0): model realises it also
+			// needs the French file to copy the canonical translation.
+			`NEED_FILES: ["locales/fr/common.json"]`,
+			// Turn 2 (round 1): real diff now that both files are
+			// loaded.
+			"diff --git a/locales/en/common.json b/locales/en/common.json\n" +
+				"--- a/locales/en/common.json\n" +
+				"+++ b/locales/en/common.json\n" +
+				"@@ -1 +1 @@\n" +
+				"-{\"contactSales\":\"Contact Sales\"}\n" +
+				"+{\"cta\":{\"contactSales\":\"Contact Sales\"}}\n",
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue: &github.Issue{
+			Owner: "aisu-ai", Repo: "aidev", Number: 1,
+			Title: "T", Body: "consolidate sales CTA across locales",
+		},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "manual consolidation", Markdown: "## Plan\n- add common.cta.contactSales"}
+
+	patch, err := impl.Run(context.Background(), ctx, sketch)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if patch == nil {
+		t.Fatal("nil patch on success")
+	}
+	if !strings.Contains(patch.Diff, "Contact Sales") {
+		t.Errorf("patch missing canonical value, got:\n%s", patch.Diff)
+	}
+	// Sanity-check the loop ran the expected number of turns: picker
+	// + first generateDiff (NEED_FILES) + second generateDiff (diff).
+	if provider.calls != 3 {
+		t.Errorf("provider called %d times, want 3", provider.calls)
+	}
+}
+
+// TestImplementerRunRejectsInfiniteNeedFiles verifies the loop cap.
+// A model that keeps saying "need more files" forever must eventually
+// trip the maxNeedFilesRounds guard and fail with a clear error
+// rather than ballooning LLM cost.
+func TestImplementerRunRejectsInfiniteNeedFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.go", "b.go", "c.go", "d.go"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	provider := &scriptedProvider{
+		responses: []string{
+			`["a.go"]`,                   // picker
+			`NEED_FILES: ["b.go"]`,       // round 0
+			`NEED_FILES: ["c.go"]`,       // round 1
+			`NEED_FILES: ["d.go"]`,       // round 2 — should trip the cap
+			`NEED_FILES: ["unused.go"]`,  // never reached
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "aisu-ai", Repo: "aidev", Number: 1, Title: "T", Body: "body"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("expected NEED_FILES-cap error, got nil")
+	}
+	if !strings.Contains(err.Error(), "NEED_FILES limit reached") {
+		t.Errorf("expected NEED_FILES limit error, got: %v", err)
+	}
+}
+
+// TestImplementerRunRejectsRepeatedFileRequests guards against a
+// model that keeps re-requesting paths the harness already loaded.
+// We de-duplicate inside Run; if the model asks for ONLY files that
+// are already in the contents map, the loop short-circuits rather
+// than wasting another LLM round on the same context.
+func TestImplementerRunRejectsRepeatedFileRequests(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &scriptedProvider{
+		responses: []string{
+			`["a.go"]`,            // picker loads a.go
+			`NEED_FILES: ["a.go"]`, // model re-requests the same file
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "aisu-ai", Repo: "aidev", Number: 1, Title: "T", Body: "b"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("expected error on duplicate-only NEED_FILES request")
+	}
+	if !strings.Contains(err.Error(), "already provided") {
+		t.Errorf("expected 'already provided' error, got: %v", err)
+	}
+}
+
+func TestParseNeedFilesCapsLength(t *testing.T) {
+	// parseNeedFiles reuses cleanFileList's cap, so a huge request
+	// still fits within maxRequestedFiles.
+	var b []byte
+	b = append(b, []byte(`NEED_FILES: [`)...)
+	for j := 0; j < maxRequestedFiles*3; j++ {
+		if j > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, []byte(`"f`+intoa(j)+`.go"`)...)
+	}
+	b = append(b, ']')
+	got, err := parseNeedFiles(string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != maxRequestedFiles {
+		t.Errorf("got %d, want cap at %d", len(got), maxRequestedFiles)
 	}
 }
