@@ -1,7 +1,7 @@
 ---
 description: Run the full aidev agent pipeline on a GitHub issue
 argument-hint: <issue-number-or-url> [repo-path]
-allowed-tools: Bash(aidev:*), Write
+allowed-tools: Bash(aidev:*), Read, Grep, Glob, Write, AskUserQuestion
 ---
 
 You are driving `aidev`, the multi-agent coding tool.
@@ -34,38 +34,50 @@ Where `<ISSUE>` is the literal first token from `$ARGUMENTS` and
 `<PATH>` is the literal second token (or `.` if unset). Expand `~`
 to `$HOME`. Wrap the path in double quotes if it contains spaces.
 
-The Bash call matches `Bash(aidev:*)` and passes the permission
-layer cleanly because it's a single `aidev` invocation with no
-surrounding shell logic.
-
 STEP 3 — Read the Critic verdict from the output.
 
-  - **build** → proceed to STEP 5.
+  - **build** → proceed to STEP 6.
   - **kill** → STOP. The Critic killed the proposal on principle;
     looping is not the answer. Report the rationale verbatim and let
     the user decide whether to override out-of-band.
   - **unclear** or **defer** → do NOT stop. Go to STEP 4.
 
-STEP 4 (interview) — The Critic has sharp questions that need human
-input before a build verdict is reachable. Your job is to interview
-the user, persist their answers where aidev can see them, and re-run
-the pipeline.
+STEP 4 (self-research) — Before bothering the user, try to answer
+the Critic's sharp questions yourself by reading the codebase. You
+have `Read`, `Grep`, and `Glob`. Most Critic questions fall into two
+buckets:
 
-Sub-step 4a: Extract the Critic's sharp questions from the report.
-They're in a section titled roughly "Sharp questions" or numbered
-1/2/3 under the FOR/AGAINST arguments. There are usually 2–3 of
-them.
+  - **Evidence questions** — "are there other consumers of X?",
+    "is this a button label or body copy?", "does the existing
+    namespace already include Y?", "what is the blast radius of
+    deleting Z?". These are answerable from the repo. Run the greps
+    and reads YOURSELF and produce concrete findings: file paths,
+    line numbers, snippets. The user should not be asked things you
+    can verify in a few seconds.
 
-Sub-step 4b: Ask the user each question, one at a time, using the
-`AskUserQuestion` tool. Keep the question text short and close to
-the Critic's own wording. If a question is multi-part, split it.
+  - **Judgment questions** — "should we ship now or split into a
+    follow-up?", "do non-English locales need native-reviewer
+    signoff?", "is this the right priority?". These need the human.
+    Save them for STEP 5.
+
+When you classify a Critic question as "evidence", run the actual
+investigation (Grep across the WHOLE repo, not just one subdir;
+Read the actual call sites; Glob the file types the Critic is
+worried about including markdown, MDX, JSON, generated types,
+storybooks, tests, analytics events). Capture the literal output
+you got — file paths and line numbers count, hand-waving doesn't.
+
+STEP 5 (judgment interview) — For the questions that survived STEP 4
+(human-judgment questions only), ask the user one at a time using
+the `AskUserQuestion` tool. Keep the question text short and close
+to the Critic's wording. If a question is multi-part, split it.
 Give the user an "escape" option ("let me think / stop pipeline")
 on every question so they're never forced into an answer.
 
-Sub-step 4c: Once you have answers, WRITE them to
-`<repo>/.aidev/clarifier.md` using the Write tool with this exact
-shape — aidev's Scout already knows how to pick up this file on the
-next run:
+After collecting answers, WRITE the full clarifier session to
+`<repo>/.aidev/clarifier.md` using the Write tool. Include BOTH
+the evidence findings from STEP 4 AND the user's answers from
+STEP 5. The on-disk format aidev's Scout reads:
 
     # Clarifier session
 
@@ -73,32 +85,50 @@ next run:
 
     ## Wave 1
 
-    ### q1 — <the first question you asked>
+    ### q1 — <question>
 
-    **Answer:** <the user's answer>
+    **Answer:** <evidence finding from STEP 4 OR user answer from STEP 5>
 
-    ### q2 — <the second question>
+    ### q2 — <question>
 
-    **Answer:** <the user's answer>
+    **Answer:** <...>
 
     ...
 
-Use `q1`, `q2`, … as IDs. If a question depended on an earlier
-answer, put it in a `## Wave 2` section instead.
+Use `q1`, `q2`, … as IDs. Mark each Answer as either
+`(evidence — Claude Code)` or `(user)` so the audit trail makes
+clear which findings came from research vs. from the developer.
 
-Sub-step 4d: Re-invoke the SAME aidev command from STEP 2. The new
-run will pick up `.aidev/clarifier.md` automatically via the Scout
-and the Critic will re-decide with the human's answers as
-authoritative input.
+Then re-invoke the SAME aidev command from STEP 2. aidev's Critic
+will pick up `.aidev/clarifier.md` and re-decide with both your
+research and the user's judgment as authoritative input.
 
-After the second run, go back to STEP 3. Do this at most TWICE
-(i.e. up to two interview rounds). If the Critic still refuses
-after two rounds, stop and report the latest verdict verbatim —
-the Critic is telling you something real.
+Do this STEP 4 → STEP 5 → re-invoke loop AT MOST TWICE.
 
-STEP 5 — Once the Critic says **build** and the Architect +
-Implementer have run, summarise the final state for the user:
-  - what the Critic recommended
+STEP 5b (escape hatch — only after 2 full interview rounds) — If
+after two rounds the Critic is STILL hedging and the user has
+genuinely answered every question that requires human judgment,
+ask the user ONE final question via `AskUserQuestion`:
+
+  > "The Critic is still hedging despite the answers we collected.
+  > Would you like to force aidev to proceed to Architect + Implementer
+  > anyway? The Critic's report stays in the audit trail."
+
+Options: "Force build" / "Stop here". On "Force build", re-invoke
+aidev one more time with the additional flag:
+
+    aidev -headless -auto -sketch 1 -force-verdict build -issue <ISSUE> -repo <PATH>
+
+This is a hard escape hatch. It logs loudly in aidev's output so
+the override is always visible in the run history. Do NOT reach for
+it before the two interview rounds — it bypasses the entire point
+of the Critic. Use it only when you're confident the Critic is
+spinning on questions the human has already resolved.
+
+STEP 6 — Once the Critic says **build** (or the user has forced
+build) and the Architect + Implementer have run, summarise the
+final state for the user:
+  - what the Critic recommended (and whether it was overridden)
   - how many sketches the Architect produced
   - whether the Implementer wrote a patch at
     `<repo>/.aidev/proposed.patch`
@@ -106,4 +136,4 @@ Implementer have run, summarise the final state for the user:
 
 Never push the user to override a `kill` verdict; that is the entire
 point of the tool. A `defer` or `unclear` verdict, however, is an
-invitation to dialogue — which is exactly what STEP 4 is for.
+invitation to dialogue — which is exactly what STEPS 4 and 5 are for.

@@ -72,17 +72,53 @@ You MUST:
 Do NOT hedge the recommendation. If the evidence is mixed, choose "unclear"
 and say what evidence would move you.
 
-If a "Clarifier session" section is present in the input below, it contains
-the human's direct answers to sharp questions YOU raised in a prior pass.
-Treat those answers as authoritative: they are ground truth about intent,
-scope, and environment that overrides any assumption you might otherwise
-make. Re-decide the verdict in light of them — do NOT re-ask the same
-questions unless the answers themselves raised new ambiguities.`
+If a "Clarifier session" section is present in the input below, it
+contains the human's direct answers to sharp questions YOU raised in a
+prior pass. Treat those answers as AUTHORITATIVE GROUND TRUTH:
+
+  - The user has decided. Their answers are not a starting point for
+    further interrogation.
+  - You may NOT re-ask any question that has already been answered in
+    the Clarifier session, even in a slightly rephrased form. If you
+    find yourself wanting to demand more evidence for an answered
+    question, the answer itself IS the evidence — that is the entire
+    point of the Clarifier loop.
+  - You may still raise NEW questions that the existing answers
+    surfaced — but only if those questions could not have been
+    foreseen from the original sharp questions you raised.
+  - If the Clarifier section materially resolves the ambiguity that
+    drove a prior 'unclear' or 'defer' verdict, your new verdict
+    SHOULD be 'build' (or, if the answers reveal a fatal flaw, 'kill').
+    Re-emitting 'unclear' or 'defer' after the user has answered is a
+    failure mode: it means the loop made no progress and the user is
+    stuck. Avoid it unless the answers literally created NEW
+    ambiguity.`
 
 	// Marshal the principles into a compact, quotable block.
 	var principles strings.Builder
 	for _, p := range cc.Principles {
 		fmt.Fprintf(&principles, "- **%s** — %s\n  %s\n", p.Name, p.Summary, oneLine(p.Description))
+	}
+
+	// Resolve the Clarifier content for this run. Two sources can supply
+	// it and they MUST converge on the same authoritative section in
+	// the prompt — otherwise the slash-command flow (which writes
+	// .aidev/clarifier.md to disk) would silently bypass the
+	// "treat as authoritative" plumbing the in-process TTY interview
+	// goes through:
+	//
+	//  1. cc.ClarifierNotes — set by the in-process headless TTY
+	//     interview right before calling Recritique. Highest priority
+	//     because it reflects the answers collected in THIS run.
+	//
+	//  2. cc.Snapshot.ClarifierContent — the persisted .aidev/clarifier.md
+	//     file on disk, populated by the repo Scout snapshot. This is
+	//     how Claude Code's slash-command interview hands answers to
+	//     aidev: it writes the file, then re-invokes us. Used only when
+	//     ClarifierNotes is empty so the in-memory copy always wins.
+	clarifier := strings.TrimSpace(cc.ClarifierNotes)
+	if clarifier == "" && cc.Snapshot != nil {
+		clarifier = strings.TrimSpace(cc.Snapshot.ClarifierContent)
 	}
 
 	var user strings.Builder
@@ -92,9 +128,9 @@ questions unless the answers themselves raised new ambiguities.`
 	user.WriteString(cc.ScoutReport)
 	user.WriteString("\n\n## Engineering principles\n\n")
 	user.WriteString(principles.String())
-	if strings.TrimSpace(cc.ClarifierNotes) != "" {
-		user.WriteString("\n\n## Clarifier session (human answers to your previous sharp questions — authoritative)\n\n")
-		user.WriteString(cc.ClarifierNotes)
+	if clarifier != "" {
+		user.WriteString("\n\n## Clarifier session (human answers to your previous sharp questions — AUTHORITATIVE GROUND TRUTH)\n\n")
+		user.WriteString(clarifier)
 	}
 
 	resp, err := c.Provider.Complete(ctx, llm.Request{
