@@ -44,6 +44,16 @@ type Context struct {
 	// authoritative for the in-memory re-critique loop; the on-disk
 	// file is what downstream runs pick up.
 	ClarifierNotes string
+
+	// CoordinatorFeedback is a bullet list of concrete, actionable
+	// issues the Coordinator found in the Implementer's previous
+	// attempt at this sketch. Set by the orchestrator's Gate-1 loop
+	// between the Coordinator's review and the next Implementer run;
+	// read by the Implementer's generateDiff prompt assembly so the
+	// retry has specific guidance to address. Always empty on the
+	// first attempt. Cleared between orchestrator runs so stale
+	// feedback from a previous issue can't leak into a new one.
+	CoordinatorFeedback string
 }
 
 // Principle is re-exported so agent code doesn't need to import the config
