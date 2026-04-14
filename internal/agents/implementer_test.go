@@ -797,6 +797,172 @@ func TestImplementerRunRejectsRepeatedFileRequests(t *testing.T) {
 	}
 }
 
+// harvestPaths tests — the Implementer's pre-flight path extractor
+// that pulls repo-relative source paths out of upstream agent prose
+// and loads them automatically before the picker turn. The
+// regression guard against 'files don't exist' ERRORs when the
+// Clarifier literally just cited the file.
+
+func TestHarvestPathsFromClarifierEvidence(t *testing.T) {
+	// The exact shape of a Clarifier evidence bullet — file path
+	// followed by a line-number annotation. This is what the user's
+	// Wave 1 Clarifier output contained, verbatim.
+	input := "In `apps/marketing/src/components/sections/pricing-section/pricing-section-client.tsx:193-199` the Button call site uses t(\"contactSales\")."
+	got := harvestPaths(input)
+	if len(got) != 1 {
+		t.Fatalf("want 1 path, got %d: %v", len(got), got)
+	}
+	want := "apps/marketing/src/components/sections/pricing-section/pricing-section-client.tsx"
+	if got[0] != want {
+		t.Errorf("got %q, want %q", got[0], want)
+	}
+}
+
+func TestHarvestPathsMultipleExtensions(t *testing.T) {
+	input := `
+The translation lives in apps/marketing/src/lib/i18n/translations/fr/common.json and the
+call site is at apps/marketing/src/components/pages/pricing/pricing.tsx:56. The type
+definition is in packages/types/src/i18n.ts and the helper is use-translation.ts at
+apps/marketing/src/lib/i18n/use-translation.ts.
+`
+	got := harvestPaths(input)
+	want := map[string]bool{
+		"apps/marketing/src/lib/i18n/translations/fr/common.json": true,
+		"apps/marketing/src/components/pages/pricing/pricing.tsx": true,
+		"packages/types/src/i18n.ts":                              true,
+		"apps/marketing/src/lib/i18n/use-translation.ts":          true,
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d paths %v, want %d (%v)", len(got), got, len(want), want)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("unexpected path %q", p)
+		}
+	}
+}
+
+func TestHarvestPathsDeduplicates(t *testing.T) {
+	input := "foo/bar.go foo/bar.go foo/bar.go"
+	got := harvestPaths(input)
+	if len(got) != 1 || got[0] != "foo/bar.go" {
+		t.Errorf("got %v, want [foo/bar.go]", got)
+	}
+}
+
+func TestHarvestPathsFromMultipleSources(t *testing.T) {
+	scout := "Top-level is apps/marketing/src/app/page.tsx with components/..."
+	critic := "Worth checking: apps/marketing/src/components/cta/button.tsx"
+	clarifier := "Fix site: apps/marketing/src/components/pages/pricing/pricing.tsx:56"
+	got := harvestPaths(scout, critic, clarifier)
+	if len(got) != 3 {
+		t.Errorf("want 3, got %d: %v", len(got), got)
+	}
+}
+
+func TestHarvestPathsRejectsAbsoluteAndTraversal(t *testing.T) {
+	input := "Check /etc/passwd and ../../../outside.go but foo/bar.go is fine."
+	got := harvestPaths(input)
+	if len(got) != 1 || got[0] != "foo/bar.go" {
+		t.Errorf("got %v, want only [foo/bar.go] (absolute and traversal filtered)", got)
+	}
+}
+
+func TestHarvestPathsIgnoresBareFilenames(t *testing.T) {
+	// Bare filenames without a directory component ("main.go" on its
+	// own) are too noisy to harvest — they match too many things in
+	// prose. The regex requires at least one slash.
+	got := harvestPaths("see main.go for details, or check foo.tsx")
+	if len(got) != 0 {
+		t.Errorf("bare filenames should be rejected, got %v", got)
+	}
+}
+
+func TestHarvestPathsIgnoresEmptyInput(t *testing.T) {
+	got := harvestPaths("", "   ", "\n\n")
+	if len(got) != 0 {
+		t.Errorf("empty inputs should return nothing, got %v", got)
+	}
+}
+
+// TestImplementerRunAutoLoadsUpstreamCitedPaths is the regression
+// guard for the 'ERROR: files do not exist' failure the user hit.
+// The Clarifier cites a path that is NOT in the picker's inventory
+// (simulates an inventory cap truncation). The Implementer.Run()
+// must auto-harvest the path from the Clarifier content, load it
+// via readFiles, and make it available to generateDiff BEFORE the
+// picker runs. Without this fix the Implementer would see only the
+// truncated inventory, conclude the file doesn't exist, and ERROR.
+func TestImplementerRunAutoLoadsUpstreamCitedPaths(t *testing.T) {
+	dir := t.TempDir()
+	// Create the "hidden" file in a deep subdirectory — the
+	// Clarifier cites it but we'll simulate the picker not seeing
+	// it by having the picker return an empty inventory pick.
+	citedPath := "apps/marketing/src/components/pages/pricing/pricing.tsx"
+	if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(citedPath)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, citedPath), []byte("export const Pricing = () => <>\"Contact our sales team\"</>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &captureAllProvider{
+		responses: []string{
+			// Picker turn: returns empty (simulating the picker not
+			// knowing about the cited path because it's truncated
+			// out of the inventory). This matches the real failure
+			// where the picker returned an empty list too.
+			`[]`,
+			// generateDiff turn: because Run() auto-harvested the
+			// Clarifier path and loaded it, the file contents are
+			// already in the prompt. Model produces a real diff.
+			"diff --git a/apps/marketing/src/components/pages/pricing/pricing.tsx b/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"--- a/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"+++ b/apps/marketing/src/components/pages/pricing/pricing.tsx\n" +
+				"@@ -1 +1 @@\n" +
+				"-export const Pricing = () => <>\"Contact our sales team\"</>\n" +
+				"+export const Pricing = () => <>\"Contact Sales\"</>\n",
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue: &github.Issue{
+			Owner: "a", Repo: "b", Number: 1,
+			Title: "Unify CTA",
+			Body:  "fix the drift",
+		},
+		Snapshot: &repo.Snapshot{Root: dir},
+		ClarifierNotes: "### q1 — evidence\n\n**Answer:** The call site is at `" + citedPath + ":193-199` and it uses t(\"contactSales\").",
+	}
+	sketch := &Sketch{Number: 1, Title: "consolidate", Markdown: "## Plan\n- update the " + citedPath + " label"}
+
+	patch, err := impl.Run(context.Background(), ctx, sketch)
+	if err != nil {
+		t.Fatalf("Run should not fail — upstream-cited path should be auto-loaded: %v", err)
+	}
+	if patch == nil {
+		t.Fatal("nil patch")
+	}
+	if !strings.Contains(patch.Diff, "Contact Sales") {
+		t.Errorf("patch missing expected change, got:\n%s", patch.Diff)
+	}
+
+	// Verify the second prompt (generateDiff turn) actually
+	// contains the file contents Run() auto-loaded from the
+	// Clarifier citation. If the harvest didn't fire, the contents
+	// section would be empty.
+	if len(provider.prompts) < 2 {
+		t.Fatalf("want 2 prompts, got %d", len(provider.prompts))
+	}
+	diffPrompt := provider.prompts[1]
+	if !strings.Contains(diffPrompt, "export const Pricing") {
+		t.Errorf("diff-generation prompt did not include auto-harvested file contents; got:\n%s", diffPrompt)
+	}
+	if !strings.Contains(diffPrompt, citedPath) {
+		t.Errorf("diff-generation prompt should cite the upstream path under ## Current file contents; got:\n%s", diffPrompt)
+	}
+}
+
 func TestParseNeedFilesCapsLength(t *testing.T) {
 	// parseNeedFiles reuses cleanFileList's cap, so a huge request
 	// still fits within maxRequestedFiles.
