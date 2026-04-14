@@ -13,7 +13,10 @@
 // reaches for Claude, and to swap either side without touching agent code.
 package llm
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Role is a typed string used by agents when requesting a provider from the
 // Router. Using constants keeps typo-bugs out of the hot path.
@@ -118,4 +121,152 @@ type StreamChunk struct {
 	// Consumers should check this before drawing conclusions from the
 	// accumulated Text.
 	Err error
+}
+
+// ---------------------------------------------------------------------------
+// Tool use (v0.4)
+// ---------------------------------------------------------------------------
+//
+// The NEED_FILES loop in the Implementer was a poor-man's simulation of
+// tool use built on top of the single-shot Complete() method: the model
+// emitted a fake "NEED_FILES: [...]" string, the harness parsed it,
+// loaded files, and re-called. Every brittleness we patched in PRs
+// #31/#33/#34/#35/#36 was a leaky abstraction in that simulation.
+//
+// ToolAwareProvider is the real thing. Backends that implement it
+// expose a native tool-use loop where the model calls `read_file`,
+// `glob`, `grep`, etc. as real tools within a single open LLM session.
+// The Implementer stops round-tripping file content through string
+// protocols.
+//
+// Adoption is opt-in per backend via a Go interface type assertion:
+//
+//	if toolAware, ok := provider.(llm.ToolAwareProvider); ok {
+//		// use native tool loop
+//	} else {
+//		// fall back to NEED_FILES-style Complete path
+//	}
+//
+// Providers that don't implement ToolAwareProvider keep working via
+// the legacy path. v0.4 ships with Anthropic REST as the first and
+// only ToolAwareProvider; Ollama and claude-cli land in later
+// releases.
+
+// ToolDefinition describes a single tool available to the model.
+// InputSchema is a JSON Schema object describing the tool's
+// parameters — aidev hand-writes these for the handful of tools it
+// exposes rather than generating from Go types, because the schemas
+// are small and the clarity benefit is worth the duplication.
+type ToolDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// ToolContentBlock is one element of a ToolMessage's Content. It
+// represents a single typed block — text the user/assistant wrote,
+// a tool_use call the assistant made, or a tool_result the user
+// (harness) produced in response to a tool_use.
+//
+// The shape is a flattened union: Type discriminates, and only the
+// fields relevant to that type are populated. This maps 1:1 to the
+// Anthropic Messages API content-block shape and is how we preserve
+// enough state for multi-turn tool conversations without rebuilding
+// the whole API on top of a simpler type.
+type ToolContentBlock struct {
+	// Type is "text", "tool_use", or "tool_result".
+	Type string
+
+	// Text is populated when Type == "text".
+	Text string
+
+	// ToolUseID identifies a tool_use block (when Type == "tool_use")
+	// or the tool_use it responds to (when Type == "tool_result").
+	// Set by the provider on tool_use blocks; set by the harness on
+	// tool_result blocks so the provider can correlate.
+	ToolUseID string
+
+	// ToolName is the tool being invoked (when Type == "tool_use").
+	ToolName string
+
+	// ToolInput is the JSON object argument to the tool (when Type ==
+	// "tool_use"). Opaque to the provider layer — the agent validates
+	// and executes it.
+	ToolInput json.RawMessage
+
+	// ToolResultContent is the text returned from executing a tool
+	// (when Type == "tool_result"). Provider serializes this as the
+	// `content` field of the tool_result block.
+	ToolResultContent string
+
+	// ToolResultIsError indicates the tool reported a recoverable
+	// failure (file not found, grep had no matches, etc.). The model
+	// sees this flag and decides whether to retry, try a different
+	// tool, or give up. Harness-level errors (auth, transport) are
+	// propagated to the caller as Go errors and never become
+	// ToolResult blocks.
+	ToolResultIsError bool
+}
+
+// ToolMessage is one turn in a tool-aware conversation. Unlike the
+// simple Message type, Content is a slice of typed blocks because a
+// single assistant turn can interleave text and tool_use blocks and a
+// single user turn can contain multiple tool_result blocks (one per
+// pending tool_use from the prior assistant turn).
+type ToolMessage struct {
+	Role    string // "user" | "assistant"
+	Content []ToolContentBlock
+}
+
+// ToolAwareRequest is the full multi-turn tool-use conversation as
+// the caller sees it. Messages is the growing history — on the first
+// turn it contains just the initial user message; each subsequent
+// turn appends the assistant's response AND a user message with the
+// computed tool_result blocks.
+type ToolAwareRequest struct {
+	System      string
+	Tools       []ToolDefinition
+	Messages    []ToolMessage
+	MaxTokens   int
+	Temperature float64
+}
+
+// ToolUse is a single pending tool call extracted from a
+// ToolAwareResponse. It's a convenience view: the same information
+// also lives in the response's raw message blocks (accessible via
+// AssistantMessage), but ToolUses is what an iterating harness
+// actually wants to range over.
+type ToolUse struct {
+	ID    string
+	Name  string
+	Input json.RawMessage
+}
+
+// ToolAwareResponse is the return value from CompleteWithTools. On a
+// normal turn Content holds the model's text and StopReason is
+// "end_turn"; on a tool-use turn Content may be empty and ToolUses
+// holds the pending tool calls the harness must execute and feed
+// back in the next request.
+//
+// AssistantMessage is the full assistant turn represented as a
+// ToolMessage — the caller appends this verbatim to its own
+// ToolAwareRequest.Messages list before adding the user tool_result
+// message for the next iteration. This is the key invariant that
+// lets the caller manage state in one place (the Messages slice)
+// while the provider stays stateless.
+type ToolAwareResponse struct {
+	Content          string
+	ToolUses         []ToolUse
+	StopReason       string // "end_turn" | "tool_use" | "max_tokens" | ...
+	Model            string
+	Usage            Usage
+	AssistantMessage ToolMessage
+}
+
+// ToolAwareProvider is the optional capability interface for backends
+// that support native tool use. Detect support via a type assertion
+// the same way you would for Streamer.
+type ToolAwareProvider interface {
+	Provider
+	CompleteWithTools(ctx context.Context, req ToolAwareRequest) (ToolAwareResponse, error)
 }
