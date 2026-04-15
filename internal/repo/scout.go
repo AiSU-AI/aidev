@@ -19,19 +19,20 @@ import (
 
 // Snapshot is the structured view of a repository Scout builds up.
 type Snapshot struct {
-	Root            string
-	Languages       map[string]int // extension -> file count
-	TopLevelEntries []string       // names of files/dirs at repo root
-	ReadmePath      string
-	ReadmeContent   string
-	AgentMarkdown   string // CLAUDE.md, AGENTS.md, or AIDEV.md if present
-	ArchitectureDoc string // ARCHITECTURE.md if present
-	CharterPath     string // .aidev/charter.md if present
-	CharterContent  string // contents of CharterPath
-	ClarifierPath   string // .aidev/clarifier.md if present
+	Root             string
+	Languages        map[string]int // extension -> file count
+	TopLevelEntries  []string       // names of files/dirs at repo root
+	DirectoryTree    string         // depth-2 rendered tree for the Scout prompt
+	ReadmePath       string
+	ReadmeContent    string
+	AgentMarkdown    string // CLAUDE.md, AGENTS.md, or AIDEV.md if present
+	ArchitectureDoc  string // ARCHITECTURE.md if present
+	CharterPath      string // .aidev/charter.md if present
+	CharterContent   string // contents of CharterPath
+	ClarifierPath    string // .aidev/clarifier.md if present
 	ClarifierContent string // contents of ClarifierPath
-	PrinciplesPath  string // .aidev/principles.yaml if present
-	TotalFiles      int
+	PrinciplesPath   string // .aidev/principles.yaml if present
+	TotalFiles       int
 }
 
 // HasStrongSignal reports whether the snapshot has at least one source
@@ -137,6 +138,14 @@ func Scan(root string) (*Snapshot, error) {
 		"__pycache__": true, ".aidev-cache": true,
 	}
 
+	// Depth-2 directory tree rendered into the Snapshot so the Scout
+	// agent's prompt shows real subdirectories instead of only top-level
+	// names. This is the grounding fix for the monorepo hallucination
+	// bug (Scout describing "apps/web, apps/api, packages/shared" for a
+	// repo that only has "apps/marketing"). See also internal/agents/scout.go
+	// where the tree is inlined into the user message.
+	snap.DirectoryTree = renderDirectoryTree(root, skipDirs, 2, 200, 4096)
+
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// A permissions error on one dir should not abort the whole scan.
@@ -189,6 +198,100 @@ func (s *Snapshot) TopLanguages(n int) []string {
 		out = append(out, pairs[i].ext+" ("+itoa(pairs[i].n)+")")
 	}
 	return out
+}
+
+// renderDirectoryTree walks `root` breadth-first up to maxDepth and
+// emits a simple indented listing that the Scout agent can paste into
+// its prompt. Directories in skipDirs are pruned (whole subtree).
+// Output is capped by maxEntries and maxBytes so a giant monorepo
+// never blows past Scout's context window. Files are listed only at
+// depth 1; depth >=2 shows directories only to keep the signal
+// high and the noise low.
+//
+// Example output for aidev itself:
+//
+//	cmd/
+//	  aidev/
+//	completion/
+//	  bash
+//	  zsh
+//	config/
+//	  models.yaml
+//	  principles.yaml
+//	internal/
+//	  agents/
+//	  completion/
+//	  config/
+//	  ...
+func renderDirectoryTree(root string, skipDirs map[string]bool, maxDepth, maxEntries, maxBytes int) string {
+	var b strings.Builder
+	entries := 0
+	truncated := false
+
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if path == root {
+			return nil
+		}
+
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		depth := strings.Count(rel, string(filepath.Separator)) + 1
+
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			// Skip dot-dirs except .aidev (which holds charter, clarifier,
+			// followups — signals the Scout wants to see).
+			if strings.HasPrefix(d.Name(), ".") && d.Name() != ".aidev" {
+				return filepath.SkipDir
+			}
+			if depth > maxDepth {
+				return filepath.SkipDir
+			}
+		} else {
+			// Files at depth 2+ are noise for the Scout prompt — the
+			// top-level file list already covers package.json / go.mod /
+			// Cargo.toml-style signals at depth 1.
+			if depth > 1 {
+				return nil
+			}
+		}
+
+		if entries >= maxEntries {
+			truncated = true
+			return filepath.SkipAll
+		}
+
+		indent := strings.Repeat("  ", depth-1)
+		name := d.Name()
+		if d.IsDir() {
+			name += "/"
+		}
+		line := indent + name + "\n"
+		if b.Len()+len(line) > maxBytes {
+			truncated = true
+			return filepath.SkipAll
+		}
+		b.WriteString(line)
+		entries++
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, filepath.SkipAll) {
+		// Partial tree is better than no tree — fall through.
+	}
+	if truncated {
+		b.WriteString("... [truncated]\n")
+	}
+	return b.String()
 }
 
 func itoa(n int) string {

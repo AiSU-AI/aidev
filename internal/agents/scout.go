@@ -51,6 +51,18 @@ func (s *Scout) Run(ctx context.Context, c *Context) (string, error) {
 	}
 	b.WriteString("\n")
 
+	// Directory tree grounding. Without this, a small-tier Scout with
+	// only top-level names will fill in plausible-but-wrong subdirectory
+	// structure from its training priors (the monorepo hallucination
+	// bug). Depth 2 is enough to expose "apps/marketing", "apps/web",
+	// "packages/shared" etc. without the noise of deep source trees.
+	if snap.DirectoryTree != "" {
+		b.WriteString("## Directory tree (depth 2)\n\n")
+		b.WriteString("```\n")
+		b.WriteString(snap.DirectoryTree)
+		b.WriteString("```\n\n")
+	}
+
 	if snap.ReadmeContent != "" {
 		b.WriteString("## README\n\n")
 		b.WriteString(truncate(snap.ReadmeContent, 4096))
@@ -89,7 +101,11 @@ If the docs disagree, call that out.
 
 ## Architecture
 3-6 bullets on how the code is organised. Name the real top-level
-packages/directories.
+packages/directories — use ONLY names that appear verbatim in the
+"Directory tree" section above. Do not invent directories from
+experience with similar projects; if the tree shows "apps/marketing",
+do not also claim "apps/web" or "apps/api" unless they appear in the
+tree too.
 
 ## Stated principles
 Bullets drawn verbatim from any agent markdown or architecture doc.
