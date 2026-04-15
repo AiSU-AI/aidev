@@ -169,7 +169,7 @@ func TestClaudeCLIImplementsToolAwareProvider(t *testing.T) {
 // TestClaudeCLICompleteWithToolsHappyPath verifies the subprocess-agent
 // path: a fake claude binary that echoes the invocation details back
 // as the envelope's `result` field, so the test can assert the
-// command-line surface (--allowedTools, --append-system-prompt) AND
+// command-line surface (--tools, --append-system-prompt) AND
 // the cwd are correctly threaded.
 func TestClaudeCLICompleteWithToolsHappyPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -245,7 +245,7 @@ JSON
 	for _, want := range []string{
 		"--print",
 		"--output-format json",
-		"--allowedTools Read Grep Glob LS",
+		"--tools Read,Grep,Glob,LS",
 		"--append-system-prompt you are the test implementer",
 		"cwd: " + repoDir,
 		"stdin:\nproduce a unified diff",

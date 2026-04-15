@@ -342,7 +342,7 @@ func runConfigDoctor() {
 	// shipped providers (anthropic, ollama, claude-cli) now implement
 	// ToolAwareProvider — the claude-cli path does so via subprocess
 	// agent mode (invokes `claude -p` inside the target repo with
-	// --allowedTools Read/Grep/Glob/LS). No warning needed today; the
+	// --tools Read,Grep,Glob,LS). No warning needed today; the
 	// check is kept as a hook in case a future provider is added
 	// without ToolAwareProvider support.
 	// Historical note: earlier versions warned here because claude-cli

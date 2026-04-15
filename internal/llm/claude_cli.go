@@ -253,11 +253,13 @@ func (c *ClaudeCLI) SetBin(path string) { c.bin = path }
 // how claude CLI was designed to be used.
 //
 // Tool scope: only read-only tools are allowed (Read, Grep, Glob,
-// LS). Edit / Write / Bash are NOT in --allowedTools so the agent
-// cannot modify the repo directly — its only output channel is the
-// final stdout text, which aidev captures as a diff candidate. This
-// preserves the aidev contract that the user reviews every patch
-// before applying.
+// LS). The subprocess is invoked with `--tools Read,Grep,Glob,LS`
+// which HARD-RESTRICTS the available toolset (in contrast to
+// `--allowedTools`, which is a pre-approval list that silently
+// leaves Edit / Write / Bash reachable). This preserves the aidev
+// contract that we produce patches, we do not modify your repo;
+// the agent's only output channel is stdout, captured as a diff
+// candidate, and the user reviews every patch before apply.
 //
 // Working directory: cmd.Dir is set to req.WorkingDir so the agent's
 // tools operate inside the target repo. This is the ONE place where
@@ -298,12 +300,15 @@ func (c *ClaudeCLI) CompleteWithTools(ctx context.Context, r ToolAwareRequest) (
 	args := []string{
 		"--print",
 		"--output-format", "json",
-		// Pre-authorize the read-only exploration tools so the
-		// subprocess never blocks on a permission prompt. The
-		// agent must NOT be allowed to Edit / Write / Bash — its
-		// only output is stdout, and aidev captures that as a
-		// diff candidate. User reviews every patch before apply.
-		"--allowedTools", "Read", "Grep", "Glob", "LS",
+		// RESTRICT the tool set to read-only exploration. Use
+		// --tools (hard restriction to the listed tools only),
+		// NOT --allowedTools (which is an auto-approve list that
+		// silently leaves Edit/Write/Bash reachable). aidev's
+		// contract is "we produce patches, we don't modify your
+		// repo" — the agent's only output channel is stdout,
+		// captured as a diff candidate. The user reviews every
+		// patch before applying it.
+		"--tools", "Read,Grep,Glob,LS",
 	}
 	if c.model != "" {
 		args = append(args, "--model", c.model)

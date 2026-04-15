@@ -837,10 +837,10 @@ func discoverConfigDir() string {
 // and silently fell back to the legacy NEED_FILES path. As of the
 // claude-cli subprocess-agent mode, claude-cli DOES implement
 // ToolAwareProvider via a different shape — it invokes `claude -p`
-// with --allowedTools, lets the subprocess drive its own tools
-// inside the repo, and returns the final diff. We note that shape
-// with an ℹ marker so the user can tell at a glance which tool-use
-// strategy each tool-capable role is using.
+// with --tools Read,Grep,Glob,LS, lets the subprocess drive those
+// read-only tools inside the repo, and returns the final diff.
+// We note that shape with an ℹ marker so the user can tell at a
+// glance which tool-use strategy each tool-capable role is using.
 func printStartupBanner(cfg *config.Config) {
 	if cfg == nil || cfg.Models.Routing == nil {
 		return
@@ -864,7 +864,7 @@ func printStartupBanner(cfg *config.Config) {
 		}
 		marker := ""
 		if (role == "implementer" || role == "reviewer") && tier.Provider == "claude-cli" {
-			marker = "    ℹ claude-cli subprocess agent (runs `claude -p` with --allowedTools Read/Grep/Glob/LS inside the target repo)"
+			marker = "    ℹ claude-cli subprocess agent (runs `claude -p` with --tools Read,Grep,Glob,LS inside the target repo)"
 		}
 		modelDisplay := tier.Model
 		if modelDisplay == "" {
