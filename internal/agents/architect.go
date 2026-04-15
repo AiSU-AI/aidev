@@ -84,6 +84,23 @@ func EstimateCost(n int) CostEstimate {
 // Run produces N sketches. It fails loudly if the shared Context is missing
 // the Critic's report, because the Architect is only meaningful after the
 // build/defer/kill decision has been made.
+//
+// Each sketch is produced by a separate Complete() call. Splitting the work
+// this way has three wins over asking for all N sketches in one response:
+//
+//   - Smaller context per call → lower SIGKILL / OOM risk on the model side.
+//     (Concretely: claude-cli was getting SIGKILL'd on the single big call
+//     for N=3; splitting made the problem go away.)
+//   - Retry middleware works per sketch — a transient failure on one call
+//     no longer takes the other two down with it.
+//   - Partial success is possible: if one of N sketches fails retries-
+//     exhausted, we still return the ones that succeeded. An all-or-nothing
+//     Architect gate was a bad tradeoff for an advisory step.
+//
+// Serial, not parallel — sequential calls let each sketch see prior titles
+// so the "diversity hint" isn't guessing. Parallelism is a latency win we
+// can add later once telemetry shows it matters; for now the reliability
+// win is the whole story.
 func (a *Architect) Run(ctx context.Context, cc *Context) ([]Sketch, error) {
 	if cc == nil || cc.Issue == nil {
 		return nil, fmt.Errorf("architect: missing issue")
@@ -95,33 +112,118 @@ func (a *Architect) Run(ctx context.Context, cc *Context) ([]Sketch, error) {
 		return nil, fmt.Errorf("architect: critic report must run first")
 	}
 
-	system := fmt.Sprintf(`You are the Architect for aidev, a multi-agent coding tool.
+	// The user message is the same for every sketch call — context is
+	// immutable across the loop, only the system prompt changes per call
+	// to steer diversity.
+	userMsg := a.buildUserMessage(cc)
+
+	var sketches []Sketch
+	var callErrors []error
+	priorTitles := make([]string, 0, a.N)
+
+	for i := 1; i <= a.N; i++ {
+		system := a.buildSketchSystemPrompt(i, priorTitles)
+		resp, err := a.Provider.Complete(ctx, llm.Request{
+			System: system,
+			Messages: []llm.Message{
+				{Role: "user", Content: userMsg},
+			},
+		})
+		if err != nil {
+			// Accumulate the error but keep going — partial success is
+			// the whole point of the split. If every call fails we'll
+			// surface a combined error below.
+			callErrors = append(callErrors, fmt.Errorf("sketch %d: %w", i, err))
+			continue
+		}
+		parsed := ParseSketches(resp.Content)
+		if len(parsed) == 0 {
+			callErrors = append(callErrors, fmt.Errorf("sketch %d: no parseable sketch in response:\n%s", i, resp.Content))
+			continue
+		}
+		// The per-call prompt always asks for "## Sketch 1: ..." so the
+		// model's numbering is relative. Renumber to the loop index and
+		// recompute the header so ParseSketches downstream (if anyone
+		// re-parses the aggregate) continues to work.
+		s := parsed[0]
+		s.Number = i
+		s.Markdown = renumberSketch(s.Markdown, i)
+		sketches = append(sketches, s)
+		priorTitles = append(priorTitles, s.Title)
+	}
+
+	if len(sketches) == 0 {
+		return nil, fmt.Errorf("architect: produced no parseable sketches after %d calls. First error: %w", a.N, firstOrNil(callErrors))
+	}
+	// Partial success path — log the missing ones via the returned
+	// sketches slice (caller sees len(sketches) < N) but do not fail.
+	// The headless reporter already prints "Architect produced X
+	// sketches" which will naturally reflect any shortfall.
+	return sketches, nil
+}
+
+// buildUserMessage assembles the per-run user message the Architect sees
+// on every sketch call. It contains the issue, the Scout brief, the
+// Critic report, and the short-form engineering principles.
+func (a *Architect) buildUserMessage(cc *Context) string {
+	var principles strings.Builder
+	for _, p := range cc.Principles {
+		fmt.Fprintf(&principles, "- **%s** — %s\n", p.Name, p.Summary)
+	}
+
+	var user strings.Builder
+	fmt.Fprintf(&user, "## GitHub issue %s/%s#%d: %s\n\n",
+		cc.Issue.Owner, cc.Issue.Repo, cc.Issue.Number, cc.Issue.Title)
+	user.WriteString(cc.Issue.Body)
+	user.WriteString("\n\n## Scout brief\n\n")
+	user.WriteString(cc.ScoutReport)
+	user.WriteString("\n\n## Critic report\n\n")
+	user.WriteString(cc.CriticReport)
+	user.WriteString("\n\n## Engineering principles (short form)\n\n")
+	user.WriteString(principles.String())
+	return user.String()
+}
+
+// buildSketchSystemPrompt produces the per-call system prompt for sketch
+// i (1-indexed). When i > 1 it includes a "prior sketches" note so the
+// model can explicitly diverge from what already exists.
+func (a *Architect) buildSketchSystemPrompt(i int, priorTitles []string) string {
+	var diversity string
+	if len(priorTitles) > 0 {
+		var b strings.Builder
+		b.WriteString("\nPRIOR SKETCHES ALREADY PRODUCED (you must be meaningfully different from all of these):\n")
+		for idx, title := range priorTitles {
+			fmt.Fprintf(&b, "  %d. %s\n", idx+1, title)
+		}
+		b.WriteString("\nYour sketch must differ from ALL of the above on at least one major axis.\n")
+		diversity = b.String()
+	}
+
+	return fmt.Sprintf(`You are the Architect for aidev, a multi-agent coding tool.
 
 The Critic has already approved this proposal. Your job is to produce exactly
-%d MEANINGFULLY DIFFERENT solution sketches so the developer can pick the
-approach before any code is written.
+ONE solution sketch. This is sketch %d of %d for this issue; the developer
+will pick one of the %d total sketches to hand to the Implementer.
+%s
+REQUIREMENTS — your sketch must obey:
 
-REQUIREMENTS — every sketch must obey:
-
-1. Each sketch must differ from the others on at least one major axis:
+1. It must differ from any prior sketches on at least one major axis:
    - data model / persistence layer
    - API shape / extraction boundary
    - build-vs-buy (use a library) / write-it-ourselves
    - MVP / complete / over-built
    - monolith / extracted package
    - synchronous / event-driven
-   DO NOT produce three variations of the same idea with different knobs.
+   DO NOT produce a variation of a prior sketch with different knobs.
 
-2. Every sketch must be realistic for THIS repository. Cite the repository's
-   stated purpose and existing conventions. Do not propose a rewrite unless
-   the issue explicitly asks for one.
+2. It must be realistic for THIS repository. Cite the repository's stated
+   purpose and existing conventions. Do not propose a rewrite unless the
+   issue explicitly asks for one.
 
-3. Every sketch must honour the engineering principles provided. If a
-   sketch breaks a principle, say so explicitly and justify why that trade is
-   worth making.
+3. It must honour the engineering principles provided. If it breaks a
+   principle, say so explicitly and justify why that trade is worth making.
 
-OUTPUT FORMAT — you MUST use this exact structure for each sketch so a
-parser can split on the headings:
+OUTPUT FORMAT — you MUST use this exact structure so a parser can find it:
 
 ## Sketch 1: <short title, 3-6 words>
 
@@ -149,57 +251,35 @@ parser can split on the headings:
 Estimated files touched, approximate lines of code added or changed, whether
 it needs a migration, whether it needs new dependencies.
 
----
+End with EXACTLY one line:
 
-## Sketch 2: ...
-(same structure)
+SKETCHES: 1
 
----
-
-## Sketch 3: ...
-(same structure)
-
-End the report with EXACTLY one line:
-
-SKETCHES: %d
-
+ALWAYS use "## Sketch 1:" as the heading even though this is sketch %d of
+the full run — the orchestrator renumbers sketches after aggregating them.
 Do NOT include code blocks. Do NOT write the implementation. The Implementer
-agent will handle code — you are the person sketching on a whiteboard.`, a.N, a.N)
+agent will handle code — you are the person sketching on a whiteboard.`,
+		i, a.N, a.N, diversity, i)
+}
 
-	// Assemble the user message. We include everything the Critic saw plus
-	// the Critic's own report so the Architect can cite specific objections
-	// that each sketch addresses.
-	var principles strings.Builder
-	for _, p := range cc.Principles {
-		fmt.Fprintf(&principles, "- **%s** — %s\n", p.Name, p.Summary)
-	}
-
-	var user strings.Builder
-	fmt.Fprintf(&user, "## GitHub issue %s/%s#%d: %s\n\n",
-		cc.Issue.Owner, cc.Issue.Repo, cc.Issue.Number, cc.Issue.Title)
-	user.WriteString(cc.Issue.Body)
-	user.WriteString("\n\n## Scout brief\n\n")
-	user.WriteString(cc.ScoutReport)
-	user.WriteString("\n\n## Critic report\n\n")
-	user.WriteString(cc.CriticReport)
-	user.WriteString("\n\n## Engineering principles (short form)\n\n")
-	user.WriteString(principles.String())
-
-	resp, err := a.Provider.Complete(ctx, llm.Request{
-		System: system,
-		Messages: []llm.Message{
-			{Role: "user", Content: user.String()},
-		},
+// renumberSketch rewrites a "## Sketch 1: Title" heading to "## Sketch N:
+// Title" so the aggregated sketch list has sequential numbers even though
+// each per-call response says "Sketch 1".
+func renumberSketch(md string, n int) string {
+	return sketchHeaderRe.ReplaceAllStringFunc(md, func(match string) string {
+		sub := sketchHeaderRe.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		return fmt.Sprintf("## Sketch %d: %s", n, strings.TrimSpace(sub[2]))
 	})
-	if err != nil {
-		return nil, fmt.Errorf("architect: %w", err)
-	}
+}
 
-	sketches := ParseSketches(resp.Content)
-	if len(sketches) == 0 {
-		return nil, fmt.Errorf("architect: produced no parseable sketches. Raw output:\n%s", resp.Content)
+func firstOrNil(errs []error) error {
+	if len(errs) == 0 {
+		return nil
 	}
-	return sketches, nil
+	return errs[0]
 }
 
 // sketchHeaderRe matches a markdown H2 of the form "## Sketch N: Title".
