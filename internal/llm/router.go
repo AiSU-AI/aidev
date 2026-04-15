@@ -43,14 +43,20 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 func (r *Router) Recorder() *Recorder { return r.recorder }
 
 func buildProvider(t config.Tier, recorder *Recorder) (Provider, error) {
+	// v0.5b: per-tier HTTP timeout from config, zero means the provider
+	// falls back to its DefaultHTTPTimeout constant (20 minutes). Needed
+	// for large local models (32b on M1 Pro) where a single Implementer
+	// call can take 10-20 minutes wall-clock and the previous hardcoded
+	// 5-minute timeout was firing before the model could respond.
+	timeout := time.Duration(t.TimeoutSeconds) * time.Second
 	var base Provider
 	switch t.Provider {
 	case "ollama":
-		base = NewOllamaWithStreaming(t.Endpoint, t.Model, t.MaxTokens, t.Temperature)
+		base = NewOllama(t.Endpoint, t.Model, t.MaxTokens, t.Temperature, timeout)
 	case "anthropic":
-		base = NewClaude(t.Model, t.MaxTokens, t.Temperature)
+		base = NewClaude(t.Model, t.MaxTokens, t.Temperature, timeout)
 	case "claude-cli":
-		base = NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature)
+		base = NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature, timeout)
 	default:
 		return nil, fmt.Errorf("unknown provider %q", t.Provider)
 	}

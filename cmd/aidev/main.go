@@ -867,7 +867,16 @@ func printStartupBanner(cfg *config.Config) {
 		if modelDisplay == "" {
 			modelDisplay = "(default)"
 		}
-		fmt.Fprintf(os.Stderr, "  %-12s → %s:%s%s\n", role, tier.Provider, modelDisplay, marker)
+		// Show the effective per-call timeout next to each role
+		// so the user knows how long a hung LLM call can block
+		// the pipeline before the HTTP client gives up. This is
+		// directly the UX answer to v0.5a's "32b timed out at 5
+		// minutes with no visible warning" failure mode.
+		timeoutDisplay := "20m0s (default)"
+		if tier.TimeoutSeconds > 0 {
+			timeoutDisplay = (time.Duration(tier.TimeoutSeconds) * time.Second).String()
+		}
+		fmt.Fprintf(os.Stderr, "  %-12s → %s:%s  (timeout=%s)%s\n", role, tier.Provider, modelDisplay, timeoutDisplay, marker)
 	}
 	fmt.Fprintln(os.Stderr)
 }

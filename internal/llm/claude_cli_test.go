@@ -28,7 +28,7 @@ cat <<'JSON'
 JSON
 `)
 
-	p := NewClaudeCLI("", 1024, 0.1)
+	p := NewClaudeCLI("", 1024, 0.1, 0)
 	p.SetBin(fakeBin)
 
 	resp, err := p.Complete(context.Background(), Request{
@@ -75,7 +75,7 @@ func TestClaudeCLICompleteMalformedEnvelopeFallsBack(t *testing.T) {
 # Emit something that is definitely not a json envelope.
 echo "this is not json, just plain text"
 `)
-	p := NewClaudeCLI("", 1024, 0.1)
+	p := NewClaudeCLI("", 1024, 0.1, 0)
 	p.SetBin(fakeBin)
 	resp, err := p.Complete(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
@@ -92,7 +92,7 @@ echo "this is not json, just plain text"
 }
 
 func TestClaudeCLICompleteEmptyPromptErrors(t *testing.T) {
-	p := NewClaudeCLI("", 1024, 0.1)
+	p := NewClaudeCLI("", 1024, 0.1, 0)
 	_, err := p.Complete(context.Background(), Request{})
 	if err == nil {
 		t.Error("expected error on empty prompt")
@@ -107,7 +107,7 @@ func TestClaudeCLICompleteEmptyResponseErrors(t *testing.T) {
 # Print nothing — simulates a CLI that silently fails.
 exit 0
 `)
-	p := NewClaudeCLI("", 1024, 0.1)
+	p := NewClaudeCLI("", 1024, 0.1, 0)
 	p.SetBin(fakeBin)
 	_, err := p.Complete(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
@@ -125,7 +125,7 @@ func TestClaudeCLICompleteStderrInError(t *testing.T) {
 echo "not authenticated — run claude /login" >&2
 exit 2
 `)
-	p := NewClaudeCLI("", 1024, 0.1)
+	p := NewClaudeCLI("", 1024, 0.1, 0)
 	p.SetBin(fakeBin)
 	_, err := p.Complete(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
@@ -139,11 +139,11 @@ exit 2
 }
 
 func TestClaudeCLIName(t *testing.T) {
-	p1 := NewClaudeCLI("", 1024, 0.1)
+	p1 := NewClaudeCLI("", 1024, 0.1, 0)
 	if p1.Name() != "claude-cli" {
 		t.Errorf("name = %q, want claude-cli", p1.Name())
 	}
-	p2 := NewClaudeCLI("claude-opus-4-6", 1024, 0.1)
+	p2 := NewClaudeCLI("claude-opus-4-6", 1024, 0.1, 0)
 	if p2.Name() != "claude-cli:claude-opus-4-6" {
 		t.Errorf("name = %q, want claude-cli:claude-opus-4-6", p2.Name())
 	}

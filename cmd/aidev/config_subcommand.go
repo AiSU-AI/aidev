@@ -374,6 +374,21 @@ func runConfigDoctor() {
 		}
 	}
 
+	// Tier timeout_seconds sanity check. Zero (the default) is
+	// fine. < 60s is almost certainly a mistake — even a cloud
+	// call can take 30+ seconds on a cold start. > 3600s (1 hour)
+	// is suspiciously patient and likely means the user forgot
+	// they set it; better to surface a warning.
+	for _, name := range sortedKeys(cfg.Models.Tiers) {
+		t := cfg.Models.Tiers[name]
+		if t.TimeoutSeconds == 0 {
+			continue
+		}
+		inRange := t.TimeoutSeconds >= 60 && t.TimeoutSeconds <= 3600
+		check(inRange, "warn",
+			fmt.Sprintf("tier %q timeout_seconds=%d is in the sane range (60-3600)", name, t.TimeoutSeconds))
+	}
+
 	fmt.Fprintln(os.Stderr)
 	if failures > 0 {
 		fmt.Fprintf(os.Stderr, "%d failure(s), %d warning(s) — fix the failures before running aidev.\n", failures, warnings)

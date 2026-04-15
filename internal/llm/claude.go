@@ -25,15 +25,19 @@ type Claude struct {
 }
 
 // NewClaude constructs a Claude provider. The API key is read from the
-// ANTHROPIC_API_KEY environment variable.
-func NewClaude(model string, maxTokens int, temperature float64) *Claude {
+// ANTHROPIC_API_KEY environment variable. timeout may be 0; in that
+// case DefaultHTTPTimeout is used.
+func NewClaude(model string, maxTokens int, temperature float64, timeout time.Duration) *Claude {
+	if timeout <= 0 {
+		timeout = DefaultHTTPTimeout
+	}
 	return &Claude{
 		apiKey:      os.Getenv("ANTHROPIC_API_KEY"),
 		model:       model,
 		maxTokens:   maxTokens,
 		temperature: temperature,
 		endpoint:    "https://api.anthropic.com/v1/messages",
-		http:        &http.Client{Timeout: 5 * time.Minute},
+		http:        &http.Client{Timeout: timeout},
 	}
 }
 

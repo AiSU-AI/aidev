@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// DefaultHTTPTimeout is the wall-clock cap on a single LLM call when
+// the tier config doesn't set one explicitly. 20 minutes is generous
+// enough for local 32b-class models on M1 Pro-class hardware
+// (~5-10 tok/s × 8192 output tokens ≈ 13-27 minutes worst case) and
+// has plenty of headroom for cloud calls (rarely more than 60 seconds).
+// v0.5b bumped this from the hardcoded 5 minutes that left qwen 32b
+// users dead in the water on their first run.
+const DefaultHTTPTimeout = 20 * time.Minute
+
 // Ollama is a Provider that talks to a local (or remote) Ollama daemon over
 // HTTP. We hand-roll the client instead of pulling in ollama/ollama as a
 // dependency — the API is tiny and the import graph of the upstream module
@@ -24,19 +33,23 @@ type Ollama struct {
 
 // NewOllama constructs an Ollama provider. endpoint may be empty; if so it
 // falls back to AIDEV_OLLAMA_URL and finally http://localhost:11434.
-func NewOllama(endpoint, model string, maxTokens int, temperature float64) *Ollama {
+// timeout may be 0; in that case DefaultHTTPTimeout is used.
+func NewOllama(endpoint, model string, maxTokens int, temperature float64, timeout time.Duration) *Ollama {
 	if endpoint == "" {
 		endpoint = os.Getenv("AIDEV_OLLAMA_URL")
 	}
 	if endpoint == "" {
 		endpoint = "http://localhost:11434"
 	}
+	if timeout <= 0 {
+		timeout = DefaultHTTPTimeout
+	}
 	return &Ollama{
 		endpoint:    endpoint,
 		model:       model,
 		maxTokens:   maxTokens,
 		temperature: temperature,
-		http:        &http.Client{Timeout: 5 * time.Minute},
+		http:        &http.Client{Timeout: timeout},
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 )
 
 // ollamaStreamResp represents a single chunk from Ollama's streaming API
@@ -285,18 +284,3 @@ func (o *Ollama) convertToolMessages(messages []ToolMessage) ([]ollamaToolMessag
 	return ollamaMsgs, nil
 }
 
-// Enhanced Ollama provider with better timeout handling
-func NewOllamaWithStreaming(endpoint, model string, maxTokens int, temperature float64) *Ollama {
-	if endpoint == "" {
-		endpoint = "http://localhost:11434"
-	}
-	return &Ollama{
-		endpoint:    endpoint,
-		model:       model,
-		maxTokens:   maxTokens,
-		temperature: temperature,
-		http: &http.Client{
-			Timeout: 10 * time.Minute, // Longer timeout for streaming
-		},
-	}
-}
