@@ -51,18 +51,6 @@ func (s *Scout) Run(ctx context.Context, c *Context) (string, error) {
 	}
 	b.WriteString("\n")
 
-	// Directory tree grounding. Without this, a small-tier Scout with
-	// only top-level names will fill in plausible-but-wrong subdirectory
-	// structure from its training priors (the monorepo hallucination
-	// bug). Depth 2 is enough to expose "apps/marketing", "apps/web",
-	// "packages/shared" etc. without the noise of deep source trees.
-	if snap.DirectoryTree != "" {
-		b.WriteString("## Directory tree (depth 2)\n\n")
-		b.WriteString("```\n")
-		b.WriteString(snap.DirectoryTree)
-		b.WriteString("```\n\n")
-	}
-
 	if snap.ReadmeContent != "" {
 		b.WriteString("## README\n\n")
 		b.WriteString(truncate(snap.ReadmeContent, 4096))
@@ -89,6 +77,20 @@ func (s *Scout) Run(ctx context.Context, c *Context) (string, error) {
 		b.WriteString("\n\n")
 	}
 
+	// Directory tree goes LAST, framed as filesystem ground truth.
+	// Small-tier models show recency bias; putting the tree after the
+	// prose makes it the most-attended section. The frame is deliberately
+	// blunt ("OVERRIDES docs") because an earlier revision placed the
+	// tree before the docs and the model still pulled directory names
+	// from stale README prose instead of the actual filesystem.
+	if snap.DirectoryTree != "" {
+		b.WriteString("## FILESYSTEM GROUND TRUTH (depth-2 directory tree — overrides any architecture description in the docs above)\n\n")
+		b.WriteString("This is what the filesystem actually contains RIGHT NOW. If the README or CLAUDE.md describes a directory layout that does not match this tree, the docs are stale. Name directories as they appear here, not as they appear in prose.\n\n")
+		b.WriteString("```\n")
+		b.WriteString(snap.DirectoryTree)
+		b.WriteString("```\n\n")
+	}
+
 	system := `You are the Scout for aidev, a multi-agent coding tool.
 Your job is to produce a FACTUAL, concise brief of the repository a developer
 is asking you to work on. Do NOT propose changes. Do NOT speculate.
@@ -100,19 +102,23 @@ One paragraph: what this repository is for, as stated by its own docs.
 If the docs disagree, call that out.
 
 ## Architecture
-3-6 bullets on how the code is organised. Name the real top-level
-packages/directories — use ONLY names that appear verbatim in the
-"Directory tree" section above. Do not invent directories from
-experience with similar projects; if the tree shows "apps/marketing",
-do not also claim "apps/web" or "apps/api" unless they appear in the
-tree too.
+3-6 bullets on how the code is organised. RULE: every directory name
+you mention MUST appear verbatim in the "FILESYSTEM GROUND TRUTH"
+section of the user message. Do not invent directories from similar
+projects. Do not copy directory names from the README or CLAUDE.md —
+those docs may be stale, the filesystem is not. If the tree shows
+"apps/web-spa" and the docs say "apps/web", you MUST write
+"apps/web-spa" and note the drift in Unknowns below.
 
 ## Stated principles
 Bullets drawn verbatim from any agent markdown or architecture doc.
 
 ## Unknowns
 Bullets listing questions the Critic will need answered before evaluating
-any new feature.`
+any new feature. If any directory or module named in the README or
+CLAUDE.md does NOT appear in the filesystem ground truth (or vice
+versa), list that drift here explicitly — the docs have become
+unreliable on that point and the Critic needs to know.`
 
 	req := llm.Request{
 		System: system,
