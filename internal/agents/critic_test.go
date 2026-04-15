@@ -36,6 +36,11 @@ func TestExtractRecommendation(t *testing.T) {
 		{"unclear preserved", "body\nRECOMMENDATION: unclear", "unclear"},
 		{"missing defaults unclear", "just some body without a verdict", "unclear"},
 		{"unknown verb defaults unclear", "body\nRECOMMENDATION: maybe", "unclear"},
+		{"markdown-bolded verdict", "body\n**RECOMMENDATION: build**\n", "build"},
+		{"bolded with trailing unclear hedge", "body\n\n**RECOMMENDATION: build**\n\nmore text\n\nRECOMMENDATION: unclear\n", "build"},
+		{"plain verdict with trailing unclear hedge", "body\nRECOMMENDATION: build\n\nnotes\n\nRECOMMENDATION: unclear\n", "build"},
+		{"italic emphasis", "body\n_RECOMMENDATION: kill_\n", "kill"},
+		{"half-bold value", "body\nRECOMMENDATION: defer**\n", "defer"},
 	}
 	for _, c := range cases {
 		got := extractRecommendation(c.in)

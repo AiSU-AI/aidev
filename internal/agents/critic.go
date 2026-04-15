@@ -153,25 +153,49 @@ prior pass. Treat those answers as AUTHORITATIVE GROUND TRUTH:
 	return rpt, nil
 }
 
-// extractRecommendation returns the one-word verdict from the tail of the
-// report. Unknown or missing verdicts collapse to "unclear" so the
-// orchestrator always has something to render.
+// extractRecommendation returns the one-word verdict from the report.
+// The Critic prompt asks for a single `RECOMMENDATION: <word>` line but
+// models sometimes (a) wrap it in markdown emphasis (`**RECOMMENDATION:
+// build**`) and (b) emit a trailing `RECOMMENDATION: unclear` hedge
+// after their real verdict. We strip markdown emphasis and prefer a
+// decisive verdict over an "unclear" tail so the orchestrator isn't
+// stalled by models that violate the "do not hedge" instruction.
 func extractRecommendation(md string) string {
 	lines := strings.Split(md, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
+	var verdicts []string
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		// Strip surrounding markdown emphasis so `**RECOMMENDATION: build**`
+		// and `_RECOMMENDATION: build_` parse the same as plain text.
+		line = strings.Trim(line, "*_")
+		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(strings.ToUpper(line), "RECOMMENDATION:") {
 			continue
 		}
 		val := strings.TrimSpace(line[len("RECOMMENDATION:"):])
 		val = strings.TrimSpace(strings.TrimPrefix(val, ":"))
+		// A value like `build**` survives the line-level Trim when the
+		// closing emphasis was only on one side; strip it too.
+		val = strings.Trim(val, "*_")
+		val = strings.TrimSpace(val)
 		val = strings.ToLower(val)
 		switch val {
 		case "build", "defer", "kill", "unclear":
-			return val
+			verdicts = append(verdicts, val)
 		}
 	}
-	return "unclear"
+	if len(verdicts) == 0 {
+		return "unclear"
+	}
+	// Prefer decisive verdicts. If the Critic emitted both `build` and a
+	// trailing `unclear`, trust the decisive one — the prompt forbids
+	// hedging, so a trailing "unclear" after a concrete verdict is noise.
+	for _, v := range verdicts {
+		if v != "unclear" {
+			return v
+		}
+	}
+	return verdicts[0]
 }
 
 func oneLine(s string) string {
