@@ -59,6 +59,36 @@
 # tier. If you customize a profile to put the Implementer on
 # claude-cli you'll lose tool use; `aidev config doctor` will
 # warn you about it.
+#
+# ---
+#
+# Timeouts (v0.5b):
+#
+# Each tier has a 20-minute default wall-clock timeout on a
+# single LLM call. That's generous enough for 32b local models
+# on M1 Pro-class hardware (~5-10 tok/s × 8k output ≈ 15 min)
+# and rarely hit by cloud calls. To override per-tier, add a
+# `timeout_seconds` field to the tier:
+#
+#     tiers:
+#       large:
+#         provider: ollama
+#         model: qwen2.5:32b
+#         endpoint: http://localhost:11434
+#         max_tokens: 8192
+#         temperature: 0.3
+#         timeout_seconds: 1800     # 30 min — for slower hardware
+#
+# Good starting values:
+#   small local (7b):    300-600s
+#   medium local (14b):  600-900s
+#   large local (32b+):  1200-1800s on M1 Pro, less on M3 Max
+#   cloud (anthropic):   300s (rarely hit)
+#   claude-cli:          600s (subprocess startup overhead)
+#
+# Zero or omitted means "use the 20-minute default". The
+# doctor warns on suspiciously low (<60s) or high (>3600s)
+# values.
 
 active_profile: default
 

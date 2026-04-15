@@ -261,6 +261,60 @@ routing:
 // TestProfileNamesIsSorted is a tiny guard on the helper used for
 // error messages — sorted output keeps "available profiles: [...]"
 // stable across runs.
+// TestLoadParsesTimeoutSeconds verifies that the v0.5b
+// timeout_seconds field on a tier is deserialized into the
+// Tier struct so Router.buildProvider can plumb it through to
+// the provider constructors. Regression guard against the
+// YAML tag drifting or the field being dropped in a refactor.
+func TestLoadParsesTimeoutSeconds(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, `
+active_profile: default
+profiles:
+  default:
+    tiers:
+      small:
+        provider: ollama
+        model: qwen:7b
+        max_tokens: 2048
+        temperature: 0.2
+        timeout_seconds: 900
+      large:
+        provider: ollama
+        model: qwen:32b
+        max_tokens: 8192
+        temperature: 0.2
+        timeout_seconds: 1800
+      no_timeout:
+        provider: ollama
+        model: qwen:14b
+    routing:
+      scout: small
+      critic: large
+      architect: large
+      charter: large
+      implementer: no_timeout
+      reviewer: no_timeout
+      tester: small
+      coordinator: large
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Models.Tiers["small"].TimeoutSeconds; got != 900 {
+		t.Errorf("small.timeout_seconds = %d, want 900", got)
+	}
+	if got := cfg.Models.Tiers["large"].TimeoutSeconds; got != 1800 {
+		t.Errorf("large.timeout_seconds = %d, want 1800", got)
+	}
+	// Zero when omitted — this means "use the provider's
+	// default", not an error.
+	if got := cfg.Models.Tiers["no_timeout"].TimeoutSeconds; got != 0 {
+		t.Errorf("no_timeout.timeout_seconds = %d, want 0 (unset)", got)
+	}
+}
+
 func TestProfileNamesIsSorted(t *testing.T) {
 	in := map[string]Profile{
 		"zzz":     {},

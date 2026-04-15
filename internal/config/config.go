@@ -33,6 +33,22 @@ type Tier struct {
 	Endpoint    string  `yaml:"endpoint,omitempty"`
 	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
+
+	// TimeoutSeconds is the wall-clock cap on a single LLM call
+	// through this tier. 0 means "use the provider's default"
+	// (20 minutes as of v0.5b — bumped from the hardcoded 5-minute
+	// default after qwen2.5-coder:32b on M1 Pro repeatedly timed
+	// out at 8-token-per-second generation rates).
+	//
+	// Set this per-tier to match the tier's actual speed:
+	//   small local (7b):    300-600s is plenty
+	//   medium local (14b):  600-900s is the sweet spot
+	//   large local (32b+):  1200-1800s for M1 Pro-class hardware
+	//   cloud (anthropic):   300s is fine, rarely hit
+	//   claude-cli:          600s to cover subprocess startup
+	//
+	// Zero-value means "the shipping default (20 min)".
+	TimeoutSeconds int `yaml:"timeout_seconds,omitempty"`
 }
 
 // Profile is one named bundle of tiers + routing. A models.yaml

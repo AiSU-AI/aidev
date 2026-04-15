@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/aisu-ai/aidev/internal/config"
 )
@@ -34,13 +35,14 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 }
 
 func buildProvider(t config.Tier) (Provider, error) {
+	timeout := time.Duration(t.TimeoutSeconds) * time.Second
 	switch t.Provider {
 	case "ollama":
-		return NewOllama(t.Endpoint, t.Model, t.MaxTokens, t.Temperature), nil
+		return NewOllama(t.Endpoint, t.Model, t.MaxTokens, t.Temperature, timeout), nil
 	case "anthropic":
-		return NewClaude(t.Model, t.MaxTokens, t.Temperature), nil
+		return NewClaude(t.Model, t.MaxTokens, t.Temperature, timeout), nil
 	case "claude-cli":
-		return NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature), nil
+		return NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature, timeout), nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", t.Provider)
 	}

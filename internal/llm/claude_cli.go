@@ -66,13 +66,20 @@ type ClaudeCLI struct {
 // exec.LookPath because doctor does that in its own check; we want
 // provider construction to be cheap and lazy. A missing binary will
 // surface at the first Complete() call with a clear error message.
-func NewClaudeCLI(model string, maxTokens int, temperature float64) *ClaudeCLI {
+//
+// timeout may be 0; in that case DefaultHTTPTimeout is used. The
+// CLI subprocess timeout doubly bounds a hung 'claude --print' call,
+// complementing the context.WithTimeout that runs around exec.
+func NewClaudeCLI(model string, maxTokens int, temperature float64, timeout time.Duration) *ClaudeCLI {
+	if timeout <= 0 {
+		timeout = DefaultHTTPTimeout
+	}
 	return &ClaudeCLI{
 		bin:         "claude",
 		model:       model,
 		maxTokens:   maxTokens,
 		temperature: temperature,
-		timeout:     5 * time.Minute,
+		timeout:     timeout,
 	}
 }
 
