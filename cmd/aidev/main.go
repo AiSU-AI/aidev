@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -891,6 +892,12 @@ func printStartupBanner(cfg *config.Config) {
 // normal pipeline (and any interview rounds) have run, and the
 // override is logged loudly so the user always sees it fired.
 func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int, forceVerdict string) {
+	// Emit a per-gate telemetry table at the end of every run (early
+	// return included) so cost/latency is always visible. fatal() exits
+	// before the defer fires, so failed runs skip the table — that's
+	// acceptable because the error takes precedence over the summary.
+	defer renderTelemetry(orch)
+
 	for ev := range orch.Run(ctx) {
 		if ev.Err != nil {
 			fatal(ev.Err.Error())
@@ -983,6 +990,47 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 			fmt.Printf("\n_Patch also written to %s_\n", p.Path)
 		}
 	}
+}
+
+// renderTelemetry prints the per-gate token / latency summary table at
+// the end of a headless run. It is deferred from runHeadless so it
+// always fires, including on early returns (Critic verdict != build,
+// unused sketch opt-in, etc.). Empty recorders render nothing so unit
+// tests and offline dry-runs stay quiet.
+func renderTelemetry(orch *orchestrator.Orchestrator) {
+	if orch == nil {
+		return
+	}
+	router := orch.Router()
+	if router == nil {
+		return
+	}
+	recorder := router.Recorder()
+	summary := recorder.Summarize()
+	if len(summary) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("## Telemetry")
+	fmt.Println()
+	fmt.Println("| gate | provider | calls | input | output | elapsed | errors |")
+	fmt.Println("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+	var totInput, totOutput, totCalls, totErrors int
+	var totElapsed time.Duration
+	for _, s := range summary {
+		fmt.Printf("| %s | %s | %d | %d | %d | %s | %d |\n",
+			s.Gate, s.Provider, s.Calls, s.InputTokens, s.OutputTokens,
+			s.Elapsed.Round(time.Millisecond), s.Errors)
+		totCalls += s.Calls
+		totInput += s.InputTokens
+		totOutput += s.OutputTokens
+		totElapsed += s.Elapsed
+		totErrors += s.Errors
+	}
+	fmt.Printf("| **TOTAL** | | **%d** | **%d** | **%d** | **%s** | **%d** |\n",
+		totCalls, totInput, totOutput, totElapsed.Round(time.Millisecond), totErrors)
+	fmt.Println()
+	fmt.Println("_Telemetry captures one row per pipeline gate. Retries are absorbed into `elapsed`; a gate with 2 retries shows 1 call and the full wall-clock including backoff._")
 }
 
 // runInterviewLoop drives up to maxInterviewRounds Clarifier

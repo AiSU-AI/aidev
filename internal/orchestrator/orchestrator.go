@@ -236,7 +236,7 @@ func (o *Orchestrator) ReviewPatch(ctx context.Context, patch string) <-chan Eve
 		o.state = StateReviewing
 		o.emit(ctx, out, Event{State: o.state, Message: "Reviewer performing Boy Scout pass..."})
 
-		rev, err := o.reviewer.Run(ctx, o.ctx, patch)
+		rev, err := o.reviewer.Run(llm.WithGate(ctx, "reviewer"), o.ctx, patch)
 		if err != nil {
 			o.state = StateError
 			o.emit(ctx, out, Event{State: StateError, Err: err})
@@ -252,7 +252,7 @@ func (o *Orchestrator) ReviewPatch(ctx context.Context, patch string) <-chan Eve
 		}
 
 		// Coordinator Gate 5: post-Reviewer monitor.
-		o.runAdvisoryGate(ctx, out, "post-reviewer", func() ([]agents.GateNote, error) {
+		o.runAdvisoryGate(ctx, out, "post-reviewer", func(ctx context.Context) ([]agents.GateNote, error) {
 			return o.coordinator.ObserveReviewerVerdict(ctx, o.ctx, rev)
 		})
 
@@ -391,7 +391,7 @@ func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan E
 		var review *agents.CoordinatorReview
 
 		for round := 0; round <= maxCoordinatorRounds; round++ {
-			p, err := o.implementer.Run(ctx, o.ctx, &chosen)
+			p, err := o.implementer.Run(llm.WithGate(ctx, "implementer"), o.ctx, &chosen)
 			if err != nil {
 				o.state = StateError
 				o.emit(ctx, out, Event{State: StateError, Err: err})
@@ -403,7 +403,7 @@ func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan E
 			// non-fatal — we log it and proceed as if approved.
 			// The Coordinator is a safety net, not a gate; a broken
 			// cloud connection shouldn't block the user's patch.
-			r, cerr := o.coordinator.Review(ctx, o.ctx, &chosen, patch)
+			r, cerr := o.coordinator.Review(llm.WithGate(ctx, "coordinator-review"), o.ctx, &chosen, patch)
 			if cerr != nil {
 				fmt.Fprintf(o.reporterLog, "aidev coordinator: review failed, proceeding without: %v\n", cerr)
 				review = nil
@@ -572,21 +572,21 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 		// Scout.
 		o.state = StateScouting
 		o.emit(ctx, out, Event{State: o.state, Message: "Scouting repository..."})
-		if _, err := o.scout.Run(ctx, o.ctx); err != nil {
+		if _, err := o.scout.Run(llm.WithGate(ctx, "scout"), o.ctx); err != nil {
 			o.state = StateError
 			o.emit(ctx, out, Event{State: o.state, Err: err})
 			return
 		}
 
 		// Coordinator Gate 0: post-Scout monitor.
-		o.runAdvisoryGate(ctx, out, "post-scout", func() ([]agents.GateNote, error) {
+		o.runAdvisoryGate(ctx, out, "post-scout", func(ctx context.Context) ([]agents.GateNote, error) {
 			return o.coordinator.ObserveScoutBrief(ctx, o.ctx)
 		})
 
 		// Critic.
 		o.state = StateCritiquing
 		o.emit(ctx, out, Event{State: o.state, Message: "Critic evaluating proposal..."})
-		rpt, err := o.critic.Run(ctx, o.ctx)
+		rpt, err := o.critic.Run(llm.WithGate(ctx, "critic"), o.ctx)
 		if err != nil {
 			o.state = StateError
 			o.emit(ctx, out, Event{State: o.state, Err: err})
@@ -595,7 +595,7 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 		o.critRpt = rpt
 
 		// Coordinator Gate 1: post-Critic monitor.
-		o.runAdvisoryGate(ctx, out, "post-critic", func() ([]agents.GateNote, error) {
+		o.runAdvisoryGate(ctx, out, "post-critic", func(ctx context.Context) ([]agents.GateNote, error) {
 			return o.coordinator.ObserveCriticReport(ctx, o.ctx)
 		})
 
@@ -616,11 +616,14 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 // logged and swallowed. The pipeline must always be able to
 // proceed past an advisory gate even if the Coordinator's
 // provider is down — this is the safety-net contract from #33.
-func (o *Orchestrator) runAdvisoryGate(ctx context.Context, out chan<- Event, gateName string, run func() ([]agents.GateNote, error)) {
+func (o *Orchestrator) runAdvisoryGate(ctx context.Context, out chan<- Event, gateName string, run func(context.Context) ([]agents.GateNote, error)) {
 	if o.coordinator == nil {
 		return
 	}
-	notes, err := run()
+	// Tag the gate name on the context so the telemetry middleware can
+	// attribute Coordinator calls to the right advisory gate.
+	gateCtx := llm.WithGate(ctx, "coordinator-"+gateName)
+	notes, err := run(gateCtx)
 	if err != nil {
 		fmt.Fprintf(o.reporterLog, "aidev coordinator %s: %v\n", gateName, err)
 		return
@@ -675,7 +678,7 @@ func (o *Orchestrator) Recritique(ctx context.Context) <-chan Event {
 
 		o.state = StateCritiquing
 		o.emit(ctx, out, Event{State: o.state, Message: "Critic re-evaluating with clarifier answers..."})
-		rpt, err := o.critic.Run(ctx, o.ctx)
+		rpt, err := o.critic.Run(llm.WithGate(ctx, "critic-recritique"), o.ctx)
 		if err != nil {
 			o.state = StateError
 			o.emit(ctx, out, Event{State: o.state, Err: err})
@@ -736,7 +739,7 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 				preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds),
 		})
 
-		sketches, err := o.architect.Run(ctx, o.ctx)
+		sketches, err := o.architect.Run(llm.WithGate(ctx, "architect"), o.ctx)
 		if err != nil {
 			o.state = StateError
 			o.emit(ctx, out, Event{State: o.state, Err: err})
@@ -745,7 +748,7 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 		o.ctx.Sketches = sketches
 
 		// Coordinator Gate 2: post-Architect monitor.
-		o.runAdvisoryGate(ctx, out, "post-architect", func() ([]agents.GateNote, error) {
+		o.runAdvisoryGate(ctx, out, "post-architect", func(ctx context.Context) ([]agents.GateNote, error) {
 			return o.coordinator.ObserveArchitectSketches(ctx, o.ctx)
 		})
 

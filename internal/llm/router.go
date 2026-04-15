@@ -12,20 +12,24 @@ import (
 // across goroutines because Provider implementations are stateless above the
 // HTTP client.
 type Router struct {
-	tiers   map[string]Provider
-	routing map[string]string // role name -> tier name
+	tiers    map[string]Provider
+	routing  map[string]string // role name -> tier name
+	recorder *Recorder
 }
 
 // NewRouter builds a Router from a loaded config. It instantiates one
 // Provider per tier; unknown provider types in models.yaml become a hard
-// error at startup rather than at first use.
+// error at startup rather than at first use. Every tier provider is wrapped
+// with the router's shared telemetry recorder so per-gate token counts and
+// latency are captured automatically for the headless report.
 func NewRouter(cfg *config.Config) (*Router, error) {
 	r := &Router{
-		tiers:   make(map[string]Provider, len(cfg.Models.Tiers)),
-		routing: cfg.Models.Routing,
+		tiers:    make(map[string]Provider, len(cfg.Models.Tiers)),
+		routing:  cfg.Models.Routing,
+		recorder: NewRecorder(),
 	}
 	for name, t := range cfg.Models.Tiers {
-		p, err := buildProvider(t)
+		p, err := buildProvider(t, r.recorder)
 		if err != nil {
 			return nil, fmt.Errorf("tier %q: %w", name, err)
 		}
@@ -34,7 +38,11 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 	return r, nil
 }
 
-func buildProvider(t config.Tier) (Provider, error) {
+// Recorder returns the router's telemetry recorder. Callers use this to
+// render a per-gate summary after a run completes.
+func (r *Router) Recorder() *Recorder { return r.recorder }
+
+func buildProvider(t config.Tier, recorder *Recorder) (Provider, error) {
 	var base Provider
 	switch t.Provider {
 	case "ollama":
@@ -62,6 +70,13 @@ func buildProvider(t config.Tier) (Provider, error) {
 	// Add circuit breaker for cloud providers to prevent cascading failures
 	if t.Provider == "anthropic" || t.Provider == "claude-cli" {
 		middlewares = append(middlewares, WithCircuitBreaker(3, 60*time.Second))
+	}
+
+	// Telemetry goes OUTSIDE retry and circuit breaker so each recorded
+	// "call" represents one logical request from the caller's perspective.
+	// Retries are absorbed into the elapsed time on that single record.
+	if recorder != nil {
+		middlewares = append(middlewares, WithTelemetry(recorder))
 	}
 
 	return ProviderWithMiddleware(base, middlewares...), nil
