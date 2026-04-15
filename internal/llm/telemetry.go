@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -127,6 +128,37 @@ func (t *telemetryWrapper) Name() string { return t.inner.Name() }
 func (t *telemetryWrapper) Complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
 	resp, err := t.inner.Complete(ctx, req)
+	t.recorder.Record(CallRecord{
+		Gate:         gateFrom(ctx),
+		Provider:     t.inner.Name(),
+		InputTokens:  resp.Usage.InputTokens,
+		OutputTokens: resp.Usage.OutputTokens,
+		Elapsed:      time.Since(start),
+		Err:          err,
+	})
+	return resp, err
+}
+
+// CompleteWithTools forwards a tool-aware request to the wrapped
+// provider when it implements ToolAwareProvider and records a
+// CallRecord with the same gate attribution and token/elapsed fields
+// the Complete path uses. Returns ErrToolsNotSupported when the inner
+// provider does not support native tool use — and does NOT record a
+// CallRecord in that case, because no real work happened.
+func (t *telemetryWrapper) CompleteWithTools(ctx context.Context, req ToolAwareRequest) (ToolAwareResponse, error) {
+	inner, ok := t.inner.(ToolAwareProvider)
+	if !ok {
+		return ToolAwareResponse{}, ErrToolsNotSupported
+	}
+	start := time.Now()
+	resp, err := inner.CompleteWithTools(ctx, req)
+	// A capability error means no real LLM call happened — do not
+	// emit a CallRecord for it. The inner middleware layers short-
+	// circuit before touching the transport, so there's nothing to
+	// attribute.
+	if errors.Is(err, ErrToolsNotSupported) {
+		return resp, err
+	}
 	t.recorder.Record(CallRecord{
 		Gate:         gateFrom(ctx),
 		Provider:     t.inner.Name(),

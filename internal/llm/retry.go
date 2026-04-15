@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -142,6 +143,48 @@ func (r *RetryWrapper) Complete(ctx context.Context, req Request) (Response, err
 	}
 
 	return Response{}, fmt.Errorf("after %d attempts, last error: %w", r.config.MaxAttempts, lastErr)
+}
+
+// CompleteWithTools forwards a tool-aware request to the wrapped
+// provider if it implements ToolAwareProvider, applying the same retry
+// loop that Complete uses. If the inner provider does not support
+// native tool use, it returns ErrToolsNotSupported so callers can fall
+// back to the legacy Complete path.
+func (r *RetryWrapper) CompleteWithTools(ctx context.Context, req ToolAwareRequest) (ToolAwareResponse, error) {
+	inner, ok := r.provider.(ToolAwareProvider)
+	if !ok {
+		return ToolAwareResponse{}, ErrToolsNotSupported
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= r.config.MaxAttempts; attempt++ {
+		resp, err := inner.CompleteWithTools(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		// ErrToolsNotSupported is a capability signal, not a
+		// transport failure. Surface it unwrapped so the Implementer's
+		// errors.Is check at the top of Run() can route around it.
+		if errors.Is(err, ErrToolsNotSupported) {
+			return ToolAwareResponse{}, err
+		}
+		if !isRetryable(err) {
+			break
+		}
+		if attempt == r.config.MaxAttempts {
+			break
+		}
+		delay := r.calculateDelay(attempt)
+		fmt.Printf("Attempt %d/%d failed for %s (tools): %v. Retrying in %v...\n",
+			attempt, r.config.MaxAttempts, r.provider.Name(), err, delay)
+		select {
+		case <-ctx.Done():
+			return ToolAwareResponse{}, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return ToolAwareResponse{}, fmt.Errorf("after %d attempts, last error: %w", r.config.MaxAttempts, lastErr)
 }
 
 // calculateDelay computes the delay for a given attempt based on backoff strategy
@@ -316,6 +359,38 @@ func (cb *CircuitBreaker) Complete(ctx context.Context, req Request) (Response, 
 		return resp, err
 	}
 
+	cb.onSuccess()
+	return resp, nil
+}
+
+// CompleteWithTools forwards a tool-aware request to the inner provider
+// if it implements ToolAwareProvider, applying the same circuit-breaker
+// state transitions as Complete. Returns ErrToolsNotSupported when the
+// inner provider lacks native tool use.
+func (cb *CircuitBreaker) CompleteWithTools(ctx context.Context, req ToolAwareRequest) (ToolAwareResponse, error) {
+	inner, ok := cb.provider.(ToolAwareProvider)
+	if !ok {
+		return ToolAwareResponse{}, ErrToolsNotSupported
+	}
+
+	if cb.state == StateOpen {
+		if time.Since(cb.lastFailTime) > cb.resetTimeout {
+			cb.state = StateHalfOpen
+		} else {
+			return ToolAwareResponse{}, fmt.Errorf("circuit breaker is open for %s", cb.provider.Name())
+		}
+	}
+
+	resp, err := inner.CompleteWithTools(ctx, req)
+	if err != nil {
+		// ErrToolsNotSupported is a capability signal, not a
+		// transport failure — do not count it against the breaker.
+		if errors.Is(err, ErrToolsNotSupported) {
+			return resp, err
+		}
+		cb.onFailure()
+		return resp, err
+	}
 	cb.onSuccess()
 	return resp, nil
 }

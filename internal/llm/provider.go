@@ -16,7 +16,26 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
+
+// ErrToolsNotSupported is returned by a middleware's CompleteWithTools
+// method when the wrapped inner provider does not implement
+// ToolAwareProvider. Callers that chain middleware around a mixed set of
+// backends (cloud Claude which supports tools; Ollama which supports
+// tools; claude-cli which currently does not) detect this sentinel with
+// errors.Is and fall back to the legacy Complete() path.
+//
+// This exists because wrapping a ToolAwareProvider in a plain Provider
+// middleware would otherwise erase the tool-use capability at the
+// interface boundary: a struct that only declares Name()+Complete() does
+// not satisfy ToolAwareProvider even if its inner field does. Every
+// middleware in this package therefore declares CompleteWithTools and
+// forwards to the inner provider when tool use is available, returning
+// ErrToolsNotSupported otherwise. The type assertion at the Implementer
+// now always succeeds at compile time; the runtime behaviour still
+// degrades gracefully for non-tool-aware backends.
+var ErrToolsNotSupported = errors.New("llm: provider does not support native tool use")
 
 // Role is a typed string used by agents when requesting a provider from the
 // Router. Using constants keeps typo-bugs out of the hot path.

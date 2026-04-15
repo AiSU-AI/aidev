@@ -137,10 +137,26 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	// v0.4: if the provider supports native tool use, use the real
 	// agentic loop. The legacy picker + NEED_FILES path below is
 	// kept as the fallback for providers without tool support
-	// (Ollama, claude-cli) so swapping to a fully-local preset
+	// (currently only claude-cli) so swapping to a fully-local preset
 	// still works end-to-end — slower, less reliable, but functional.
+	//
+	// Note: every Router-built Provider is wrapped in retry +
+	// (sometimes) circuit-breaker + telemetry middleware. Each of
+	// those middlewares now declares CompleteWithTools itself, so
+	// this type assertion always succeeds against a routed provider.
+	// Capability detection happens at the first CompleteWithTools
+	// call: if the inner base provider isn't tool-aware, the
+	// middleware chain returns llm.ErrToolsNotSupported and we fall
+	// through to the legacy picker path below.
 	if toolAware, ok := i.Provider.(llm.ToolAwareProvider); ok {
-		return i.runWithTools(ctx, toolAware, c, chosen)
+		patch, err := i.runWithTools(ctx, toolAware, c, chosen)
+		if err == nil {
+			return patch, nil
+		}
+		if !errors.Is(err, llm.ErrToolsNotSupported) {
+			return nil, err
+		}
+		// Inner provider doesn't support tool use — fall through.
 	}
 
 	// Pre-load files that upstream agents (Scout, Critic, Clarifier,
