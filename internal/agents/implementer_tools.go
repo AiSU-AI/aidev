@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -166,7 +167,14 @@ func (i *Implementer) runWithTools(ctx context.Context, provider llm.ToolAwarePr
 			// follow-up user message with tool_result blocks.
 			resultBlocks := make([]llm.ToolContentBlock, 0, len(resp.ToolUses))
 			for _, use := range resp.ToolUses {
-				resultBlocks = append(resultBlocks, exec.Execute(use))
+				result := exec.Execute(use)
+				// Breadcrumb each tool call to stderr so the run log shows
+				// exactly what the model searched for. Crucial for
+				// debugging "model gave up after empty result" failures —
+				// without this trace we can't tell if the model used bad
+				// patterns or the right patterns against the wrong tree.
+				logToolCall(iter, use, result)
+				resultBlocks = append(resultBlocks, result)
 			}
 			messages = append(messages, llm.ToolMessage{
 				Role:    "user",
@@ -257,14 +265,35 @@ WORKFLOW:
 
 1. Use the tools to discover the code. Typical pattern for a
    refactor or consolidation task:
-     - glob for candidate files ("apps/marketing/**/*.tsx")
-     - grep for all call sites of the thing you're changing
+     - list_dir the directory the issue body references FIRST, to
+       confirm the real path and see what's actually there. If the
+       issue says "files live under apps/marketing/src/lib/foo/",
+       list_dir apps/marketing/src/lib/foo/ before you glob or grep
+       — a directory that is not what you expect is a signal that
+       the issue's path example may be partial or relative.
+     - glob for candidate files ("apps/marketing/**/*.tsx").
+     - grep for all call sites of the thing you're changing.
      - read_file each file you plan to modify to see exact line
-       numbers and surrounding context
+       numbers and surrounding context.
      - read_file the locale / config files whose values you need
-       to preserve verbatim
+       to preserve verbatim.
    You can call multiple tools per turn — batch them when you
    already know what you need.
+
+1a. EMPTY RESULTS ARE NOT A REASON TO GIVE UP. If a glob returns
+    zero files or a grep returns zero matches, that means your
+    PATTERN was wrong, not that the task is impossible. Before
+    declaring ERROR on an empty result you MUST:
+      - list_dir the parent directory to see what's actually there.
+      - Try at least one broader pattern (strip a path segment,
+        drop a suffix, or grep for a shorter substring).
+      - If the issue body or the chosen sketch quotes literal file
+        paths or key names, read_file those paths DIRECTLY — do not
+        assume glob will find them from a guessed pattern.
+    Declaring ERROR after exactly one empty tool result is a
+    failure mode we are explicitly guarding against. The issue body
+    and sketch usually contain the exact paths and identifiers you
+    need — use them verbatim before trying to infer.
 
 2. When you have enough context, emit a unified git diff as your
    final assistant message (without any more tool calls). The loop
@@ -470,4 +499,49 @@ func truncateForError(s string, n int) string {
 		return s
 	}
 	return s[:n] + "\n...[truncated at " + fmt.Sprint(n) + " bytes]"
+}
+
+// logToolCall writes a single-line breadcrumb to stderr for one
+// tool invocation. Format: "aidev: implementer: tool iter=N
+// name=<tool> input=<json-one-line> result=<short summary>".
+// The result summary distinguishes between empty results (the
+// common "gave up after one search" failure mode), error results
+// from the executor, and non-empty results — truncated so the
+// breadcrumb stays readable in a terminal scrollback buffer.
+func logToolCall(iter int, use llm.ToolUse, result llm.ToolContentBlock) {
+	// Collapse the json input onto one line so the breadcrumb is
+	// grep-friendly. json.RawMessage is already compact in most
+	// cases; strip newlines defensively.
+	input := strings.ReplaceAll(string(use.Input), "\n", " ")
+	input = strings.ReplaceAll(input, "\t", " ")
+	if len(input) > 240 {
+		input = input[:240] + "..."
+	}
+
+	resultSummary := summariseToolResult(result)
+	fmt.Fprintf(os.Stderr, "aidev: implementer: tool iter=%d name=%s input=%s result=%s\n",
+		iter, use.Name, input, resultSummary)
+}
+
+// summariseToolResult produces a short, single-line description of
+// a tool's output for the breadcrumb log. It deliberately flags
+// empty/error results loudly because those are the signals that
+// tell us why the model gave up — a non-verbose "ok: 12 bytes" is
+// uninteresting, but "empty (no matches)" on a grep is diagnostic.
+func summariseToolResult(r llm.ToolContentBlock) string {
+	body := strings.TrimSpace(r.ToolResultContent)
+	switch {
+	case r.ToolResultIsError:
+		first := body
+		if len(first) > 120 {
+			first = first[:120] + "..."
+		}
+		return "ERROR: " + first
+	case body == "":
+		return "empty"
+	case len(body) < 120:
+		return "ok: " + strings.ReplaceAll(body, "\n", " ⏎ ")
+	default:
+		return fmt.Sprintf("ok: %d bytes, %d lines", len(body), strings.Count(body, "\n")+1)
+	}
 }
