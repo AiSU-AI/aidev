@@ -1,0 +1,112 @@
+#compdef aidev
+# aidev zsh completion script
+
+_aidev() {
+    local -a commands
+    commands=(
+        'doctor:Run environment health checks'
+        'charter:Generate repository charter'
+        'test:Run test suite'
+        'review:Review generated patches'
+        'plugin:Manage Claude Code plugins'
+        'install:Install default configuration'
+        'followups:Manage follow-up issues'
+        'clarify:Clarify ambiguous requirements'
+        'config:Manage configuration'
+        'ollama:Manage Ollama models'
+    )
+
+    local -a main_options
+    main_options=(
+        '--version[Show version information]'
+        '--help[Show help information]'
+        '-issue[GitHub issue URL]:issue:_urls'
+        '-repo[Repository path]:directory:_directories'
+        '-config[Config directory]:directory:_directories'
+        '-headless[Run without TUI]'
+        '-auto[Auto-run architect when critic recommends build]'
+        '-n[Number of architect sketches]:number:(1 2 3 4 5 6 7 8 9)'
+        '-sketch[Auto-select sketch number]:number:(1 2 3 4 5 6 7 8 9)'
+        '-force-verdict[Force critic verdict]:verdict:(build defer kill)'
+    )
+
+    local context state line
+    typeset -A opt_args
+
+    _arguments -C \
+        $main_options \
+        '1: :->command' \
+        '*: :->args' && ret=0
+
+    case $state in
+        command)
+            _describe 'command' commands
+            ;;
+        args)
+            case $line[1] in
+                doctor|charter|test|review|install|clarify)
+                    _arguments \
+                        '-repo[Repository path]:directory:_directories' \
+                        '-config[Config directory]:directory:_directories' \
+                        '--help[Show help]'
+                    ;;
+                plugin)
+                    _arguments \
+                        '1:plugin_action:(install uninstall)' \
+                        '--force[Force overwrite existing files]' \
+                        '--dir[Target directory]:directory:_directories' \
+                        '--help[Show help]'
+                    ;;
+                followups)
+                    _arguments \
+                        '-repo[Repository path]:directory:_directories' \
+                        '-target[Target GitHub repo]:target:_github_repos' \
+                        '--file-issues[Actually file issues]' \
+                        '--help[Show help]'
+                    ;;
+                config)
+                    local -a config_commands
+                    config_commands=(
+                        'show:Show active profile'
+                        'profile:Manage profiles'
+                        'set:Set role configuration'
+                        'edit:Edit configuration file'
+                        'doctor:Validate configuration'
+                    )
+                    _describe 'config command' config_commands
+                    ;;
+                ollama)
+                    local -a ollama_commands
+                    ollama_commands=(
+                        'list:List available models'
+                        'recommend:Recommend models'
+                        'validate:Validate model'
+                        'health:Check daemon health'
+                        'profile:Show usage profile'
+                    )
+                    _describe 'ollama command' ollama_commands
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# GitHub URL completion function
+_urls() {
+    local -a urls
+    urls=(
+        'https://github.com'
+    )
+    _describe 'GitHub URL' urls
+}
+
+# GitHub repository completion function  
+_github_repos() {
+    local -a repos
+    repos=(
+        'owner/repo:Repository in owner/repo format'
+    )
+    _describe 'GitHub repository' repos
+}
+
+_aidev "$@"

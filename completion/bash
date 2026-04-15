@@ -1,0 +1,170 @@
+# aidev bash completion script
+# Install by placing this file in /etc/bash_completion.d/aidev or ~/.bash_completion.d/aidev
+# Or add to your ~/.bashrc: source /path/to/aidev/completion/bash
+
+_aidev_completion() {
+    local cur prev words cword
+    _init_completion || return
+
+    case "${prev}" in
+        aidev)
+            # Main command options
+            COMPREPLY=($(compgen -W "
+                --version
+                --help
+                -issue
+                -repo
+                -config
+                -headless
+                -auto
+                -n
+                -sketch
+                -force-verdict
+                doctor
+                charter
+                test
+                review
+                plugin
+                install
+                followups
+                clarify
+                config
+                ollama
+            " -- "${cur}"))
+            ;;
+        -issue)
+            # Complete GitHub issue URLs
+            if [[ "${cur}" == https://* ]]; then
+                # For GitHub URLs, suggest common patterns
+                COMPREPLY=($(compgen -W "github.com" -- "${cur}"))
+            else
+                COMPREPLY=($(compgen -W "https://github.com" -- "${cur}"))
+            fi
+            ;;
+        -repo)
+            # Complete directory paths
+            COMPREPLY=($(compgen -d -- "${cur}"))
+            ;;
+        -config)
+            # Complete directory paths for config
+            COMPREPLY=($(compgen -d -- "${cur}"))
+            ;;
+        -n|-sketch)
+            # Complete numbers for sketch count
+            COMPREPLY=($(compgen -W "1 2 3 4 5 6 7 8 9" -- "${cur}"))
+            ;;
+        -force-verdict)
+            # Complete verdict options
+            COMPREPLY=($(compgen -W "build defer kill" -- "${cur}"))
+            ;;
+        doctor|charter|test|review|install|clarify)
+            # Subcommands that take -repo and -config
+            COMPREPLY=($(compgen -W "-repo -config --help" -- "${cur}"))
+            ;;
+        plugin)
+            # Plugin subcommands
+            COMPREPLY=($(compgen -W "install uninstall --help" -- "${cur}"))
+            ;;
+        followups)
+            # Followups subcommands
+            COMPREPLY=($(compgen -W "-repo -target --file-issues --help" -- "${cur}"))
+            ;;
+        config)
+            # Config subcommands
+            COMPREPLY=($(compgen -W "
+                show
+                profile
+                set
+                edit
+                doctor
+                --help
+            " -- "${cur}"))
+            ;;
+        ollama)
+            # Ollama subcommands
+            COMPREPLY=($(compgen -W "
+                list
+                recommend
+                validate
+                health
+                profile
+                --help
+            " -- "${cur}"))
+            ;;
+        profile)
+            # Config profile subcommands
+            case "${words[*]}" in
+                *"config profile"*)
+                    COMPREPLY=($(compgen -W "list use --help" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        set)
+            # Config set subcommand
+            if [[ "${words[*]}" == *"config set"* ]]; then
+                # Complete role names
+                COMPREPLY=($(compgen -W "
+                    scout
+                    critic
+                    architect
+                    charter
+                    implementer
+                    reviewer
+                    tester
+                    coordinator
+                " -- "${cur}"))
+            fi
+            ;;
+        recommend)
+            # Ollama recommend subcommand
+            if [[ "${words[*]}" == *"ollama recommend"* ]]; then
+                # Complete tier names
+                COMPREPLY=($(compgen -W "small medium large" -- "${cur}"))
+            fi
+            ;;
+        validate)
+            # Ollama validate subcommand
+            if [[ "${words[*]}" == *"ollama validate"* ]]; then
+                # Complete with --require-tools flag
+                COMPREPLY=($(compgen -W "--require-tools --help" -- "${cur}"))
+            fi
+            ;;
+        *)
+            # Default completion for any other context
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=($(compgen -W "
+                    --version
+                    --help
+                    -issue
+                    -repo
+                    -config
+                    -headless
+                    -auto
+                    -n
+                    -sketch
+                    -force-verdict
+                " -- "${cur}"))
+            else
+                # Complete main commands
+                COMPREPLY=($(compgen -W "
+                    doctor
+                    charter
+                    test
+                    review
+                    plugin
+                    install
+                    followups
+                    clarify
+                    config
+                    ollama
+                " -- "${cur}"))
+            fi
+            ;;
+    esac
+
+    # Add file completion for certain contexts
+    if [[ "${prev}" == @(-config|--config) ]]; then
+        _filedir
+    fi
+} &&
+complete -F _aidev_completion aidev

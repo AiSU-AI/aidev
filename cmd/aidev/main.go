@@ -28,6 +28,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/aisu-ai/aidev/internal/agents"
+	"github.com/aisu-ai/aidev/internal/completion"
 	"github.com/aisu-ai/aidev/internal/config"
 	"github.com/aisu-ai/aidev/internal/doctor"
 	"github.com/aisu-ai/aidev/internal/github"
@@ -125,6 +126,25 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "ollama" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runOllamaSubcommand()
+		return
+	}
+	// Intercept the `completion` subcommand. Installs shell completion
+	// for bash and zsh to enable tab autocompletion.
+	if len(os.Args) > 1 && os.Args[1] == "completion" {
+		// Check for script output mode - don't modify args
+		if len(os.Args) > 3 && os.Args[3] == "--script" {
+			// Don't modify os.Args, just call the subcommand directly
+			runCompletionSubcommandWithArgs(os.Args[2:])
+			return
+		}
+		// Check for help flags before modifying args
+		if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") {
+			// Don't modify os.Args, just call the subcommand directly
+			runCompletionSubcommandWithArgs(os.Args[2:])
+			return
+		}
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runCompletionSubcommand()
 		return
 	}
 
@@ -1117,7 +1137,131 @@ func formatClarifierNotes(g *agents.QuestionGraph, answers []agents.Answer) stri
 	return b.String()
 }
 
+func runCompletionSubcommandWithArgs(args []string) {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+		fmt.Println("aidev completion - Install shell autocompletion")
+		fmt.Println()
+		fmt.Println("Usage:")
+		fmt.Println("  aidev completion <shell>")
+		fmt.Println()
+		fmt.Println("Available shells:")
+		fmt.Println("  bash    Install bash completion")
+		fmt.Println("  zsh     Install zsh completion")
+		fmt.Println("  install Install completions for detected shell")
+		fmt.Println()
+		fmt.Println("Script output mode (for eval):")
+		fmt.Println("  aidev completion bash --script    # Output bash completion script")
+		fmt.Println("  aidev completion zsh --script     # Output zsh completion script")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  aidev completion bash     # Install bash completion")
+		fmt.Println("  aidev completion zsh      # Install zsh completion")
+		fmt.Println("  aidev completion install  # Auto-detect and install")
+		fmt.Println()
+		fmt.Println("After installation, restart your shell or source the configuration file.")
+		return
+	}
+
+	shell := args[0]
+
+	// Check for script output mode
+	if len(args) > 1 && args[1] == "--script" {
+		switch shell {
+		case "bash":
+			fmt.Print(completion.GenerateBashCompletion())
+		case "zsh":
+			fmt.Print(completion.GenerateZshCompletion())
+		default:
+			fatal(fmt.Sprintf("unsupported shell for script output: %s", shell))
+		}
+		return
+	}
+
+	installer, err := completion.NewInstaller()
+	if err != nil {
+		fatal(fmt.Sprintf("completion installer: %v", err))
+	}
+
+	switch shell {
+	case "bash":
+		if err := installer.InstallBashCompletion(); err != nil {
+			fatal(fmt.Sprintf("bash completion install: %v", err))
+		}
+		fmt.Println("Bash completion installed successfully!")
+		fmt.Println("Restart your shell or run: source ~/.bashrc")
+	case "zsh":
+		if err := installer.InstallZshCompletion(); err != nil {
+			fatal(fmt.Sprintf("zsh completion install: %v", err))
+		}
+		fmt.Println("Zsh completion installed successfully!")
+		fmt.Println("Restart your shell or run: source ~/.zshrc")
+	case "install":
+		if err := installer.InstallAll(); err != nil {
+			fatal(fmt.Sprintf("completion install: %v", err))
+		}
+		fmt.Println("Shell completion installed successfully!")
+		fmt.Println("Restart your shell for changes to take effect")
+	default:
+		fatal(fmt.Sprintf("unsupported shell: %s (supported: bash, zsh, install)", shell))
+	}
+}
+
+func runCompletionSubcommand() {
+	if len(os.Args) < 2 || os.Args[1] == "--help" || os.Args[1] == "-h" {
+		fmt.Println("aidev completion - Install shell autocompletion")
+		fmt.Println()
+		fmt.Println("Usage:")
+		fmt.Println("  aidev completion <shell>")
+		fmt.Println()
+		fmt.Println("Available shells:")
+		fmt.Println("  bash    Install bash completion")
+		fmt.Println("  zsh     Install zsh completion")
+		fmt.Println("  install Install completions for detected shell")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  aidev completion bash     # Install bash completion")
+		fmt.Println("  aidev completion zsh      # Install zsh completion")
+		fmt.Println("  aidev completion install  # Auto-detect and install")
+		fmt.Println()
+		fmt.Println("After installation, restart your shell or source the configuration file.")
+		if len(os.Args) < 2 {
+			os.Exit(1)
+		}
+		return
+	}
+
+	shell := os.Args[1]
+
+	installer, err := completion.NewInstaller()
+	if err != nil {
+		fatal(fmt.Sprintf("completion installer: %v", err))
+	}
+
+	switch shell {
+	case "bash":
+		if err := installer.InstallBashCompletion(); err != nil {
+			fatal(fmt.Sprintf("bash completion install: %v", err))
+		}
+		fmt.Println("Bash completion installed successfully!")
+		fmt.Println("Restart your shell or run: source ~/.bashrc")
+	case "zsh":
+		if err := installer.InstallZshCompletion(); err != nil {
+			fatal(fmt.Sprintf("zsh completion install: %v", err))
+		}
+		fmt.Println("Zsh completion installed successfully!")
+		fmt.Println("Restart your shell or run: source ~/.zshrc")
+	case "install":
+		if err := installer.InstallAll(); err != nil {
+			fatal(fmt.Sprintf("completion install: %v", err))
+		}
+		fmt.Println("Shell completion installed successfully!")
+		fmt.Println("Restart your shell for changes to take effect")
+	default:
+		fatal(fmt.Sprintf("unsupported shell: %s (supported: bash, zsh, install)", shell))
+	}
+}
+
 func fatal(msg string) {
-	fmt.Fprintln(os.Stderr, "aidev: "+msg)
+	fmt.Fprintf(os.Stderr, "aidev: %s\n", msg)
 	os.Exit(1)
 }
