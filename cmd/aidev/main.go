@@ -120,6 +120,13 @@ func main() {
 		runConfigSubcommand()
 		return
 	}
+	// Intercept the `ollama` subcommand. Provides model management,
+	// recommendations, and health checks for the local Ollama daemon.
+	if len(os.Args) > 1 && os.Args[1] == "ollama" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runOllamaSubcommand()
+		return
+	}
 
 	var (
 		issueURL     = flag.String("issue", "", "GitHub issue reference: full URL (https://github.com/owner/repo/issues/N) or a bare number when -repo points at a local clone with a github.com remote")
@@ -334,11 +341,11 @@ func runClarifySubcommand() {
 // followups turn into issues.
 func runFollowUpsSubcommand() {
 	var (
-		repoPath   = flag.String("repo", ".", "Path to the target repository (where .aidev/followups.md lives)")
-		target     = flag.String("target", "", "Target GitHub repo in owner/repo form (required for --file-issues)")
-		file       = flag.Bool("file-issues", false, "Actually file the proposals as GitHub issues (default: dry run)")
-		followups  = flag.String("path", "", "Override path to followups.md (default: <repo>/.aidev/followups.md)")
-		configDir  = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		repoPath  = flag.String("repo", ".", "Path to the target repository (where .aidev/followups.md lives)")
+		target    = flag.String("target", "", "Target GitHub repo in owner/repo form (required for --file-issues)")
+		file      = flag.Bool("file-issues", false, "Actually file the proposals as GitHub issues (default: dry run)")
+		followups = flag.String("path", "", "Override path to followups.md (default: <repo>/.aidev/followups.md)")
+		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
 	)
 	flag.Parse()
 

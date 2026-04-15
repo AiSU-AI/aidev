@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/aisu-ai/aidev/internal/config"
 )
@@ -34,16 +35,36 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 }
 
 func buildProvider(t config.Tier) (Provider, error) {
+	var base Provider
 	switch t.Provider {
 	case "ollama":
-		return NewOllama(t.Endpoint, t.Model, t.MaxTokens, t.Temperature), nil
+		base = NewOllamaWithStreaming(t.Endpoint, t.Model, t.MaxTokens, t.Temperature)
 	case "anthropic":
-		return NewClaude(t.Model, t.MaxTokens, t.Temperature), nil
+		base = NewClaude(t.Model, t.MaxTokens, t.Temperature)
 	case "claude-cli":
-		return NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature), nil
+		base = NewClaudeCLI(t.Model, t.MaxTokens, t.Temperature)
 	default:
 		return nil, fmt.Errorf("unknown provider %q", t.Provider)
 	}
+
+	// Apply middleware based on provider type
+	var middlewares []func(Provider) Provider
+
+	// Add retry logic for all providers
+	retryConfig := DefaultRetryConfig()
+	if t.Provider == "ollama" {
+		// Ollama might need more retries due to local resource constraints
+		retryConfig.MaxAttempts = 5
+		retryConfig.BaseDelay = 2 * time.Second
+	}
+	middlewares = append(middlewares, WithRetry(retryConfig))
+
+	// Add circuit breaker for cloud providers to prevent cascading failures
+	if t.Provider == "anthropic" || t.Provider == "claude-cli" {
+		middlewares = append(middlewares, WithCircuitBreaker(3, 60*time.Second))
+	}
+
+	return ProviderWithMiddleware(base, middlewares...), nil
 }
 
 // For returns the Provider assigned to the given role. Unknown roles return
