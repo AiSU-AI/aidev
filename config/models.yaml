@@ -1,82 +1,217 @@
-# Model tier configuration for aidev.
+# aidev model configuration (v0.5)
 #
-# aidev routes each agent role to a model tier. Small tiers run locally
-# via Ollama; medium and large tiers default to the Claude Code CLI so
-# any user with a Max/Pro subscription gets deep-reasoning agents
-# (Critic, Architect, Charter, Reviewer) at no extra per-token cost.
+# This file defines named PROFILES, each containing a set of model
+# tiers and a role-to-tier routing. The active profile is what
+# aidev resolves on every run.
 #
-# Alternatives you can swap in:
+# ---
 #
-#   provider: anthropic   # direct REST API, requires ANTHROPIC_API_KEY
-#   provider: ollama      # fully local, no cloud calls
-#   provider: claude-cli  # (default) shells out to `claude --print`
+# Switching profiles:
 #
-# Override endpoint/model via environment variables:
-#   AIDEV_OLLAMA_URL    override ollama endpoint (default http://localhost:11434)
-#   ANTHROPIC_API_KEY   required when any tier uses provider: anthropic
+#   aidev config show              # print the currently active profile
+#   aidev config profile list      # list all available profiles
+#   aidev config profile use <name>   # switch active profile
+#   aidev config set <role> <provider> <model>   # tweak the active profile
+#   aidev config edit              # open this file in $EDITOR
+#   aidev config doctor            # validate the active profile
 #
-# The claude-cli provider uses whichever model your Claude Code
-# subscription defaults to when `model` is empty. Set `model` to an
-# explicit name (e.g. claude-opus-4-6) to pin it.
+# Every config-mutation command prompts for confirmation before
+# writing. Pass --yes to bypass the prompt for scripted callers.
+#
+# ---
+#
+# Shipped profiles (this PR ships four):
+#
+#   default    Local Ollama for the agents (Implementer/Reviewer
+#              with native tool use, Critic/Architect on Claude
+#              CLI for cloud reasoning depth) and Claude CLI as
+#              the Coordinator monitoring every agent transition.
+#              Recommended for users with both local hardware and
+#              a Claude Code subscription.
+#
+#   offline    Fully offline. Every role on a local Ollama model.
+#              Zero cloud calls. Use when air-gapped, on a plane,
+#              or testing without a Claude Code session.
+#
+#   low-vram   Same routing shape as `default` but every Ollama
+#              tier on a 7B model. For laptops without much GPU
+#              memory (~5 GB VRAM total).
+#
+#   high-vram  Same routing shape as `default` but with bigger
+#              local models for Implementer/Reviewer (32B coder)
+#              and Scout/Tester (14B coder). For workstations
+#              with 24+ GB VRAM that can keep multiple models
+#              hot.
+#
+# ---
+#
+# Tool use (v0.4+):
+#
+# The Implementer and Reviewer use native tool calls (read_file,
+# glob, grep, list_dir) when their tier provider supports it.
+# Currently supported: provider: anthropic AND provider: ollama
+# with a tool-capable model (qwen2.5, qwen2.5-coder, llama3.1+,
+# mistral-nemo, command-r-plus, firefunction-v2). The provider:
+# claude-cli backend does NOT support tool use yet — agents on
+# claude-cli fall back to the legacy picker + NEED_FILES path.
+#
+# The four shipped profiles all give the Implementer a tool-using
+# tier. If you customize a profile to put the Implementer on
+# claude-cli you'll lose tool use; `aidev config doctor` will
+# warn you about it.
 
-tiers:
-  small:
-    provider: ollama
-    model: qwen2.5-coder:7b
-    endpoint: http://localhost:11434
-    max_tokens: 2048
-    temperature: 0.2
+active_profile: default
 
-  # The medium tier hosts the Implementer and Reviewer. v0.4 added
-  # native tool use (read_file, glob, grep, list_dir) for providers
-  # that implement llm.ToolAwareProvider. Currently only the
-  # `anthropic` provider supports tool use; `claude-cli` and
-  # `ollama` fall back to the legacy picker + NEED_FILES path,
-  # which still works but is less robust.
-  #
-  # To unlock v0.4 tool use for the Implementer specifically, set
-  # ANTHROPIC_API_KEY and swap this tier:
-  #
-  #   medium:
-  #     provider: anthropic
-  #     model: claude-sonnet-4-6       # or claude-opus-4-6
-  #     max_tokens: 8192
-  #     temperature: 0.2
-  #
-  # Tool use eliminates entire categories of failures that the
-  # legacy path hits on large monorepos (see aidev#37 for the
-  # motivating diagnosis).
-  medium:
-    provider: claude-cli
-    model: ""
-    max_tokens: 4096
-    temperature: 0.2
+profiles:
 
-  large:
-    provider: claude-cli
-    model: ""
-    max_tokens: 8192
-    temperature: 0.3
+  default:
+    description: |
+      Local Ollama for Implementer/Reviewer with native tool use,
+      Claude CLI for Critic/Architect/Charter (cloud reasoning
+      depth), Claude CLI as the Coordinator monitoring every
+      agent transition. The "local horse, cloud jockey" shape.
+    tiers:
+      small:
+        provider: ollama
+        model: qwen2.5-coder:7b
+        endpoint: http://localhost:11434
+        max_tokens: 2048
+        temperature: 0.2
+      medium:
+        provider: ollama
+        model: qwen2.5-coder:14b
+        endpoint: http://localhost:11434
+        max_tokens: 8192
+        temperature: 0.2
+      cloud_large:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+      oversight:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: small
+      tester: small
+      implementer: medium
+      reviewer: medium
+      critic: cloud_large
+      architect: cloud_large
+      charter: cloud_large
+      coordinator: oversight
 
-# Role -> tier routing. Roles that need deep reasoning (critic,
-# architect, charter, coordinator) use the large tier. Implementer
-# and reviewer use medium. Scout and tester are routed to the small
-# local tier for speed and cost.
-#
-# coordinator is aidev's Gate-1 safety net: it reviews the
-# Implementer's diff before it's written to disk and catches common
-# failure modes (fabrication, invalid syntax for the file format,
-# auxiliary TODO files, partial scope). It runs on the large tier
-# because catching those failures is a judgment task — the same
-# reason the Critic runs there. If you're running a local
-# Implementer (see models.local.yaml), keeping the Coordinator on a
-# cloud tier is the recommended "local horse, cloud jockey" shape.
-routing:
-  scout: small
-  critic: large
-  architect: large
-  charter: large
-  coordinator: large
-  implementer: medium
-  reviewer: medium
-  tester: small
+  offline:
+    description: |
+      Fully offline. Every role on a local Ollama model. Zero
+      cloud calls. Use when air-gapped, on a plane, or testing
+      without a Claude Code session. Quality on Critic/Architect
+      is meaningfully lower than `default` because local 32B
+      models reason less deeply than Claude Opus.
+    tiers:
+      small:
+        provider: ollama
+        model: qwen2.5-coder:7b
+        endpoint: http://localhost:11434
+        max_tokens: 2048
+        temperature: 0.2
+      medium:
+        provider: ollama
+        model: qwen2.5-coder:14b
+        endpoint: http://localhost:11434
+        max_tokens: 8192
+        temperature: 0.2
+      large:
+        provider: ollama
+        model: qwen2.5:32b
+        endpoint: http://localhost:11434
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: small
+      tester: small
+      implementer: medium
+      reviewer: medium
+      critic: large
+      architect: large
+      charter: large
+      coordinator: large
+
+  low-vram:
+    description: |
+      Same routing shape as `default` but every Ollama tier on a
+      7B model. For laptops with limited GPU memory (~5 GB VRAM
+      total). Implementer quality drops compared to `default`
+      because the 7B coder model is less capable at multi-file
+      changes than the 14B variant. Critic/Architect/Coordinator
+      stay on Claude CLI so the judgment quality of the pipeline
+      is preserved.
+    tiers:
+      small:
+        provider: ollama
+        model: qwen2.5-coder:7b
+        endpoint: http://localhost:11434
+        max_tokens: 2048
+        temperature: 0.2
+      cloud_large:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+      oversight:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: small
+      tester: small
+      implementer: small
+      reviewer: small
+      critic: cloud_large
+      architect: cloud_large
+      charter: cloud_large
+      coordinator: oversight
+
+  high-vram:
+    description: |
+      Same routing shape as `default` but with bigger local
+      models for Implementer/Reviewer (32B coder) and Scout/Tester
+      (14B coder). For workstations with 24+ GB VRAM that can
+      keep multiple models hot. Implementer quality approaches
+      Claude Sonnet on focused refactors. Critic/Architect stay
+      on Claude CLI for the deepest reasoning.
+    tiers:
+      medium:
+        provider: ollama
+        model: qwen2.5-coder:14b
+        endpoint: http://localhost:11434
+        max_tokens: 4096
+        temperature: 0.2
+      large:
+        provider: ollama
+        model: qwen2.5-coder:32b
+        endpoint: http://localhost:11434
+        max_tokens: 16384
+        temperature: 0.2
+      cloud_large:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+      oversight:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: medium
+      tester: medium
+      implementer: large
+      reviewer: large
+      critic: cloud_large
+      architect: cloud_large
+      charter: cloud_large
+      coordinator: oversight

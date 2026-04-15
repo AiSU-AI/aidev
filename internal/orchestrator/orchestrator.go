@@ -251,6 +251,11 @@ func (o *Orchestrator) ReviewPatch(ctx context.Context, patch string) <-chan Eve
 			}
 		}
 
+		// Coordinator Gate 5: post-Reviewer monitor.
+		o.runAdvisoryGate(ctx, out, "post-reviewer", func() ([]agents.GateNote, error) {
+			return o.coordinator.ObserveReviewerVerdict(ctx, o.ctx, rev)
+		})
+
 		o.state = StateReviewDone
 		o.emit(ctx, out, Event{
 			State: o.state,
@@ -456,6 +461,19 @@ func (o *Orchestrator) Implement(ctx context.Context, sketchNumber int) <-chan E
 // nil in that case).
 func (o *Orchestrator) CoordinatorReview() *agents.CoordinatorReview { return o.coordReview }
 
+// CoordinatorNotes returns the running list of advisory notes the
+// Coordinator's monitor gates have produced across the current
+// run. Used by the headless report to surface what the
+// post-Scout, post-Critic, post-Architect, and post-Reviewer
+// gates observed. Empty when no gate has fired yet, or when the
+// Coordinator wasn't reachable.
+func (o *Orchestrator) CoordinatorNotes() []agents.GateNote {
+	if o.coordinator == nil {
+		return nil
+	}
+	return o.coordinator.Notes
+}
+
 // Router exposes the router so the TUI can display provider health.
 func (o *Orchestrator) Router() *llm.Router { return o.router }
 
@@ -560,6 +578,11 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 			return
 		}
 
+		// Coordinator Gate 0: post-Scout monitor.
+		o.runAdvisoryGate(ctx, out, "post-scout", func() ([]agents.GateNote, error) {
+			return o.coordinator.ObserveScoutBrief(ctx, o.ctx)
+		})
+
 		// Critic.
 		o.state = StateCritiquing
 		o.emit(ctx, out, Event{State: o.state, Message: "Critic evaluating proposal..."})
@@ -571,11 +594,50 @@ func (o *Orchestrator) Run(ctx context.Context) <-chan Event {
 		}
 		o.critRpt = rpt
 
+		// Coordinator Gate 1: post-Critic monitor.
+		o.runAdvisoryGate(ctx, out, "post-critic", func() ([]agents.GateNote, error) {
+			return o.coordinator.ObserveCriticReport(ctx, o.ctx)
+		})
+
 		// First pass terminates here and awaits the human's verdict.
 		o.state = StateAwaitUser
 		o.emit(ctx, out, Event{State: o.state, Message: "Critic recommends: " + rpt.Recommendation})
 	}()
 	return out
+}
+
+// runAdvisoryGate is the shared wrapper for Gates 0/1/2/5. It
+// invokes the named Coordinator method, logs any error to the
+// reporter log (advisory gates NEVER block the pipeline), and
+// emits a transition event so the headless report and the TUI
+// can show what the monitor observed.
+//
+// Errors from the gate (provider failures, parse failures) are
+// logged and swallowed. The pipeline must always be able to
+// proceed past an advisory gate even if the Coordinator's
+// provider is down — this is the safety-net contract from #33.
+func (o *Orchestrator) runAdvisoryGate(ctx context.Context, out chan<- Event, gateName string, run func() ([]agents.GateNote, error)) {
+	if o.coordinator == nil {
+		return
+	}
+	notes, err := run()
+	if err != nil {
+		fmt.Fprintf(o.reporterLog, "aidev coordinator %s: %v\n", gateName, err)
+		return
+	}
+	for _, n := range notes {
+		// Surface concerns and warnings as events so the
+		// headless report and TUI status line both show
+		// them. Info-level breadcrumbs stay in the running
+		// notes buffer only.
+		switch n.Severity {
+		case "warn", "concern":
+			o.emit(ctx, out, Event{
+				State:   o.state,
+				Message: fmt.Sprintf("Coordinator [%s/%s]: %s", n.Gate, n.Severity, n.Body),
+			})
+		}
+	}
 }
 
 // Recritique re-runs ONLY the Critic stage against the current agent
@@ -681,6 +743,11 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 			return
 		}
 		o.ctx.Sketches = sketches
+
+		// Coordinator Gate 2: post-Architect monitor.
+		o.runAdvisoryGate(ctx, out, "post-architect", func() ([]agents.GateNote, error) {
+			return o.coordinator.ObserveArchitectSketches(ctx, o.ctx)
+		})
 
 		o.state = StateSketchesReady
 		o.emit(ctx, out, Event{
