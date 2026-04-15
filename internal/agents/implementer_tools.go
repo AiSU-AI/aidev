@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/aisu-ai/aidev/internal/llm"
@@ -35,6 +36,15 @@ import (
 // the budget.
 const maxToolIterations = 25
 
+// maxToolFormatCorrections is the cap on how many times
+// runWithTools will send a corrective follow-up when the model
+// ends its turn with invalid final content (not a diff, not an
+// ERROR: line). One correction is enough for cloud Claude; local
+// Ollama models occasionally need two but anything beyond that
+// is a model that simply cannot follow the output format and
+// deserves a hard failure with a clear error.
+const maxToolFormatCorrections = 2
+
 // runWithTools drives the native tool-use loop. Called from
 // Implementer.Run() when the provider implements ToolAwareProvider.
 //
@@ -51,11 +61,19 @@ const maxToolIterations = 25
 //  5. Bounded at maxToolIterations to prevent runaway cost.
 //
 // Unlike the legacy path, there is NO picker turn, NO NEED_FILES
-// protocol, NO harvest step, NO missing-path tracking, and NO
-// format-correction retry. All of those were workarounds for the
-// missing tool-use capability. The model now has direct access to
-// the filesystem via tools and the conversation state is the only
-// thing the loop has to manage.
+// protocol, NO harvest step, and NO missing-path tracking. The
+// model has direct access to the filesystem via tools and the
+// conversation state is the only thing the loop has to manage.
+//
+// Format correction (v0.5a): the loop DOES include one layer of
+// format correction, because even tool-capable local models
+// (qwen2.5-coder:14b especially) sometimes produce an end_turn
+// response whose content isn't a valid diff. The provider layer
+// now salvages content-embedded tool calls before we get here,
+// so the cases that reach this loop are genuine format misses —
+// the model thought it was done but emitted the wrong shape. We
+// send one corrective follow-up asking for either a valid diff
+// or a real tool_use, and only fail hard if it's wrong twice.
 func (i *Implementer) runWithTools(ctx context.Context, provider llm.ToolAwareProvider, c *Context, chosen *Sketch) (*Patch, error) {
 	exec := NewToolExecutor(c.Snapshot.Root)
 	toolDefs := exec.Definitions()
@@ -75,6 +93,13 @@ func (i *Implementer) runWithTools(ctx context.Context, provider llm.ToolAwarePr
 		},
 	}
 
+	// formatCorrectionsUsed tracks how many times we've sent a
+	// corrective follow-up to recover from a malformed final
+	// turn (an end_turn response whose content isn't a diff).
+	// Capped at maxToolFormatCorrections so a model that
+	// refuses to comply can't loop forever.
+	formatCorrectionsUsed := 0
+
 	for iter := 0; iter < maxToolIterations; iter++ {
 		resp, err := provider.CompleteWithTools(ctx, llm.ToolAwareRequest{
 			System:   system,
@@ -92,8 +117,46 @@ func (i *Implementer) runWithTools(ctx context.Context, provider llm.ToolAwarePr
 
 		switch resp.StopReason {
 		case "end_turn":
-			// Model is done iterating. Its final text is the patch.
-			return validateDiffResponse(resp.Content)
+			// Model is done iterating. Its final text is supposed
+			// to be a unified diff. If validation passes, return
+			// the patch.
+			patch, err := validateDiffResponse(resp.Content)
+			if err == nil {
+				return patch, nil
+			}
+			// ERROR: is an intentional terminal state — the
+			// model is saying the task is impossible. Propagate
+			// immediately instead of trying to format-correct it
+			// into a diff.
+			if errors.Is(err, errDeclaredError) {
+				return nil, err
+			}
+			// Otherwise it's a format miss. Try ONE format
+			// correction before failing hard.
+			if formatCorrectionsUsed >= maxToolFormatCorrections {
+				// Dump the raw output so the user can see exactly
+				// what the model produced. This is the debugging
+				// signal v0.4a missed — we'd just see "first
+				// line was X" and have to guess at the rest.
+				return nil, fmt.Errorf("implementer: end_turn output is not a valid diff after %d format corrections: %w\n\nraw output:\n%s",
+					formatCorrectionsUsed, err, truncateForError(resp.Content, 2048))
+			}
+			// Stage a corrective user message that quotes the
+			// broken output and tells the model what to do.
+			messages = append(messages, llm.ToolMessage{
+				Role: "user",
+				Content: []llm.ToolContentBlock{
+					{
+						Type: "text",
+						Text: buildFormatCorrectionMessage(resp.Content, err),
+					},
+				},
+			})
+			formatCorrectionsUsed++
+			// Fall through to the next loop iteration, which
+			// re-calls the provider with the corrective message
+			// appended.
+			continue
 
 		case "tool_use":
 			if len(resp.ToolUses) == 0 {
@@ -207,6 +270,22 @@ WORKFLOW:
    final assistant message (without any more tool calls). The loop
    ends when your turn contains only text.
 
+3. CRITICAL — how to actually call tools: use the native tool_call
+   mechanism provided by your runtime. Do NOT emit a JSON object
+   in your message text like {"name": "read_file", "arguments":
+   {"path": "..."}} and expect it to be interpreted as a tool
+   call. The harness expects tool calls via the structured
+   tool_calls field of your response, not JSON in the content.
+   If you emit raw JSON in content the harness will treat it as
+   your final diff output and reject it for not being a diff.
+
+4. CRITICAL — when you are DONE and ready to produce the diff,
+   your response content must be the LITERAL unified diff text,
+   starting with the line "diff --git a/...". Do NOT wrap the
+   diff in a JSON object, do NOT put it in a Markdown code
+   fence, do NOT prefix it with prose. The raw diff is what
+   goes straight to the 'git apply' command.
+
 OUTPUT REQUIREMENTS for the final diff:
 
 1. Standard git unified diff format:
@@ -269,12 +348,18 @@ review it. A diff that applies cleanly and finishes the scope is
 worth ten drafts that need human cleanup.`
 }
 
+// errDeclaredError is the sentinel wrapping an `ERROR:` escape
+// hatch from the model. runWithTools uses errors.Is to
+// distinguish an ERROR: (terminal, propagate immediately) from
+// a generic validation miss (format-correction candidate).
+var errDeclaredError = errors.New("implementer: declared ERROR")
+
 // validateDiffResponse checks that a model's final text looks like a
 // unified git diff and returns a Patch. Uses the same grammar the
 // legacy path used, minus the NEED_FILES branch (not valid in
-// tool-use mode) and minus the format-correction retry (the model
-// can iterate inside the tool loop, so a bad final turn is a real
-// failure, not a format slip).
+// tool-use mode). Returns an error wrapping errDeclaredError for
+// ERROR: responses so the caller can distinguish them from
+// format misses.
 func validateDiffResponse(raw string) (*Patch, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -287,22 +372,102 @@ func validateDiffResponse(raw string) (*Patch, error) {
 		if reason == "" {
 			reason = "(no reason given)"
 		}
-		return nil, fmt.Errorf("implementer: declared ERROR: %s", reason)
+		// Wrap errDeclaredError so runWithTools can detect this
+		// via errors.Is and propagate immediately instead of
+		// trying to format-correct the ERROR: back to a diff.
+		return nil, fmt.Errorf("%w: %s", errDeclaredError, reason)
 	}
 
-	// Tolerate a short prose preamble before `diff --git` in the
+	// Tolerate a SHORT prose preamble before `diff --git` in the
 	// tool-use path — models sometimes narrate the final turn
-	// ("Here's the diff:") before the real content. We look for
-	// the first `diff --git` anywhere in the response and treat
-	// everything from there to the end as the patch body.
-	idx := strings.Index(raw, "diff --git")
-	if idx < 0 {
-		return nil, fmt.Errorf("implementer: final response contains no 'diff --git' marker; got first line: %q", firstLine(raw))
+	// ("Here's the diff:") before the real content. But only
+	// match `diff --git` at the START of a line after an optional
+	// prose preamble, NOT anywhere in the raw string. Using a
+	// plain strings.Index would match inside a JSON string
+	// literal like {"diff": "diff --git ..."} and we'd extract
+	// a garbled half-JSON as the patch body.
+	//
+	// Valid shapes we accept:
+	//
+	//   diff --git a/... b/...      ← the common case
+	//
+	//   Here's the diff:
+	//
+	//   diff --git a/... b/...      ← short prose preamble
+	//
+	// Anything else (JSON wrapper, tool-call JSON, random
+	// garbage) triggers the format-correction retry in
+	// runWithTools.
+	if strings.HasPrefix(raw, "diff --git") {
+		return &Patch{
+			Diff:         raw,
+			FilesTouched: parseFilesFromDiff(raw),
+		}, nil
 	}
-	diff := raw[idx:]
+	// Prose preamble: allow up to 500 chars of prose followed by
+	// a blank line followed by `diff --git` at the start of a
+	// line. Anything else falls through to the error.
+	if m := proseDiffRe.FindStringSubmatchIndex(raw); m != nil {
+		// m[0..1] is full match; m[2..3] is the `diff --git` group.
+		diffStart := m[2]
+		if diffStart <= 500 {
+			diff := raw[diffStart:]
+			return &Patch{
+				Diff:         diff,
+				FilesTouched: parseFilesFromDiff(diff),
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("implementer: final response does not start with 'diff --git'; got first line: %q", firstLine(raw))
+}
 
-	return &Patch{
-		Diff:         diff,
-		FilesTouched: parseFilesFromDiff(diff),
-	}, nil
+// proseDiffRe matches a prose preamble (any content) followed
+// by a blank line and `diff --git` at the start of a line. The
+// capture group is on the `diff --git` start so we can extract
+// the diff body without the prose prefix. We use `(?m)` so `^`
+// matches at the start of a line, not just the start of the
+// whole string.
+var proseDiffRe = regexp.MustCompile(`(?m)(^diff --git )`)
+
+// buildFormatCorrectionMessage composes the corrective user
+// message we send to the model when its end_turn content isn't
+// a valid diff. Quotes the broken output verbatim (truncated to
+// keep prompt size bounded) and tells the model exactly what
+// the next response must look like.
+//
+// Pattern is the same as the legacy tryGenerateDiff format
+// correction (#34), adapted for the tool-use loop: we can
+// mention tools because the model has real tool access here,
+// so the correction allows either "try more tool_use turns" or
+// "emit a clean diff" or "emit ERROR: <reason>".
+func buildFormatCorrectionMessage(brokenContent string, validationErr error) string {
+	var b strings.Builder
+	b.WriteString("## Your previous response was not a valid final output\n\n")
+	fmt.Fprintf(&b, "The validator rejected your end_turn response with: %v\n\n", validationErr)
+	b.WriteString("What you wrote (first 500 chars):\n\n> ")
+	b.WriteString(strings.ReplaceAll(truncateForError(brokenContent, 500), "\n", "\n> "))
+	b.WriteString("\n\n")
+	b.WriteString("Your next response MUST be EXACTLY ONE of:\n\n")
+	b.WriteString("1. A complete unified git diff starting with `diff --git a/...`. ")
+	b.WriteString("This is the success path — the diff is what the user will `git apply`.\n\n")
+	b.WriteString("2. More tool calls (read_file, glob, grep, list_dir) if you need more ")
+	b.WriteString("repository context before you can produce the diff. Use the native ")
+	b.WriteString("tool-call mechanism, not a JSON object in your content.\n\n")
+	b.WriteString("3. A single line `ERROR: <reason>` if the task is genuinely impossible ")
+	b.WriteString("(e.g. sketch contradicts itself, required files don't exist).\n\n")
+	b.WriteString("Do NOT emit prose describing what you would do. Do NOT emit a JSON ")
+	b.WriteString("wrapper around the diff (like `{\"diff\": \"...\"}`). The diff itself ")
+	b.WriteString("must be the literal content of your response.\n")
+	return b.String()
+}
+
+// truncateForError clips a string to n bytes, appending an
+// ellipsis marker if truncation happened. Used for error
+// messages and correction prompts so a runaway output can't
+// balloon the log or the next turn's context.
+func truncateForError(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "\n...[truncated at " + fmt.Sprint(n) + " bytes]"
 }

@@ -415,3 +415,231 @@ func TestImplementerRunLegacyPathStillFiresForNonToolProviders(t *testing.T) {
 		t.Errorf("legacy diff wrong: %s", patch.Diff)
 	}
 }
+
+// recordingToolProvider captures every ToolAwareRequest it
+// receives so tests can inspect the full multi-turn
+// conversation. Used by the format-correction tests below to
+// verify that the corrective follow-up actually quoted the
+// broken output back to the model.
+type recordingToolProvider struct {
+	responses []llm.ToolAwareResponse
+	requests  []llm.ToolAwareRequest
+}
+
+func (p *recordingToolProvider) Name() string { return "recording-tool" }
+func (p *recordingToolProvider) Complete(_ context.Context, _ llm.Request) (llm.Response, error) {
+	panic("recordingToolProvider.Complete called")
+}
+func (p *recordingToolProvider) CompleteWithTools(_ context.Context, req llm.ToolAwareRequest) (llm.ToolAwareResponse, error) {
+	p.requests = append(p.requests, req)
+	idx := len(p.requests) - 1
+	if idx >= len(p.responses) {
+		idx = len(p.responses) - 1
+	}
+	return p.responses[idx], nil
+}
+
+var _ llm.ToolAwareProvider = (*recordingToolProvider)(nil)
+
+// TestImplementerRunToolPathRecoversFromMalformedFinalContent
+// is the regression guard for v0.5a. When the model ends its
+// turn with content that isn't a diff (and not an ERROR:), the
+// harness must send a corrective follow-up and let the model
+// produce a valid diff on the retry.
+//
+// Covers the exact scenario the user hit: qwen2.5-coder:14b
+// emitted a `{` on its final turn instead of a `diff --git`.
+// The embedded-tool-call salvage in fromOllamaResponse catches
+// the most common subset of this failure mode, but when the
+// content doesn't match any known tool-call shape (e.g. the
+// model wrote `{"diff": "..."}` or just random JSON garbage)
+// the format-correction retry is the backstop.
+func TestImplementerRunToolPathRecoversFromMalformedFinalContent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &recordingToolProvider{
+		responses: []llm.ToolAwareResponse{
+			// Turn 1: model ends with malformed content (a JSON
+			// wrapper around the diff — not a tool-call shape,
+			// not a valid diff).
+			{
+				StopReason: "end_turn",
+				Content:    `{"diff": "diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-package x\n+package y\n"}`,
+				AssistantMessage: llm.ToolMessage{
+					Role: "assistant",
+					Content: []llm.ToolContentBlock{
+						makeTextBlock(`{"diff": "..."}`),
+					},
+				},
+			},
+			// Turn 2: after the corrective follow-up, the model
+			// emits a real unified diff.
+			{
+				StopReason: "end_turn",
+				Content: "diff --git a/x.go b/x.go\n" +
+					"--- a/x.go\n" +
+					"+++ b/x.go\n" +
+					"@@ -1 +1 @@\n" +
+					"-package x\n" +
+					"+package y\n",
+				AssistantMessage: llm.ToolMessage{
+					Role:    "assistant",
+					Content: []llm.ToolContentBlock{makeTextBlock("diff --git a/x.go b/x.go\n...")},
+				},
+			},
+		},
+	}
+
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "t", Body: "body"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	patch, err := impl.Run(context.Background(), ctx, sketch)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if patch == nil {
+		t.Fatal("nil patch")
+	}
+	if !strings.Contains(patch.Diff, "+package y") {
+		t.Errorf("final patch wrong: %s", patch.Diff)
+	}
+
+	// Two turns total: one rejected + one corrected.
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider called %d times, want 2", len(provider.requests))
+	}
+
+	// The SECOND turn's user message list must end with a
+	// corrective user message that quotes the broken content.
+	secondReq := provider.requests[1]
+	if len(secondReq.Messages) == 0 {
+		t.Fatal("second request has no messages")
+	}
+	lastMsg := secondReq.Messages[len(secondReq.Messages)-1]
+	if lastMsg.Role != "user" {
+		t.Errorf("last message role = %q, want user", lastMsg.Role)
+	}
+	var foundCorrection bool
+	for _, b := range lastMsg.Content {
+		if b.Type == "text" && strings.Contains(b.Text, "Your previous response was not a valid final output") {
+			foundCorrection = true
+		}
+		if b.Type == "text" && !strings.Contains(b.Text, `{"diff":`) {
+			continue
+		}
+		if b.Type == "text" && strings.Contains(b.Text, `{"diff":`) {
+			// The correction message should echo the broken
+			// JSON wrapper back to the model so it sees what
+			// it wrote.
+			foundCorrection = true
+		}
+	}
+	if !foundCorrection {
+		t.Errorf("corrective follow-up missing or malformed; last message:\n%+v", lastMsg)
+	}
+}
+
+// TestImplementerRunToolPathFailsAfterRepeatedMalformedOutput
+// guards the format-correction cap. A model that refuses to
+// emit a valid diff across multiple corrections must fail
+// hard with a clear error that includes the raw output for
+// debugging.
+func TestImplementerRunToolPathFailsAfterRepeatedMalformedOutput(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every response is malformed — no diff marker anywhere.
+	malformed := llm.ToolAwareResponse{
+		StopReason: "end_turn",
+		Content:    `{"i": "wrote", "more": "nonsense"}`,
+		AssistantMessage: llm.ToolMessage{
+			Role:    "assistant",
+			Content: []llm.ToolContentBlock{makeTextBlock(`{"i": "wrote", "more": "nonsense"}`)},
+		},
+	}
+	script := make([]llm.ToolAwareResponse, maxToolFormatCorrections+3)
+	for i := range script {
+		script[i] = malformed
+	}
+	provider := &scriptedToolProvider{responses: script}
+
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "t", Body: "body"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("expected hard failure after format-correction cap")
+	}
+	// The error must include the raw output so the user can
+	// debug without re-running — this is the debuggability
+	// fix #35/#36 were missing at the tool-use path.
+	if !strings.Contains(err.Error(), "raw output:") {
+		t.Errorf("error should include raw output section; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `{"i": "wrote"`) {
+		t.Errorf("error should quote the malformed content; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "format corrections") {
+		t.Errorf("error should mention format corrections; got: %v", err)
+	}
+}
+
+// TestImplementerRunToolPathFormatCorrectionNotTriggeredOnERROR
+// verifies that an ERROR: escape hatch from the model is
+// surfaced immediately without going through format
+// correction. ERROR: is an intentional terminal state, not a
+// malformed output.
+func TestImplementerRunToolPathFormatCorrectionNotTriggeredOnERROR(t *testing.T) {
+	dir := t.TempDir()
+
+	provider := &scriptedToolProvider{
+		responses: []llm.ToolAwareResponse{
+			{
+				StopReason: "end_turn",
+				Content:    "ERROR: sketch references a file that does not exist",
+				AssistantMessage: llm.ToolMessage{
+					Role:    "assistant",
+					Content: []llm.ToolContentBlock{makeTextBlock("ERROR: sketch references a file that does not exist")},
+				},
+			},
+			// This second response should NEVER be reached —
+			// ERROR: terminates immediately.
+			{
+				StopReason: "end_turn",
+				Content:    "diff --git a/x b/x\n",
+			},
+		},
+	}
+	impl := &Implementer{Provider: provider}
+	ctx := &Context{
+		Issue:    &github.Issue{Owner: "a", Repo: "b", Number: 1, Title: "t", Body: "body"},
+		Snapshot: &repo.Snapshot{Root: dir},
+	}
+	sketch := &Sketch{Number: 1, Title: "t", Markdown: "m"}
+
+	_, err := impl.Run(context.Background(), ctx, sketch)
+	if err == nil {
+		t.Fatal("ERROR: should propagate as a Go error")
+	}
+	if !strings.Contains(err.Error(), "declared ERROR") {
+		t.Errorf("ERROR: should surface as 'declared ERROR', got: %v", err)
+	}
+	// Only one provider call — the second scripted response
+	// must not have been reached.
+	if provider.calls != 1 {
+		t.Errorf("provider called %d times, want 1 (ERROR should terminate immediately)", provider.calls)
+	}
+}
