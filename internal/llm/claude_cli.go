@@ -233,3 +233,169 @@ func (c *ClaudeCLI) Complete(ctx context.Context, r Request) (Response, error) {
 // production code; exported only so claude_cli_test.go in the same
 // package can use it.
 func (c *ClaudeCLI) SetBin(path string) { c.bin = path }
+
+// CompleteWithTools implements ToolAwareProvider for ClaudeCLI by
+// running the claude CLI binary as a SUBPROCESS AGENT against the
+// target repository. This is a fundamentally different shape from
+// the anthropic and ollama tool-use loops: those transcript every
+// individual tool_use block through aidev's harness. For claude-cli
+// we hand the whole task to `claude -p` with its built-in tools
+// (Read, Grep, Glob, LS) pre-authorized, let it explore the repo
+// autonomously, and capture the final unified diff from its output.
+//
+// Why not transcript individual tool calls? Because the `claude`
+// binary does not expose a tool_use protocol over its --print
+// interface — it's a single-shot REPL. Attempting to drive it
+// through aidev's legacy NEED_FILES picker failed because claude's
+// response shape is "I'll use my tools to read files" followed by
+// a reasoning trace, not a JSON file-selection array. Handing it
+// the task and letting it use its own tools internally aligns with
+// how claude CLI was designed to be used.
+//
+// Tool scope: only read-only tools are allowed (Read, Grep, Glob,
+// LS). Edit / Write / Bash are NOT in --allowedTools so the agent
+// cannot modify the repo directly — its only output channel is the
+// final stdout text, which aidev captures as a diff candidate. This
+// preserves the aidev contract that the user reviews every patch
+// before applying.
+//
+// Working directory: cmd.Dir is set to req.WorkingDir so the agent's
+// tools operate inside the target repo. This is the ONE place where
+// the claude-cli provider reads the target repo directly; the
+// non-tool Complete() path deliberately runs from a neutral tmpDir
+// to avoid inheriting an unrelated CLAUDE.md.
+//
+// The returned ToolAwareResponse always has StopReason="end_turn"
+// and no ToolUses — from aidev's perspective this is a single
+// synthetic turn that happens to take a long time. The internal
+// tool calls claude made are not visible to aidev telemetry.
+func (c *ClaudeCLI) CompleteWithTools(ctx context.Context, r ToolAwareRequest) (ToolAwareResponse, error) {
+	if c.bin == "" {
+		return ToolAwareResponse{}, errors.New("claude-cli: empty bin")
+	}
+
+	// Flatten the seed message(s) into a single task prompt. The
+	// implementer's runWithTools always seeds with exactly one user
+	// message so this concatenation is lossless today; if a future
+	// caller sends a multi-turn conversation we'll re-examine.
+	var user strings.Builder
+	for _, m := range r.Messages {
+		if m.Role == "assistant" {
+			continue
+		}
+		for _, block := range m.Content {
+			if block.Type == "text" && block.Text != "" {
+				user.WriteString(block.Text)
+				user.WriteString("\n")
+			}
+		}
+	}
+	prompt := strings.TrimSpace(user.String())
+	if prompt == "" {
+		return ToolAwareResponse{}, errors.New("claude-cli: empty user prompt")
+	}
+
+	args := []string{
+		"--print",
+		"--output-format", "json",
+		// Pre-authorize the read-only exploration tools so the
+		// subprocess never blocks on a permission prompt. The
+		// agent must NOT be allowed to Edit / Write / Bash — its
+		// only output is stdout, and aidev captures that as a
+		// diff candidate. User reviews every patch before apply.
+		"--allowedTools", "Read", "Grep", "Glob", "LS",
+	}
+	if c.model != "" {
+		args = append(args, "--model", c.model)
+	}
+	if r.System != "" {
+		// Append (do not replace) the aidev implementer system
+		// prompt on top of claude CLI's default agent prompt.
+		// Replacing would strip claude's built-in tool-use guidance.
+		args = append(args, "--append-system-prompt", r.System)
+	}
+
+	// Unlike Complete(), this path DELIBERATELY runs inside the target
+	// repo so claude's tools can read its files. Empty WorkingDir is
+	// a configuration error at the caller layer — fail fast rather
+	// than silently pointing the agent at aidev's own checkout.
+	if strings.TrimSpace(r.WorkingDir) == "" {
+		return ToolAwareResponse{}, errors.New("claude-cli: CompleteWithTools requires ToolAwareRequest.WorkingDir — the target repo root")
+	}
+
+	runCtx := ctx
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(runCtx, c.bin, args...)
+	cmd.Dir = r.WorkingDir
+	cmd.Stdin = strings.NewReader(prompt)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		msg := stderr.String()
+		if msg == "" {
+			msg = err.Error()
+		}
+		if len(msg) > 2048 {
+			msg = msg[:2048] + "...[truncated]"
+		}
+		return ToolAwareResponse{}, fmt.Errorf("claude-cli: agent mode: %w (stderr: %s)", err, strings.TrimSpace(msg))
+	}
+
+	raw := strings.TrimSpace(stdout.String())
+	if raw == "" {
+		return ToolAwareResponse{}, errors.New("claude-cli: agent mode: empty response")
+	}
+
+	// Parse the same envelope Complete() parses — agent mode uses
+	// the same --output-format json so the `result` + `usage` shape
+	// is identical. The `result` field contains the agent's final
+	// assistant text, which should be a unified diff.
+	var env struct {
+		Result string `json:"result"`
+		Usage  struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	var content string
+	var usage Usage
+	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Result == "" {
+		// Fallback: raw stdout as content, zero usage. Matches
+		// Complete()'s malformed-envelope behaviour so downstream
+		// validators still see something to work with.
+		content = raw
+	} else {
+		content = strings.TrimSpace(env.Result)
+		usage = Usage{
+			InputTokens:  env.Usage.InputTokens,
+			OutputTokens: env.Usage.OutputTokens,
+		}
+	}
+
+	// Build the synthetic assistant message the harness appends to
+	// its history. Only one text block: the final diff candidate.
+	// No tool_use blocks because claude ran its tools internally.
+	assistant := ToolMessage{
+		Role: "assistant",
+		Content: []ToolContentBlock{
+			{Type: "text", Text: content},
+		},
+	}
+
+	return ToolAwareResponse{
+		Content:          content,
+		ToolUses:         nil,
+		StopReason:       "end_turn",
+		Model:            c.model,
+		Usage:            usage,
+		AssistantMessage: assistant,
+	}, nil
+}

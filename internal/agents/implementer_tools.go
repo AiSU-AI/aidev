@@ -106,6 +106,12 @@ func (i *Implementer) runWithTools(ctx context.Context, provider llm.ToolAwarePr
 			System:   system,
 			Tools:    toolDefs,
 			Messages: messages,
+			// WorkingDir is used only by subprocess-agent providers
+			// (claude-cli) that drive their own tools inside the
+			// target repo. Transcripting providers (anthropic,
+			// ollama) already know the repo root via the executor
+			// and ignore this field.
+			WorkingDir: c.Snapshot.Root,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("implementer: tool-use call (iteration %d): %w", iter, err)

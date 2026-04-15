@@ -158,6 +158,120 @@ func TestClaudeCLIRouterRegistration(t *testing.T) {
 	})
 }
 
+// TestClaudeCLIImplementsToolAwareProvider is a compile-time guard.
+// If CompleteWithTools is removed or renamed on *ClaudeCLI the test
+// fails at compile time — so the Implementer's capability detection
+// at implementer.go:151 keeps working end-to-end.
+func TestClaudeCLIImplementsToolAwareProvider(t *testing.T) {
+	var _ ToolAwareProvider = (*ClaudeCLI)(nil)
+}
+
+// TestClaudeCLICompleteWithToolsHappyPath verifies the subprocess-agent
+// path: a fake claude binary that echoes the invocation details back
+// as the envelope's `result` field, so the test can assert the
+// command-line surface (--allowedTools, --append-system-prompt) AND
+// the cwd are correctly threaded.
+func TestClaudeCLICompleteWithToolsHappyPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixtures don't run on windows")
+	}
+
+	// The fake claude binary writes its args + cwd + stdin to a
+	// known file, then emits a json envelope whose `result` is a
+	// canned unified diff so the tool-aware response validator is
+	// exercised end-to-end.
+	traceFile := filepath.Join(t.TempDir(), "trace")
+	fakeBin := writeFakeClaudeBin(t, `#!/bin/sh
+{
+  echo "args: $*"
+  echo "cwd: $(pwd)"
+  echo "stdin:"
+  cat
+} > `+traceFile+`
+cat <<'JSON'
+{"type":"result","subtype":"success","is_error":false,"result":"diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new","usage":{"input_tokens":42,"output_tokens":21}}
+JSON
+`)
+
+	repoDir := t.TempDir()
+	// Touch a file so cwd is a real directory claude "could" read.
+	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewClaudeCLI("", 1024, 0.1, 0)
+	p.SetBin(fakeBin)
+
+	req := ToolAwareRequest{
+		System: "you are the test implementer",
+		Messages: []ToolMessage{
+			{
+				Role: "user",
+				Content: []ToolContentBlock{
+					{Type: "text", Text: "produce a unified diff for this repo"},
+				},
+			},
+		},
+		WorkingDir: repoDir,
+	}
+	resp, err := p.CompleteWithTools(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CompleteWithTools: %v", err)
+	}
+
+	// Verify the response shape the harness expects.
+	if resp.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q, want end_turn", resp.StopReason)
+	}
+	if !strings.HasPrefix(resp.Content, "diff --git") {
+		t.Errorf("Content missing diff prefix: %q", resp.Content)
+	}
+	if resp.Usage.InputTokens != 42 || resp.Usage.OutputTokens != 21 {
+		t.Errorf("Usage = %+v, want {42 21}", resp.Usage)
+	}
+	if len(resp.ToolUses) != 0 {
+		t.Errorf("ToolUses should be empty in subprocess agent mode, got %d", len(resp.ToolUses))
+	}
+	if len(resp.AssistantMessage.Content) != 1 || resp.AssistantMessage.Content[0].Type != "text" {
+		t.Errorf("AssistantMessage shape wrong: %+v", resp.AssistantMessage)
+	}
+
+	// Verify the command-line surface actually fed to the binary.
+	trace, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatalf("trace file: %v", err)
+	}
+	traceStr := string(trace)
+	for _, want := range []string{
+		"--print",
+		"--output-format json",
+		"--allowedTools Read Grep Glob LS",
+		"--append-system-prompt you are the test implementer",
+		"cwd: " + repoDir,
+		"stdin:\nproduce a unified diff",
+	} {
+		if !strings.Contains(traceStr, want) {
+			t.Errorf("trace missing %q; full trace:\n%s", want, traceStr)
+		}
+	}
+}
+
+// TestClaudeCLICompleteWithToolsRequiresWorkingDir is the negative
+// case: agent mode without a WorkingDir would silently point claude
+// at aidev's own cwd, which is a configuration bug. Fail fast.
+func TestClaudeCLICompleteWithToolsRequiresWorkingDir(t *testing.T) {
+	p := NewClaudeCLI("", 1024, 0.1, 0)
+	p.SetBin("/bin/true")
+	_, err := p.CompleteWithTools(context.Background(), ToolAwareRequest{
+		Messages: []ToolMessage{
+			{Role: "user", Content: []ToolContentBlock{{Type: "text", Text: "hi"}}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "WorkingDir") {
+		t.Errorf("expected WorkingDir error, got: %v", err)
+	}
+}
+
 // writeFakeClaudeBin writes a shell script to a temp file, marks it
 // executable, and returns the path. Cleaned up by t.TempDir().
 func writeFakeClaudeBin(t *testing.T, script string) string {

@@ -338,20 +338,17 @@ func runConfigDoctor() {
 			fmt.Sprintf("role %q is routed to a tier", r))
 	}
 
-	// Implementer/Reviewer on claude-cli is a quality warning,
-	// not an error — they fall back to the legacy NEED_FILES path
-	// instead of using v0.4 native tool use. Coordinator on
-	// claude-cli is the recommended setup, so no warning there.
-	for _, r := range []string{"implementer", "reviewer"} {
-		tierName, ok := cfg.Models.Routing[r]
-		if !ok {
-			continue
-		}
-		tier := cfg.Models.Tiers[tierName]
-		ok = tier.Provider != "claude-cli"
-		check(ok, "warn",
-			fmt.Sprintf("role %q uses a tool-capable provider (current: %s)", r, tier.Provider))
-	}
+	// Implementer/Reviewer tool-use capability check. All three
+	// shipped providers (anthropic, ollama, claude-cli) now implement
+	// ToolAwareProvider — the claude-cli path does so via subprocess
+	// agent mode (invokes `claude -p` inside the target repo with
+	// --allowedTools Read/Grep/Glob/LS). No warning needed today; the
+	// check is kept as a hook in case a future provider is added
+	// without ToolAwareProvider support.
+	// Historical note: earlier versions warned here because claude-cli
+	// only had a legacy NEED_FILES picker. Superseded by the subprocess
+	// agent path — the warning would be misleading now.
+	_ = []string{"implementer", "reviewer"} // intentionally kept for future reinstatement
 
 	// Anthropic provider needs ANTHROPIC_API_KEY set somewhere.
 	for _, name := range sortedKeys(cfg.Models.Tiers) {

@@ -242,12 +242,24 @@ type ToolMessage struct {
 // turn it contains just the initial user message; each subsequent
 // turn appends the assistant's response AND a user message with the
 // computed tool_result blocks.
+//
+// WorkingDir is the filesystem root the provider should operate in
+// when the backend drives its own tool use as a subprocess agent
+// (e.g. the claude-cli provider invokes the `claude` binary with
+// cmd.Dir = WorkingDir so its built-in Read / Grep / Glob / LS tools
+// see the target repo). Providers that transcript tool calls through
+// the harness (anthropic, ollama) ignore this field because the
+// harness's ToolExecutor already knows the repo root. Empty string
+// means "no specific working directory" — subprocess providers
+// should fall back to a neutral location (e.g. tmpDir) rather than
+// inherit aidev's own cwd.
 type ToolAwareRequest struct {
 	System      string
 	Tools       []ToolDefinition
 	Messages    []ToolMessage
 	MaxTokens   int
 	Temperature float64
+	WorkingDir  string
 }
 
 // ToolUse is a single pending tool call extracted from a

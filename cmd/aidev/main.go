@@ -832,12 +832,15 @@ func discoverConfigDir() string {
 // pipeline-driving subcommand so the user can see exactly which
 // provider+model is wired to each agent role before the run starts.
 //
-// Critically, this also flags Implementer/Reviewer/Coordinator
-// roles whose tier provider is `claude-cli` with a ⚠ marker,
-// because that provider does NOT support tool use yet and the
-// agent will silently fall back to the legacy NEED_FILES path.
-// The user has been bitten by this enough times that explicit
-// runtime visibility is mandatory.
+// Historical note: this used to flag Implementer/Reviewer on
+// claude-cli with a ⚠ because the provider didn't support tool use
+// and silently fell back to the legacy NEED_FILES path. As of the
+// claude-cli subprocess-agent mode, claude-cli DOES implement
+// ToolAwareProvider via a different shape — it invokes `claude -p`
+// with --allowedTools, lets the subprocess drive its own tools
+// inside the repo, and returns the final diff. We note that shape
+// with an ℹ marker so the user can tell at a glance which tool-use
+// strategy each tool-capable role is using.
 func printStartupBanner(cfg *config.Config) {
 	if cfg == nil || cfg.Models.Routing == nil {
 		return
@@ -861,7 +864,7 @@ func printStartupBanner(cfg *config.Config) {
 		}
 		marker := ""
 		if (role == "implementer" || role == "reviewer") && tier.Provider == "claude-cli" {
-			marker = "    ⚠ legacy NEED_FILES path (no tool use; swap to provider: ollama or anthropic for v0.4 tool use)"
+			marker = "    ℹ claude-cli subprocess agent (runs `claude -p` with --allowedTools Read/Grep/Glob/LS inside the target repo)"
 		}
 		modelDisplay := tier.Model
 		if modelDisplay == "" {
