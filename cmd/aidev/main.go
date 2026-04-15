@@ -901,15 +901,23 @@ func printStartupBanner(cfg *config.Config) {
 // normal pipeline (and any interview rounds) have run, and the
 // override is logged loudly so the user always sees it fired.
 func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int, forceVerdict string) {
-	// Emit a per-gate telemetry table at the end of every run (early
-	// return included) so cost/latency is always visible. fatal() exits
-	// before the defer fires, so failed runs skip the table — that's
-	// acceptable because the error takes precedence over the summary.
+	// Emit a per-gate telemetry table at the end of every run. defer
+	// covers normal returns; bail() below handles the fatal-exit path
+	// (os.Exit bypasses defers, so we render just before exiting).
 	defer renderTelemetry(orch)
+
+	// bail is the fatal path for runHeadless. It renders telemetry FIRST
+	// so cost/latency data is visible on the failing run — that's when
+	// the user most needs to see which gate burned budget before dying.
+	// Every fatal() call inside runHeadless should go through bail().
+	bail := func(msg string) {
+		renderTelemetry(orch)
+		fatal(msg)
+	}
 
 	for ev := range orch.Run(ctx) {
 		if ev.Err != nil {
-			fatal(ev.Err.Error())
+			bail(ev.Err.Error())
 		}
 	}
 	agentCtx := orch.AgentContext()
@@ -968,7 +976,7 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		preview.N, preview.TotalOutputTokens, preview.EstimatedSeconds)
 	for ev := range orch.Continue(ctx) {
 		if ev.Err != nil {
-			fatal(ev.Err.Error())
+			bail(ev.Err.Error())
 		}
 	}
 	for i, s := range orch.AgentContext().Sketches {
@@ -988,7 +996,7 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 	fmt.Printf("## Implementer (auto, sketch %d)\n\n", pickSketch)
 	for ev := range orch.Implement(ctx, pickSketch) {
 		if ev.Err != nil {
-			fatal(ev.Err.Error())
+			bail(ev.Err.Error())
 		}
 	}
 	if p := orch.Patch(); p != nil {

@@ -149,15 +149,22 @@ func (i *Implementer) Run(ctx context.Context, c *Context, chosen *Sketch) (*Pat
 	// middleware chain returns llm.ErrToolsNotSupported and we fall
 	// through to the legacy picker path below.
 	if toolAware, ok := i.Provider.(llm.ToolAwareProvider); ok {
+		fmt.Fprintln(os.Stderr, "aidev: implementer: attempting native tool use path")
 		patch, err := i.runWithTools(ctx, toolAware, c, chosen)
 		if err == nil {
 			return patch, nil
 		}
 		if !errors.Is(err, llm.ErrToolsNotSupported) {
+			// Real error from the tool-use path (not a capability miss).
+			// Return it; the caller surfaces it and we don't silently
+			// downgrade to legacy. The breadcrumb above lets us
+			// distinguish "model failed inside native tools" from
+			// "model failed inside legacy picker" in the run log.
 			return nil, err
 		}
-		// Inner provider doesn't support tool use — fall through.
+		fmt.Fprintln(os.Stderr, "aidev: implementer: inner provider is not tool-aware, falling back to legacy picker path")
 	}
+	fmt.Fprintln(os.Stderr, "aidev: implementer: using legacy picker + NEED_FILES path")
 
 	// Pre-load files that upstream agents (Scout, Critic, Clarifier,
 	// Architect) have already cited in their output. These paths are
