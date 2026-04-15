@@ -26,9 +26,54 @@ import (
 	"github.com/aisu-ai/aidev/internal/llm"
 )
 
-// Coordinator is the Gate-1 reviewer agent.
+// Coordinator is the cross-agent monitor (v0.5). It runs at five
+// gates across an aidev pipeline run:
+//
+//	Gate 0  — post-Scout       advisory, observes the Scout brief
+//	Gate 1  — post-Critic      advisory, observes the Critic verdict
+//	Gate 2  — post-Architect   advisory, observes the sketch set
+//	Gate 4  — post-Implementer interventional, blocks the patch on
+//	                            CONCERNS and triggers Implementer retry
+//	Gate 5  — post-Reviewer    advisory, observes the Reviewer's verdict
+//
+// (Gate numbers leave room for future Gate 3 = pre-Architect skip
+// decision; not in scope for v0.5.)
+//
+// Gates 0/1/2/5 are advisory: their output goes into a running
+// notes buffer that downstream gates can read AND the headless
+// report surfaces to the user. They never block the run.
+//
+// Gate 4 is the only interventional gate. Its semantics are
+// unchanged from v0.4: CONCERNS triggers a bounded retry loop in
+// orchestrator.Implement, with the bullets fed back to the
+// Implementer as authoritative feedback.
+//
+// The Coordinator's own provider is invoked once per gate, so a
+// full pipeline run with every gate firing is 5 LLM calls on the
+// oversight tier (typically claude-cli). Cost is bounded and
+// predictable: same 5 calls regardless of how complex the
+// underlying issue is.
 type Coordinator struct {
 	Provider llm.Provider
+
+	// Notes is the running observation log written by gates 0,
+	// 1, 2, and 5. Gate 4 reads this list as additional context
+	// when it reviews the Implementer's diff (so e.g. a Scout
+	// note flagging "the i18n directory has 9 locales but the
+	// brief only enumerates 3" can inform the diff review's
+	// scope check). The orchestrator surfaces the notes in the
+	// headless report so the user sees what the monitor caught.
+	Notes []GateNote
+}
+
+// GateNote is one observation from an advisory gate. Severity is
+// one of "info", "warn", "concern" — "concern" is louder and
+// shows up in the headless report's TL;DR; the others are
+// background context.
+type GateNote struct {
+	Gate     string // "post-scout" | "post-critic" | "post-architect" | "post-reviewer"
+	Severity string // "info" | "warn" | "concern"
+	Body     string // markdown, multi-line OK
 }
 
 // NewCoordinator builds a Coordinator from the router's

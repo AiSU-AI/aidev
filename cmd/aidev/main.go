@@ -111,12 +111,20 @@ func main() {
 		runClarifySubcommand()
 		return
 	}
+	// Intercept the `config` subcommand tree (v0.5). Single edit
+	// surface for models.yaml that both humans and Claude Code
+	// sessions can drive — replaces the legacy --preset flag and
+	// per-file preset machinery.
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runConfigSubcommand()
+		return
+	}
 
 	var (
 		issueURL     = flag.String("issue", "", "GitHub issue reference: full URL (https://github.com/owner/repo/issues/N) or a bare number when -repo points at a local clone with a github.com remote")
 		repoPath     = flag.String("repo", ".", "Path to the target repository")
 		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
-		preset       = flag.String("preset", "", "Optional model preset name. Loads models.<name>.yaml from the config directory instead of models.yaml. Shipped presets: 'local' (fully offline via Ollama). Add your own by dropping models.<name>.yaml into the config dir.")
 		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
 		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
 		pickSketch   = flag.Int("sketch", 0, "Headless only: after Architect produces sketches, automatically run the Implementer on this sketch number (1-indexed). 0 disables.")
@@ -131,10 +139,8 @@ func main() {
 		fatal("missing required flag: -issue")
 	}
 
-	cfg := mustLoadConfigPreset(*configDir, *preset)
-	if *preset != "" {
-		fmt.Fprintf(os.Stderr, "aidev: using model preset %q (models.%s.yaml)\n", *preset, *preset)
-	}
+	cfg := mustLoadConfig(*configDir)
+	printStartupBanner(cfg)
 
 	// Precondition audit. In headless mode the doctor never prompts —
 	// it just reports and either fails or passes. In TTY mode we enable
@@ -744,17 +750,11 @@ func runDoctorSubcommand() {
 //
 // The first directory that exists and contains models.yaml wins.
 //
-// Equivalent to mustLoadConfigPreset(dir, ""). Kept as a thin wrapper
-// for the subcommands that don't expose a --preset flag.
+// v0.5: the legacy --preset flag and mustLoadConfigPreset are gone.
+// Profile selection now lives inside models.yaml itself via the
+// active_profile field. Use `aidev config profile use <name>` to
+// switch profiles instead of passing --preset.
 func mustLoadConfig(configDir string) *config.Config {
-	return mustLoadConfigPreset(configDir, "")
-}
-
-// mustLoadConfigPreset is the preset-aware form. When preset is
-// non-empty, config.LoadPreset reads models.<preset>.yaml instead of
-// models.yaml from the resolved directory. Missing preset files are a
-// loud error — we never silently fall back to the default.
-func mustLoadConfigPreset(configDir, preset string) *config.Config {
 	if configDir == "" {
 		configDir = os.Getenv("AIDEV_CONFIG")
 	}
@@ -762,13 +762,9 @@ func mustLoadConfigPreset(configDir, preset string) *config.Config {
 		configDir = discoverConfigDir()
 	}
 
-	cfg, err := config.LoadPreset(configDir, preset)
+	cfg, err := config.Load(configDir)
 	if err != nil {
-		hint := "hint: run `aidev install` to lay down the default config in ~/.config/aidev"
-		if preset != "" {
-			hint = fmt.Sprintf("hint: preset %q needs models.%s.yaml in the config directory — ship it via `aidev install` or drop your own copy there", preset, preset)
-		}
-		fatal(fmt.Sprintf("load config: %v\n  searched: %s\n  %s", err, configDir, hint))
+		fatal(fmt.Sprintf("load config: %v\n  searched: %s\n  hint: run `aidev install` to lay down the default config in ~/.config/aidev", err, configDir))
 	}
 	return cfg
 }
@@ -801,6 +797,51 @@ func discoverConfigDir() string {
 		}
 	}
 	return "config"
+}
+
+// printStartupBanner emits a one-line-per-role summary of the
+// resolved active profile to stderr. Always runs at the top of any
+// pipeline-driving subcommand so the user can see exactly which
+// provider+model is wired to each agent role before the run starts.
+//
+// Critically, this also flags Implementer/Reviewer/Coordinator
+// roles whose tier provider is `claude-cli` with a ⚠ marker,
+// because that provider does NOT support tool use yet and the
+// agent will silently fall back to the legacy NEED_FILES path.
+// The user has been bitten by this enough times that explicit
+// runtime visibility is mandatory.
+func printStartupBanner(cfg *config.Config) {
+	if cfg == nil || cfg.Models.Routing == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "aidev: config=%s/models.yaml profile=%s\n", cfg.ConfigDir, cfg.ActiveProfile)
+	// Stable role order for the banner — alphabetical inside each
+	// group: agents first, then the coordinator overseer last.
+	roleOrder := []string{
+		"scout", "critic", "architect", "charter",
+		"implementer", "reviewer", "tester",
+		"coordinator",
+	}
+	for _, role := range roleOrder {
+		tierName, ok := cfg.Models.Routing[role]
+		if !ok {
+			continue
+		}
+		tier, ok := cfg.Models.Tiers[tierName]
+		if !ok {
+			continue
+		}
+		marker := ""
+		if (role == "implementer" || role == "reviewer") && tier.Provider == "claude-cli" {
+			marker = "    ⚠ legacy NEED_FILES path (no tool use; swap to provider: ollama or anthropic for v0.4 tool use)"
+		}
+		modelDisplay := tier.Model
+		if modelDisplay == "" {
+			modelDisplay = "(default)"
+		}
+		fmt.Fprintf(os.Stderr, "  %-12s → %s:%s%s\n", role, tier.Provider, modelDisplay, marker)
+	}
+	fmt.Fprintln(os.Stderr)
 }
 
 // runHeadless is a CI-friendly mode that produces a single Markdown report

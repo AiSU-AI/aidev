@@ -3,26 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
-
-const modelsYAML = `
-tiers:
-  small:
-    provider: ollama
-    model: foo:7b
-    endpoint: http://localhost:11434
-    max_tokens: 2048
-    temperature: 0.2
-  large:
-    provider: anthropic
-    model: claude-opus-4-6
-    max_tokens: 8192
-    temperature: 0.3
-routing:
-  scout: small
-  critic: large
-`
 
 const principlesYAML = `
 principles:
@@ -31,135 +14,267 @@ principles:
     description: For tests only.
 `
 
-func TestLoad(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(modelsYAML), 0o644); err != nil {
+// modelsYAMLWithTwoProfiles is the v0.5 shape: profiles map +
+// active_profile pointer at the top level. Used by most tests
+// below to verify the new loader produces the expected resolved
+// Config.
+const modelsYAMLWithTwoProfiles = `
+active_profile: default
+
+profiles:
+  default:
+    description: Local test profile.
+    tiers:
+      small:
+        provider: ollama
+        model: foo:7b
+        endpoint: http://localhost:11434
+        max_tokens: 2048
+        temperature: 0.2
+      cloud_large:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+      oversight:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: small
+      tester: small
+      implementer: small
+      reviewer: small
+      critic: cloud_large
+      architect: cloud_large
+      charter: cloud_large
+      coordinator: oversight
+
+  offline:
+    description: Fully offline.
+    tiers:
+      bare:
+        provider: ollama
+        model: bar:14b
+        max_tokens: 4096
+        temperature: 0.1
+    routing:
+      scout: bare
+      critic: bare
+      architect: bare
+      implementer: bare
+      reviewer: bare
+      charter: bare
+      tester: bare
+      coordinator: bare
+`
+
+func writeFiles(t *testing.T, dir, models string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(models), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "principles.yaml"), []byte(principlesYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestLoadResolvesActiveProfile is the baseline: a v0.5 file with
+// an explicit active_profile must produce a Config whose Models
+// reflects that profile's tiers + routing, and Config.ActiveProfile
+// must be set so the startup banner can show it.
+func TestLoadResolvesActiveProfile(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, modelsYAMLWithTwoProfiles)
 
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Models.Tiers) != 2 {
-		t.Errorf("tiers = %d, want 2", len(cfg.Models.Tiers))
+	if cfg.ActiveProfile != "default" {
+		t.Errorf("ActiveProfile = %q, want default", cfg.ActiveProfile)
 	}
-	if cfg.Models.Routing["scout"] != "small" {
-		t.Errorf("scout routing = %q, want small", cfg.Models.Routing["scout"])
+	if cfg.Models.Routing["coordinator"] != "oversight" {
+		t.Errorf("coordinator routing = %q, want oversight", cfg.Models.Routing["coordinator"])
+	}
+	if cfg.Models.Tiers["oversight"].Provider != "claude-cli" {
+		t.Errorf("oversight tier provider = %q", cfg.Models.Tiers["oversight"].Provider)
 	}
 	if len(cfg.Principles.Principles) != 1 {
-		t.Errorf("principles = %d, want 1", len(cfg.Principles.Principles))
+		t.Errorf("principles count = %d, want 1", len(cfg.Principles.Principles))
+	}
+	// RawModelsFile must be populated so config-edit tooling can
+	// round-trip the file without losing the `offline` profile.
+	if cfg.RawModelsFile == nil {
+		t.Fatal("RawModelsFile not populated")
+	}
+	if _, ok := cfg.RawModelsFile.Profiles["offline"]; !ok {
+		t.Errorf("RawModelsFile should retain non-active 'offline' profile for round-tripping")
 	}
 }
 
-func TestLoadRejectsDanglingRouting(t *testing.T) {
+// TestLoadRejectsMissingActiveProfile verifies that a file with
+// profiles but no active_profile field errors loudly. We never
+// silently pick a default — the user has to declare which profile
+// is active.
+func TestLoadRejectsMissingActiveProfile(t *testing.T) {
 	dir := t.TempDir()
-	bad := `
-tiers:
-  small:
-    provider: ollama
-    model: foo
-routing:
-  scout: nonexistent
-`
-	_ = os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(bad), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "principles.yaml"), []byte(principlesYAML), 0o644)
-	if _, err := Load(dir); err == nil {
-		t.Error("expected error for routing to unknown tier")
-	}
-}
-
-// TestLoadPresetReadsAlternateModelsFile verifies that --preset local
-// swaps the models file from models.yaml to models.local.yaml without
-// touching principles.yaml. This is the core guarantee of the preset
-// feature: alternate routing bundles without duplicating principles.
-func TestLoadPresetReadsAlternateModelsFile(t *testing.T) {
-	dir := t.TempDir()
-	// Default file uses a cloud tier; preset file is fully local.
-	_ = os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(modelsYAML), 0o644)
-	localYAML := `
-tiers:
-  small:
-    provider: ollama
-    model: qwen2.5-coder:7b
-    endpoint: http://localhost:11434
-    max_tokens: 2048
-    temperature: 0.2
-routing:
-  scout: small
-  critic: small
-`
-	_ = os.WriteFile(filepath.Join(dir, "models.local.yaml"), []byte(localYAML), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "principles.yaml"), []byte(principlesYAML), 0o644)
-
-	cfg, err := LoadPreset(dir, "local")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Preset != "local" {
-		t.Errorf("cfg.Preset = %q, want local", cfg.Preset)
-	}
-	// The preset routes both scout and critic to small — proof we
-	// read models.local.yaml and not the default.
-	if cfg.Models.Routing["critic"] != "small" {
-		t.Errorf("critic routing = %q, want small (local preset)", cfg.Models.Routing["critic"])
-	}
-	if cfg.Models.Tiers["small"].Model != "qwen2.5-coder:7b" {
-		t.Errorf("small tier model = %q, want qwen2.5-coder:7b", cfg.Models.Tiers["small"].Model)
-	}
-	// Principles are shared across presets; should still load.
-	if len(cfg.Principles.Principles) != 1 {
-		t.Errorf("principles = %d, want 1", len(cfg.Principles.Principles))
-	}
-}
-
-// TestLoadPresetMissingFileIsLoud is the negative case: asking for a
-// preset that doesn't exist must error, not silently fall back to the
-// default. Silent fallback would hide the user's intent and ship the
-// wrong tier routing without warning.
-func TestLoadPresetMissingFileIsLoud(t *testing.T) {
-	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(modelsYAML), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "principles.yaml"), []byte(principlesYAML), 0o644)
-
-	_, err := LoadPreset(dir, "nonexistent")
+	writeFiles(t, dir, `
+profiles:
+  default:
+    tiers:
+      small: {provider: ollama, model: x}
+    routing:
+      scout: small
+`)
+	_, err := Load(dir)
 	if err == nil {
-		t.Fatal("expected error when preset file is missing")
+		t.Fatal("expected error for missing active_profile")
+	}
+	if !strings.Contains(err.Error(), "active_profile") {
+		t.Errorf("error should mention active_profile; got: %v", err)
 	}
 }
 
-// TestLoadPresetRejectsUnsafeNames guards against path-traversal via
-// the preset name. Anything that isn't [A-Za-z0-9_-]+ must be refused
-// before it becomes part of a filename.
-func TestLoadPresetRejectsUnsafeNames(t *testing.T) {
-	cases := []string{"..", "../etc", "foo/bar", "has space", "has.dot", ""}
-	for _, c := range cases {
-		_, err := LoadPreset(t.TempDir(), c)
-		if err == nil {
-			t.Errorf("expected error for unsafe preset name %q", c)
+// TestLoadRejectsActiveProfileNamingNonexistent guards against a
+// typo in active_profile pointing at a profile that doesn't
+// exist. Error must list the available profiles so the user can
+// fix it without opening the file.
+func TestLoadRejectsActiveProfileNamingNonexistent(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, `
+active_profile: typo
+profiles:
+  default:
+    tiers:
+      small: {provider: ollama, model: x}
+    routing:
+      scout: small
+  offline:
+    tiers:
+      bare: {provider: ollama, model: y}
+    routing:
+      scout: bare
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for nonexistent active_profile")
+	}
+	for _, want := range []string{"typo", "default", "offline"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q; got: %v", want, err)
 		}
 	}
 }
 
-// TestLoadWithoutPresetIsUnchanged verifies backwards compatibility:
-// callers that never pass a preset still get the default models.yaml
-// and Config.Preset is empty.
-func TestLoadWithoutPresetIsUnchanged(t *testing.T) {
+// TestLoadRejectsDanglingRouting verifies that a profile's
+// routing referencing an unknown tier is caught at load time.
+// Same guarantee as the v0.4 loader had, just scoped to the
+// active profile.
+func TestLoadRejectsDanglingRouting(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "models.yaml"), []byte(modelsYAML), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "principles.yaml"), []byte(principlesYAML), 0o644)
+	writeFiles(t, dir, `
+active_profile: default
+profiles:
+  default:
+    tiers:
+      small: {provider: ollama, model: x}
+    routing:
+      scout: small
+      critic: nonexistent
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Error("expected error for dangling routing")
+	}
+}
 
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
+// TestLoadRejectsEmptyTierProvider verifies that a tier with no
+// provider field is caught. We don't want a silent
+// "construct provider from empty string" failure deeper in the
+// router.
+func TestLoadRejectsEmptyTierProvider(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, `
+active_profile: default
+profiles:
+  default:
+    tiers:
+      small: {model: x}
+    routing:
+      scout: small
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Error("expected error for tier with empty provider")
 	}
-	if cfg.Preset != "" {
-		t.Errorf("cfg.Preset = %q, want empty for default load", cfg.Preset)
+}
+
+// TestLoadRejectsEmptyProfilesMap is the negative case for an
+// empty file shell.
+func TestLoadRejectsEmptyProfilesMap(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, "active_profile: default\nprofiles: {}\n")
+	_, err := Load(dir)
+	if err == nil {
+		t.Error("expected error for empty profiles map")
 	}
-	if cfg.Models.Routing["critic"] != "large" {
-		t.Errorf("critic routing = %q, want large (default)", cfg.Models.Routing["critic"])
+}
+
+// TestLoadDetectsLegacyV04Format is the migration-aid: a file
+// with top-level tiers + routing (v0.4 shape) instead of profiles
+// must error with a clear message pointing the user at
+// `aidev install --force`. Without this, the user would get a
+// confusing "active_profile field missing" error and have no
+// idea what to do.
+func TestLoadDetectsLegacyV04Format(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, `
+tiers:
+  small:
+    provider: ollama
+    model: foo:7b
+    max_tokens: 2048
+    temperature: 0.2
+  large:
+    provider: claude-cli
+    model: ""
+    max_tokens: 8192
+    temperature: 0.3
+routing:
+  scout: small
+  critic: large
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for legacy v0.4 format")
+	}
+	if !strings.Contains(err.Error(), "legacy v0.4 format") {
+		t.Errorf("error should mention legacy format; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "aidev install --force") {
+		t.Errorf("error should suggest the fix; got: %v", err)
+	}
+}
+
+// TestProfileNamesIsSorted is a tiny guard on the helper used for
+// error messages — sorted output keeps "available profiles: [...]"
+// stable across runs.
+func TestProfileNamesIsSorted(t *testing.T) {
+	in := map[string]Profile{
+		"zzz":     {},
+		"aaa":     {},
+		"default": {},
+	}
+	got := profileNames(in)
+	want := []string{"aaa", "default", "zzz"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v", got, want)
+		}
 	}
 }
