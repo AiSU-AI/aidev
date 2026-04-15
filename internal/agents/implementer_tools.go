@@ -265,13 +265,11 @@ WORKFLOW:
 
 1. Use the tools to discover the code. Typical pattern for a
    refactor or consolidation task:
-     - list_dir the directory the issue body references FIRST, to
-       confirm the real path and see what's actually there. If the
-       issue says "files live under apps/marketing/src/lib/foo/",
-       list_dir apps/marketing/src/lib/foo/ before you glob or grep
-       — a directory that is not what you expect is a signal that
-       the issue's path example may be partial or relative.
-     - glob for candidate files ("apps/marketing/**/*.tsx").
+     - list_dir the directory the issue body or the chosen sketch
+       literally quotes, to confirm the real tree before guessing
+       broader patterns. Use the EXACT path from the issue text,
+       not an adjacent or similar path.
+     - glob for candidate files in that tree.
      - grep for all call sites of the thing you're changing.
      - read_file each file you plan to modify to see exact line
        numbers and surrounding context.
@@ -280,7 +278,15 @@ WORKFLOW:
    You can call multiple tools per turn — batch them when you
    already know what you need.
 
-1a. EMPTY RESULTS ARE NOT A REASON TO GIVE UP. If a glob returns
+1a. NEVER use a placeholder path as if it were real. The paths you
+    invoke MUST come verbatim from the issue body, the Scout brief,
+    the chosen sketch, a previous tool_result, or the output of a
+    successful list_dir / glob. Do not try paths like "src/lib/foo"
+    or "src/components/bar" just to see what's there — a
+    list_dir on the ACTUAL target directory is always the right
+    first move.
+
+1b. EMPTY RESULTS ARE NOT A REASON TO GIVE UP. If a glob returns
     zero files or a grep returns zero matches, that means your
     PATTERN was wrong, not that the task is impossible. Before
     declaring ERROR on an empty result you MUST:
@@ -294,6 +300,14 @@ WORKFLOW:
     failure mode we are explicitly guarding against. The issue body
     and sketch usually contain the exact paths and identifiers you
     need — use them verbatim before trying to infer.
+
+1c. ONCE YOU HAVE LOADED THE TARGET FILES, PRODUCE THE DIFF. If
+    you have already read_file'd the locale / config / TSX files
+    the sketch names, you have enough context. Do not wander into
+    unrelated directories looking for "more context" — emit the
+    diff. The cost of an unnecessary tool call is high; the cost
+    of a slightly-less-informed diff is low because the user will
+    review it anyway.
 
 2. When you have enough context, emit a unified git diff as your
    final assistant message (without any more tool calls). The loop
