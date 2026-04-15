@@ -10,18 +10,22 @@ import (
 )
 
 // TestClaudeCLICompleteHappyPath writes a tiny shell script that mimics
-// the `claude` CLI (reads stdin, echoes a fixture response) and points
-// the provider at it. Verifies the prompt flows through correctly and
-// the response is returned untouched.
+// the `claude` CLI under --output-format json: reads stdin, emits a
+// fixture json envelope with known token counts. Verifies the prompt
+// flows through correctly, the assistant text is extracted from the
+// envelope's `result` field, and the token counts in `usage` are
+// surfaced on Response.Usage.
 func TestClaudeCLICompleteHappyPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script fixtures don't run on windows")
 	}
 	fakeBin := writeFakeClaudeBin(t, `#!/bin/sh
-# Read stdin, capture the last line as the "user prompt", and emit a
-# deterministic response so the test can assert on it.
+# Read stdin, capture it for later assertion, and emit a json envelope
+# shaped like real claude --print --output-format json output.
 cat > /tmp/aidev-claude-cli-test-stdin
-echo "FAKE RESPONSE FROM CLAUDE CLI"
+cat <<'JSON'
+{"type":"result","subtype":"success","is_error":false,"result":"FAKE RESPONSE FROM CLAUDE CLI","usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":0}}
+JSON
 `)
 
 	p := NewClaudeCLI("", 1024, 0.1)
@@ -39,8 +43,11 @@ echo "FAKE RESPONSE FROM CLAUDE CLI"
 	if resp.Content != "FAKE RESPONSE FROM CLAUDE CLI" {
 		t.Errorf("content = %q, want FAKE RESPONSE FROM CLAUDE CLI", resp.Content)
 	}
-	if resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 {
-		t.Errorf("token counts should be zero for claude-cli, got %+v", resp.Usage)
+	if resp.Usage.InputTokens != 1234 {
+		t.Errorf("InputTokens = %d, want 1234", resp.Usage.InputTokens)
+	}
+	if resp.Usage.OutputTokens != 567 {
+		t.Errorf("OutputTokens = %d, want 567", resp.Usage.OutputTokens)
 	}
 
 	// The fake binary captured stdin to a file; verify the prompt made
@@ -51,6 +58,36 @@ echo "FAKE RESPONSE FROM CLAUDE CLI"
 			t.Errorf("stdin to fake claude did not contain prompt: %q", stdinData)
 		}
 		_ = os.Remove("/tmp/aidev-claude-cli-test-stdin")
+	}
+}
+
+// TestClaudeCLICompleteMalformedEnvelopeFallsBack verifies the graceful
+// fallback when the CLI emits something that is not a valid json
+// envelope (e.g. an older CLI version, or garbled output). The provider
+// should NOT error — it should surface the raw stdout as Content and
+// leave Usage zero, so Complete() keeps working even if token parsing
+// breaks.
+func TestClaudeCLICompleteMalformedEnvelopeFallsBack(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixtures don't run on windows")
+	}
+	fakeBin := writeFakeClaudeBin(t, `#!/bin/sh
+# Emit something that is definitely not a json envelope.
+echo "this is not json, just plain text"
+`)
+	p := NewClaudeCLI("", 1024, 0.1)
+	p.SetBin(fakeBin)
+	resp, err := p.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete returned err on malformed envelope: %v", err)
+	}
+	if !strings.Contains(resp.Content, "this is not json") {
+		t.Errorf("fallback content = %q, want raw stdout", resp.Content)
+	}
+	if resp.Usage.InputTokens != 0 || resp.Usage.OutputTokens != 0 {
+		t.Errorf("malformed envelope should leave Usage zero, got %+v", resp.Usage)
 	}
 }
 

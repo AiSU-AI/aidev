@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -21,7 +22,7 @@ import (
 // The provider invokes `claude` with these flags:
 //
 //	--print                  one-shot, print response to stdout, exit
-//	--output-format text     plain text (no JSON envelope)
+//	--output-format json     single JSON envelope with result + usage
 //	--model <name>           optional, forwarded from config when set
 //	--append-system-prompt   the system prompt (if Request.System != "")
 //
@@ -29,15 +30,35 @@ import (
 // for long prompts (the Architect and Implementer can easily hit 20 KB
 // of user content).
 //
+// Output format rationale. The CLI supports three formats:
+//
+//   - text       — plain assistant text, no metadata. Simple but drops
+//     token counts, which breaks per-gate cost visibility in the
+//     headless telemetry table.
+//   - json       — a single envelope printed after the turn completes,
+//     containing `result` (assistant text) and `usage` (input/output
+//     token counts). Single-shot, trivial to parse. This is what we use.
+//   - stream-json — newline-delimited events (message_start, content
+//     deltas, message_stop…). Required if we ever want incremental
+//     chunks for a Streamer implementation, but overkill for the
+//     one-shot Complete() path because we already block until the
+//     subprocess exits.
+//
+// ClaudeCLI implements only Complete() — there is no Stream() method —
+// so the stream-json complexity is not warranted here. If a streaming
+// path is added later, revisit this tradeoff for that code path alone;
+// the Complete() path should stay on single-envelope json.
+//
 // Working directory: the command runs from os.TempDir() in a fresh
 // ad-hoc subdirectory so the CLI does NOT inherit CLAUDE.md from
 // aidev's own checkout (or from wherever aidev happened to be invoked).
 // Without this isolation the Critic would silently read aidev's own
 // standards file and get confused about which project it's evaluating.
 //
-// Token counts are not exposed by the CLI, so Usage fields are always
-// zero. Callers that need token accounting should use the native
-// anthropic provider instead.
+// Token counts are parsed from the json envelope's `usage` block and
+// surfaced via Response.Usage so telemetry (cost per gate) works for
+// claude-cli gates (Critic, Architect, Coordinator, Reviewer) just as
+// it does for the native anthropic and ollama providers.
 type ClaudeCLI struct {
 	// bin is the CLI binary to exec. Resolved via exec.LookPath("claude")
 	// at construction time so a missing binary fails loudly at startup
@@ -109,7 +130,7 @@ func (c *ClaudeCLI) Complete(ctx context.Context, r Request) (Response, error) {
 		return Response{}, errors.New("claude-cli: empty user prompt")
 	}
 
-	args := []string{"--print", "--output-format", "text"}
+	args := []string{"--print", "--output-format", "json"}
 	if c.model != "" {
 		args = append(args, "--model", c.model)
 	}
@@ -151,14 +172,52 @@ func (c *ClaudeCLI) Complete(ctx context.Context, r Request) (Response, error) {
 		return Response{}, fmt.Errorf("claude-cli: %w (stderr: %s)", err, strings.TrimSpace(msg))
 	}
 
-	content := strings.TrimSpace(stdout.String())
-	if content == "" {
+	raw := strings.TrimSpace(stdout.String())
+	if raw == "" {
 		return Response{}, errors.New("claude-cli: empty response")
 	}
+
+	// Parse the single-envelope json emitted by --output-format json.
+	// Shape (only fields we care about):
+	//
+	//	{
+	//	  "type": "result",
+	//	  "result": "<assistant text>",
+	//	  "usage": {
+	//	    "input_tokens": 1234,
+	//	    "output_tokens": 567,
+	//	    ...
+	//	  },
+	//	  ...
+	//	}
+	//
+	// Failure mode: if the envelope is malformed or missing `result`, we
+	// fall back to the raw stdout as Content and leave Usage zero. This
+	// preserves backwards compatibility with any CLI version that might
+	// not emit the envelope exactly as expected, and keeps Complete()
+	// from failing just because a parse hiccup occurred after the CLI
+	// already returned successfully.
+	var env struct {
+		Result string `json:"result"`
+		Usage  struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Result == "" {
+		return Response{
+			Content: raw,
+			Model:   c.model,
+			Usage:   Usage{},
+		}, nil
+	}
 	return Response{
-		Content: content,
+		Content: strings.TrimSpace(env.Result),
 		Model:   c.model,
-		Usage:   Usage{}, // CLI does not expose token counts in --print mode
+		Usage: Usage{
+			InputTokens:  env.Usage.InputTokens,
+			OutputTokens: env.Usage.OutputTokens,
+		},
 	}, nil
 }
 
