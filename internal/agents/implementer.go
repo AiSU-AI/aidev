@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/aisu-ai/aidev/internal/llm"
 )
@@ -892,7 +891,14 @@ func (p *Patch) WriteTo(repoRoot string) (string, error) {
 		return "", fmt.Errorf("implementer: mkdir: %w", err)
 	}
 	path := filepath.Join(dir, "proposed.patch")
-	body := p.Diff + "\n\n# Written by aidev at " + time.Now().UTC().Format(time.RFC3339) + "\n"
+	// Just the diff body. No footer comment — git apply parses
+	// the whole file strictly and rejects any content after the
+	// last hunk ("# Written by aidev at ..." breaks --check and
+	// --recount). The file's mtime captures when aidev wrote it.
+	body := p.Diff
+	if body == "" || body[len(body)-1] != '\n' {
+		body += "\n"
+	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		return "", fmt.Errorf("implementer: write: %w", err)
 	}

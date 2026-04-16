@@ -113,8 +113,14 @@ func TestPatchWriteToCreatesAidevDirAndFile(t *testing.T) {
 	if !strings.Contains(string(data), "diff --git") {
 		t.Error("patch file missing diff")
 	}
-	if !strings.Contains(string(data), "Written by aidev") {
-		t.Error("patch file missing footer stamp")
+	// Historical note: WriteTo used to append a "# Written by
+	// aidev at <timestamp>" footer, but that broke `git apply
+	// --check` because git rejects trailing content after the
+	// last hunk. The footer was dropped — mtime captures write
+	// time. Explicitly assert the footer is GONE so a future
+	// revert of the fix trips this test.
+	if strings.Contains(string(data), "Written by aidev") {
+		t.Error("patch file unexpectedly contains the footer stamp (breaks git apply)")
 	}
 }
 
