@@ -167,7 +167,10 @@ func extractRecommendation(md string) string {
 		line := strings.TrimSpace(raw)
 		// Strip surrounding markdown emphasis so `**RECOMMENDATION: build**`
 		// and `_RECOMMENDATION: build_` parse the same as plain text.
-		line = strings.Trim(line, "*_")
+		// Also strip leading `#` so `## RECOMMENDATION: build` (heading
+		// style) matches — the Critic occasionally formats the verdict
+		// as a heading instead of a bare line.
+		line = strings.Trim(line, "*_#")
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(strings.ToUpper(line), "RECOMMENDATION:") {
 			continue

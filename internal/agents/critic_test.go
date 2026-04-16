@@ -41,6 +41,8 @@ func TestExtractRecommendation(t *testing.T) {
 		{"plain verdict with trailing unclear hedge", "body\nRECOMMENDATION: build\n\nnotes\n\nRECOMMENDATION: unclear\n", "build"},
 		{"italic emphasis", "body\n_RECOMMENDATION: kill_\n", "kill"},
 		{"half-bold value", "body\nRECOMMENDATION: defer**\n", "defer"},
+		{"heading-style verdict", "body\n\n## RECOMMENDATION: build\n\nrationale\n\nRECOMMENDATION: unclear\n", "build"},
+		{"h3 heading style", "body\n### RECOMMENDATION: kill\n", "kill"},
 	}
 	for _, c := range cases {
 		got := extractRecommendation(c.in)
