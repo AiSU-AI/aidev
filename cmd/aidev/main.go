@@ -155,7 +155,6 @@ func main() {
 		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
 		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
 		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
-		pickSketch   = flag.Int("sketch", 0, "Headless only: after Architect produces sketches, automatically run the Implementer on this sketch number (1-indexed). 0 disables.")
 		autoRun      = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
 		forceVerdict = flag.String("force-verdict", "", "Headless only: ESCAPE HATCH. After running Scout+Critic (and any interview rounds), override the Critic's verdict with this value: build|defer|kill. Use ONLY when you have answered the Critic's questions and the Critic is still hedging. Always logged loudly so you can see when the override fired.")
 		skipDoctor   = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
@@ -244,7 +243,7 @@ func main() {
 		default:
 			fatal(fmt.Sprintf("invalid -force-verdict %q (must be build, defer, or kill)", *forceVerdict))
 		}
-		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *pickSketch, *forceVerdict)
+		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *forceVerdict)
 		return
 	}
 
@@ -886,9 +885,11 @@ func printStartupBanner(cfg *config.Config) {
 
 // runHeadless is a CI-friendly mode that produces a single Markdown report
 // on stdout. With -auto, it also runs the Architect when the Critic
-// recommends "build", so a CI pipeline can get the sketches in one pass.
-// With -sketch N, it additionally runs the Implementer against the chosen
-// sketch and prints the resulting patch.
+// recommends "build", so a CI pipeline gets sketches in one pass. The
+// pipeline STOPS after sketches — aidev is the decision layer, not the
+// implementation layer. Implementation is handed off to Claude Code (or
+// any other agent) by reading the sketches from the report or from the
+// `.aidev/architect-output.md` file that runHeadless writes at the end.
 //
 // When the Critic returns "unclear" or "defer" AND stdin is a TTY,
 // runHeadless launches an in-line Clarifier interview instead of
@@ -903,7 +904,7 @@ func printStartupBanner(cfg *config.Config) {
 // When non-empty it overrides the Critic's recommendation AFTER the
 // normal pipeline (and any interview rounds) have run, and the
 // override is logged loudly so the user always sees it fired.
-func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, pickSketch int, forceVerdict string) {
+func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, forceVerdict string) {
 	// Emit a per-gate telemetry table at the end of every run. defer
 	// covers normal returns; bail() below handles the fatal-exit path
 	// (os.Exit bypasses defers, so we render just before exiting).
@@ -982,7 +983,8 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 			bail(ev.Err.Error())
 		}
 	}
-	for i, s := range orch.AgentContext().Sketches {
+	sketches := orch.AgentContext().Sketches
+	for i, s := range sketches {
 		if i > 0 {
 			fmt.Println()
 			fmt.Println("---")
@@ -991,25 +993,60 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		fmt.Println(s.Markdown)
 	}
 
-	// Implementer opt-in.
-	if pickSketch <= 0 {
-		return
-	}
-	fmt.Println()
-	fmt.Printf("## Implementer (auto, sketch %d)\n\n", pickSketch)
-	for ev := range orch.Implement(ctx, pickSketch) {
-		if ev.Err != nil {
-			bail(ev.Err.Error())
+	// Write the sketches + full context to .aidev/architect-output.md
+	// so Claude Code (or any downstream agent) can read them without
+	// parsing the headless report. This is the handoff point: aidev is
+	// the decision layer, Claude Code is the implementation layer.
+	if agentCtx.Snapshot != nil && len(sketches) > 0 {
+		if outPath, err := writeArchitectOutput(agentCtx, sketches, absRepo); err != nil {
+			fmt.Fprintf(os.Stderr, "aidev: write architect output: %v\n", err)
+		} else {
+			fmt.Println()
+			fmt.Printf("_Architect output written to %s — hand off to Claude Code for implementation._\n", outPath)
 		}
 	}
-	if p := orch.Patch(); p != nil {
-		fmt.Println("```diff")
-		fmt.Println(p.Diff)
-		fmt.Println("```")
-		if p.Path != "" {
-			fmt.Printf("\n_Patch also written to %s_\n", p.Path)
-		}
+}
+
+// writeArchitectOutput writes the Architect's sketches + contextual
+// summary to .aidev/architect-output.md in the target repo. This is
+// the handoff artifact: a downstream agent (Claude Code, a CI step,
+// or a human) reads this file to know WHAT was decided and WHY, then
+// implements it. The format is a self-contained Markdown doc that
+// carries enough context to be actionable without re-running the
+// pipeline.
+func writeArchitectOutput(c *agents.Context, sketches []agents.Sketch, repoRoot string) (string, error) {
+	dir := filepath.Join(repoRoot, ".aidev")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
+	outPath := filepath.Join(dir, "architect-output.md")
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# aidev Architect Output\n\n")
+	if c.Issue != nil {
+		fmt.Fprintf(&b, "**Issue:** %s/%s#%d — %s\n\n", c.Issue.Owner, c.Issue.Repo, c.Issue.Number, c.Issue.Title)
+	}
+	b.WriteString("## Scout Brief\n\n")
+	b.WriteString(c.ScoutReport)
+	b.WriteString("\n\n## Critic Report\n\n")
+	b.WriteString(c.CriticReport)
+	b.WriteString("\n\n---\n\n")
+
+	for i, s := range sketches {
+		if i > 0 {
+			b.WriteString("\n---\n\n")
+		}
+		b.WriteString(s.Markdown)
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n---\n\n")
+	b.WriteString("_To implement: pick a sketch number and run Claude Code against this repo with the sketch context above._\n")
+
+	if err := os.WriteFile(outPath, []byte(b.String()), 0o644); err != nil {
+		return "", err
+	}
+	return outPath, nil
 }
 
 // renderTelemetry prints the per-gate token / latency summary table at
