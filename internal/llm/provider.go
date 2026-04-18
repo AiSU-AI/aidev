@@ -56,6 +56,13 @@ const (
 	// fabrication and invalid-syntax failures is a judgment task — the
 	// same reason the Critic and Architect run there.
 	RoleCoordinator Role = "coordinator"
+	// RoleSelector is the autonomous picker that runs after the
+	// Architect produces N sketches: it scores each sketch against a
+	// rubric and (on tie-break) consults the cloud tier for a
+	// rationale-backed pick. Falls back to RoleArchitect's tier when
+	// not explicitly routed, since Selector is a judgment task that
+	// wants the same model the Architect already trusts.
+	RoleSelector Role = "selector"
 )
 
 // Message is a single turn in a conversation. Role is "user" or "assistant".

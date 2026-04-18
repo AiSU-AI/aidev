@@ -300,17 +300,19 @@ func BatchByDependencies(g *QuestionGraph) [][]Question {
 }
 
 // WriteClarifierMarkdown serialises a Clarifier session (graph + the
-// answers the user gave) as markdown to `<repoRoot>/.aidev/clarifier.md`.
-// The Architect picks this file up on the next run the same way it
-// picks up the charter.
-func WriteClarifierMarkdown(repoRoot string, g *QuestionGraph, answers []Answer) (string, error) {
-	if repoRoot == "" {
-		return "", errors.New("clarifier: empty repo root")
+// answers the user gave) as markdown to `<dir>/clarifier.md`. dir is
+// the directory the file lands in directly (NO ".aidev" subdirectory
+// is created — callers pass the runDir from internal/runpath which
+// already ends in the per-issue artifact location). The Critic picks
+// this file up on the next run via repo.Scan + the orchestrator's
+// runDir override.
+func WriteClarifierMarkdown(dir string, g *QuestionGraph, answers []Answer) (string, error) {
+	if dir == "" {
+		return "", errors.New("clarifier: empty target directory")
 	}
 	if g == nil {
 		return "", errors.New("clarifier: nil graph")
 	}
-	dir := filepath.Join(repoRoot, ".aidev")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("clarifier: mkdir: %w", err)
 	}

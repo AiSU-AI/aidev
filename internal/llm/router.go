@@ -108,6 +108,16 @@ func (r *Router) For(role Role) (Provider, error) {
 				ok = true
 			}
 		}
+		if role == RoleSelector {
+			// Same fallback rationale as Coordinator: Selector is
+			// a judgment task that wants Architect's tier when not
+			// explicitly routed. Keeps existing models.yaml configs
+			// working without a migration.
+			if fallback, haveArch := r.routing[string(RoleArchitect)]; haveArch {
+				tier = fallback
+				ok = true
+			}
+		}
 		if !ok {
 			return nil, fmt.Errorf("router: no tier configured for role %q", role)
 		}

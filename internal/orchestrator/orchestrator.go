@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aisu-ai/aidev/internal/agents"
@@ -33,6 +34,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/github"
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/repo"
+	"github.com/aisu-ai/aidev/internal/runpath"
 )
 
 // State is the orchestrator's finite state. Every transition moves from one
@@ -45,6 +47,7 @@ const (
 	StateCritiquing    State = "critiquing"
 	StateAwaitUser     State = "await_user"
 	StateArchitecting  State = "architecting"
+	StateSelecting     State = "selecting"
 	StateSketchesReady State = "sketches_ready"
 	StateImplementing  State = "implementing"
 	StatePatchReady    State = "patch_ready"
@@ -79,6 +82,7 @@ type Orchestrator struct {
 	scout       *agents.Scout
 	critic      *agents.Critic
 	architect   *agents.Architect
+	selector    *agents.Selector
 	implementer *agents.Implementer
 	coordinator *agents.Coordinator
 	tester      *agents.Tester
@@ -102,6 +106,14 @@ type Orchestrator struct {
 	// reporterLog is where reporter errors are logged when the reporter
 	// itself returns an error from OnEvent. Defaults to os.Stderr.
 	reporterLog io.Writer
+
+	// runDir is the per-issue artifact directory aidev writes generated
+	// outputs into (clarifier.md, architect-output.md, followups.md,
+	// proposed.patch). Computed in LoadIssue from the issue identifier.
+	// Empty string means LoadIssue has not run yet — callers that need
+	// runDir should call RunDir() which surfaces a clear error in that
+	// case rather than silently writing to a wrong path.
+	runDir string
 }
 
 // Option configures the orchestrator at construction time.
@@ -190,6 +202,21 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Selector — autonomous sketch picker (P0). Construction is
+	// best-effort: if the rubric or router routing fails, we log and
+	// continue without a Selector. The orchestrator's Continue()
+	// handles a nil selector by falling through to manual pick.
+	rubric, rerr := agents.LoadDefaultRubric()
+	var selector *agents.Selector
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "aidev: load default rubric: %v (selector disabled)\n", rerr)
+	} else {
+		selector, err = agents.NewSelector(router, rubric)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "aidev: build selector: %v (autonomous sketch pick disabled)\n", err)
+			selector = nil
+		}
+	}
 	implementer, err := agents.NewImplementer(router)
 	if err != nil {
 		return nil, err
@@ -209,6 +236,7 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	o.scout = scout
 	o.critic = critic
 	o.architect = architect
+	o.selector = selector
 	o.implementer = implementer
 	o.coordinator = coordinator
 	o.tester = tester
@@ -244,10 +272,18 @@ func (o *Orchestrator) ReviewPatch(ctx context.Context, patch string) <-chan Eve
 		}
 		o.review = rev
 
-		// Best-effort follow-up persistence.
-		if o.ctx.Snapshot != nil && len(rev.FollowUps) > 0 {
-			if _, werr := rev.WriteFollowUps(o.ctx.Snapshot.Root); werr != nil {
-				fmt.Fprintf(o.reporterLog, "aidev reviewer: write followups: %v\n", werr)
+		// Best-effort follow-up persistence. Prefer runDir (P1
+		// relocation); fall back to <repo>/.aidev/ when runDir is
+		// empty (LoadIssue not run, or runpath resolution failed).
+		if len(rev.FollowUps) > 0 {
+			dir := o.runDir
+			if dir == "" && o.ctx.Snapshot != nil {
+				dir = filepath.Join(o.ctx.Snapshot.Root, ".aidev")
+			}
+			if dir != "" {
+				if _, werr := rev.WriteFollowUps(dir); werr != nil {
+					fmt.Fprintf(o.reporterLog, "aidev reviewer: write followups: %v\n", werr)
+				}
 			}
 		}
 
@@ -498,7 +534,10 @@ func (o *Orchestrator) CostPreview() agents.CostEstimate {
 }
 
 // LoadIssue pulls the issue identified by URL and seeds the agent context
-// with it. Must be called before Run.
+// with it. Must be called before Run. Also computes the per-issue runDir
+// (artifact directory under $XDG_DATA_HOME/aidev/runs/) so downstream
+// gates can write generated artifacts there instead of polluting the
+// target repo's working tree.
 func (o *Orchestrator) LoadIssue(ctx context.Context, url string) error {
 	owner, repoName, num, err := github.ParseURL(url)
 	if err != nil {
@@ -509,17 +548,50 @@ func (o *Orchestrator) LoadIssue(ctx context.Context, url string) error {
 		return err
 	}
 	o.ctx.Issue = issue
+
+	// Compute runDir now so it's available to every subsequent gate.
+	// Failure here is non-fatal — without runDir, callers fall back to
+	// writing in the repo (legacy behaviour). Log the error so the
+	// degradation is visible.
+	dir, derr := runpath.RunDir(issue.Owner, issue.Repo, issue.Number)
+	if derr != nil {
+		fmt.Fprintf(o.reporterLog, "aidev: runpath: %v (artifacts will fall back to <repo>/.aidev/)\n", derr)
+	} else {
+		o.runDir = dir
+	}
 	return nil
 }
 
+// RunDir returns the per-issue artifact directory computed by LoadIssue.
+// Empty string means LoadIssue has not run yet OR runpath resolution
+// failed (in which case the legacy <repo>/.aidev/ path is used as a
+// fallback). Callers that strictly need runDir should check for empty
+// and decide what to do.
+func (o *Orchestrator) RunDir() string { return o.runDir }
+
 // LoadRepo scans a target directory and seeds the agent context with the
 // snapshot plus any repo-local principles, merged on top of the global set.
+//
+// If LoadIssue ran first AND a clarifier file exists in the per-issue
+// runDir (`<runDir>/clarifier.md`), that clarifier overrides the
+// in-repo `<repo>/.aidev/clarifier.md` that repo.Scan would otherwise
+// surface. This is the migration path for P1 artifact relocation:
+// new clarifier sessions land in runDir, old ones (left in <repo>/.aidev/)
+// still get honoured as a fallback when no runDir version exists.
 func (o *Orchestrator) LoadRepo(root string) error {
 	snap, err := repo.Scan(root)
 	if err != nil {
 		return err
 	}
 	o.ctx.Snapshot = snap
+
+	if o.runDir != "" {
+		runClarifier := filepath.Join(o.runDir, "clarifier.md")
+		if data, err := os.ReadFile(runClarifier); err == nil {
+			snap.ClarifierPath = runClarifier
+			snap.ClarifierContent = string(data)
+		}
+	}
 
 	// Start with the global principles, then merge in any repo-local ones.
 	principles := make([]agents.Principle, 0, len(o.cfg.Principles.Principles))
@@ -751,6 +823,36 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 		o.runAdvisoryGate(ctx, out, "post-architect", func(ctx context.Context) ([]agents.GateNote, error) {
 			return o.coordinator.ObserveArchitectSketches(ctx, o.ctx)
 		})
+
+		// Selector gate (P0): autonomous sketch pick. The Selector
+		// is optional — when nil (e.g. older orchestrator
+		// constructions, tests that don't wire it), the pipeline
+		// stops at sketches_ready and a human picks. When present,
+		// it scores and picks before sketches_ready, leaving the
+		// chosen sketch in o.ctx.Selector.ChosenNumber.
+		if o.selector != nil {
+			o.state = StateSelecting
+			o.emit(ctx, out, Event{
+				State:   o.state,
+				Message: fmt.Sprintf("Selector scoring %d sketches against rubric...", len(sketches)),
+			})
+			verdict, serr := o.selector.Run(llm.WithGate(ctx, "selector"), o.ctx)
+			if serr != nil {
+				// Selector failure is non-fatal: log and keep going
+				// to sketches_ready so the user can pick manually.
+				fmt.Fprintf(o.reporterLog, "aidev selector: %v (falling back to manual sketch pick)\n", serr)
+			} else {
+				o.ctx.Selector = verdict
+				msg := fmt.Sprintf("Selector chose Sketch %d (score %.2f)", verdict.ChosenNumber, verdict.Score)
+				if verdict.ChosenNumber == 0 {
+					msg = "Selector found no implementable sketch — needs refinement"
+				}
+				if verdict.TieBreakerUsed {
+					msg += " (tie-breaker invoked)"
+				}
+				o.emit(ctx, out, Event{State: o.state, Message: msg})
+			}
+		}
 
 		o.state = StateSketchesReady
 		o.emit(ctx, out, Event{

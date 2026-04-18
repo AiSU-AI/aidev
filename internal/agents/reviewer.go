@@ -139,16 +139,20 @@ func (r *Reviewer) Run(ctx context.Context, c *Context, patch string) (*Review, 
 }
 
 // WriteFollowUps persists the proposed follow-ups to
-// `<repoRoot>/.aidev/followups.md`. Idempotent per run — overwrites any
+// `<dir>/followups.md`. dir is the artifact directory the file lands
+// in directly (NO ".aidev" subdirectory is created — callers pass the
+// runDir from internal/runpath). Idempotent per run — overwrites any
 // existing file. Returns the path written.
-func (r *Review) WriteFollowUps(repoRoot string) (string, error) {
+func (r *Review) WriteFollowUps(dir string) (string, error) {
 	if r == nil {
 		return "", errors.New("reviewer: nil review")
 	}
 	if len(r.FollowUps) == 0 {
 		return "", nil
 	}
-	dir := filepath.Join(repoRoot, ".aidev")
+	if dir == "" {
+		return "", errors.New("reviewer: empty target directory")
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("reviewer: mkdir: %w", err)
 	}

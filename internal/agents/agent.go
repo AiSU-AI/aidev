@@ -29,9 +29,10 @@ type Context struct {
 	Issue        *github.Issue
 	Snapshot     *repo.Snapshot
 	Principles   []Principle
-	ScoutReport  string   // filled in after Scout runs
-	CriticReport string   // filled in after Critic runs
-	Sketches     []Sketch // filled in after Architect runs
+	ScoutReport  string           // filled in after Scout runs
+	CriticReport string           // filled in after Critic runs
+	Sketches     []Sketch         // filled in after Architect runs
+	Selector     *SelectorVerdict // filled in after Selector runs
 
 	// ClarifierNotes holds a compact markdown rendering of a Clarifier
 	// session (the Critic's sharp questions plus the human's answers)

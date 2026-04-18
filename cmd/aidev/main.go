@@ -346,11 +346,26 @@ func runClarifySubcommand() {
 		fmt.Fprintln(os.Stderr)
 	}
 
-	path, err := agents.WriteClarifierMarkdown(absRepo, graph, answers)
+	path, err := agents.WriteClarifierMarkdown(clarifierWriteDir(orch, absRepo), graph, answers)
 	if err != nil {
 		fatal(fmt.Sprintf("write clarifier: %v", err))
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
+}
+
+// clarifierWriteDir returns the directory the next clarifier session
+// should land in. Prefers the per-issue runDir from the orchestrator
+// (P1 artifact relocation — keeps the target repo tidy). Falls back to
+// `<absRepo>/.aidev/` when LoadIssue hasn't run or runpath resolution
+// failed, so the standalone `aidev clarify` subcommand keeps working
+// even on a corrupt or unreachable XDG_DATA_HOME.
+func clarifierWriteDir(orch *orchestrator.Orchestrator, absRepo string) string {
+	if orch != nil {
+		if dir := orch.RunDir(); dir != "" {
+			return dir
+		}
+	}
+	return filepath.Join(absRepo, ".aidev")
 }
 
 // runFollowUpsSubcommand handles `aidev followups`. With --file-issues,
@@ -993,12 +1008,18 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		fmt.Println(s.Markdown)
 	}
 
-	// Write the sketches + full context to .aidev/architect-output.md
-	// so Claude Code (or any downstream agent) can read them without
-	// parsing the headless report. This is the handoff point: aidev is
-	// the decision layer, Claude Code is the implementation layer.
+	// Write the sketches + full context to architect-output.md so Claude
+	// Code (or any downstream agent) can read them without parsing the
+	// headless report. This is the handoff point: aidev is the decision
+	// layer, Claude Code is the implementation layer. Prefer the runDir
+	// (P1 artifact relocation, out of the target repo); fall back to
+	// `<repo>/.aidev/` if runDir resolution failed.
 	if agentCtx.Snapshot != nil && len(sketches) > 0 {
-		if outPath, err := writeArchitectOutput(agentCtx, sketches, absRepo); err != nil {
+		dir := orch.RunDir()
+		if dir == "" {
+			dir = filepath.Join(absRepo, ".aidev")
+		}
+		if outPath, err := writeArchitectOutput(agentCtx, sketches, dir); err != nil {
 			fmt.Fprintf(os.Stderr, "aidev: write architect output: %v\n", err)
 		} else {
 			fmt.Println()
@@ -1008,14 +1029,14 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 }
 
 // writeArchitectOutput writes the Architect's sketches + contextual
-// summary to .aidev/architect-output.md in the target repo. This is
-// the handoff artifact: a downstream agent (Claude Code, a CI step,
-// or a human) reads this file to know WHAT was decided and WHY, then
-// implements it. The format is a self-contained Markdown doc that
-// carries enough context to be actionable without re-running the
-// pipeline.
-func writeArchitectOutput(c *agents.Context, sketches []agents.Sketch, repoRoot string) (string, error) {
-	dir := filepath.Join(repoRoot, ".aidev")
+// summary to `<dir>/architect-output.md`. dir is the target directory
+// (the orchestrator's runDir under $XDG_DATA_HOME/aidev/runs/<id>/, or
+// `<repo>/.aidev/` as a legacy fallback). This is the handoff artifact:
+// a downstream agent (Claude Code, a CI step, or a human) reads this
+// file to know WHAT was decided and WHY, then implements it. Format is
+// a self-contained Markdown doc that carries enough context to be
+// actionable without re-running the pipeline.
+func writeArchitectOutput(c *agents.Context, sketches []agents.Sketch, dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -1184,7 +1205,7 @@ func runInterviewLoop(
 			fmt.Fprintln(os.Stderr)
 		}
 
-		path, err := agents.WriteClarifierMarkdown(absRepo, graph, answers)
+		path, err := agents.WriteClarifierMarkdown(clarifierWriteDir(orch, absRepo), graph, answers)
 		if err != nil {
 			fatal(fmt.Sprintf("write clarifier: %v", err))
 		}
