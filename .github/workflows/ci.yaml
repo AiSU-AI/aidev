@@ -1,0 +1,52 @@
+# ci.yaml — run build + vet + test on every push and PR against main.
+#
+# Trigger: push to main, pull_request into main. Merge-queue events are
+# intentionally excluded until we actually use a merge queue.
+#
+# Why this exists as a separate workflow from release.yaml:
+#   - release.yaml triggers only on `v*` tag pushes, so it never runs
+#     for PRs or daily commits and cannot be required by branch
+#     protection as a merge gate.
+#   - This workflow exposes a `build-test` check that branch protection
+#     can require on main, closing the loop so red PRs are
+#     unmergeable without admin bypass.
+#
+# Go version is read from go.mod via `go-version-file` so toolchain
+# bumps stay in sync automatically.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go build ./...
+        run: go build ./...
+
+      - name: go vet ./...
+        run: go vet ./...
+
+      - name: go test ./... (race)
+        run: go test -race -timeout 5m ./...
