@@ -118,6 +118,18 @@ func (r *Router) For(role Role) (Provider, error) {
 				ok = true
 			}
 		}
+		if role == RoleTriage {
+			// Triage runs the meta-judgment in the autonomous review
+			// loop (P6). It must inherit Critic-tier quality because
+			// rebuttals must be grounded in literal Sketch citations
+			// and security-finding judgments must be conservative.
+			// Falls back to Critic's tier when not explicitly routed
+			// so existing models.yaml configs keep working.
+			if fallback, haveCritic := r.routing[string(RoleCritic)]; haveCritic {
+				tier = fallback
+				ok = true
+			}
+		}
 		if !ok {
 			return nil, fmt.Errorf("router: no tier configured for role %q", role)
 		}

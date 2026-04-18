@@ -373,6 +373,238 @@ STEP 11 — Post the PR URL back to the original GH issue:
     EOF
     )"
 
+STEP 12 — Auto-review loop init (P6). Mark the PR as draft so the
+review loop has room to iterate without inviting human reviewers
+prematurely:
+
+    gh pr ready <PRNUM> --undo --repo <owner>/<repo>
+
+Resolve loop config from `<PATH>/.aidev/aidev.yaml` (or use defaults):
+  - `review.max_rounds` (default 3)
+  - `review.wait_for_ci` (default true)
+  - `review.ci_timeout_minutes` (default 30)
+  - `review.protected_paths` (default: `**/migrations/**`, `*.sql`,
+    `**/.github/workflows/**`, `**/secrets/**`, `*.env`, `*.env.*`)
+
+Initialise loop state in memory:
+  - `round = 1`
+  - `prevActions = []`  (TriageAction objects, accumulates across rounds)
+
+If `review.wait_for_ci` is false (small repos, no CI), skip every
+"wait for CI" step below — go straight from push to STEP 13.
+
+STEP 13 — Run a review round:
+
+  a. **Wait for CI** (when enabled). After the most recent push:
+     ```
+     gh pr checks <PRNUM> --repo <owner>/<repo> --watch --required --interval 30
+     ```
+     `--watch` blocks until all required checks complete (or fail).
+     Honour the `ci_timeout_minutes` config: if `gh pr checks` doesn't
+     return within the timeout, treat as `escalate` (jump to STEP 15).
+
+  b. **Capture CI status** for Triage. Build a JSON file at
+     `<runDir>/ci-status-round-<R>.json` with the schema:
+     ```json
+     {
+       "checks": [
+         {"name": "build", "state": "completed", "conclusion": "success"},
+         {"name": "CodeQL", "state": "completed", "conclusion": "failure",
+          "details_url": "https://...",
+          "log_excerpt": "<last ~50 lines from `gh run view <id> --log-failed`>"}
+       ]
+     }
+     ```
+     Use `gh pr checks <PRNUM> --json name,state,conclusion,detailsUrl`
+     for the index, then `gh run view <run-id> --log-failed | tail -50`
+     for each failed check's excerpt.
+
+  c. **Persist prior actions** for cycle protection. If `round > 1`,
+     write the cumulative `prevActions` array to
+     `<runDir>/prev-actions.json`:
+     ```json
+     [{"id": "f1", "action": "fix_now"}, ...]
+     ```
+     Just include `id` and `action` — Triage uses these to detect
+     cycles. Skip on round 1 (empty prev list).
+
+  d. **Run aidev with triage:**
+     ```
+     aidev review -triage \
+       -issue <ISSUE> \
+       -repo <PATH> \
+       -round <R> \
+       -ci-status <runDir>/ci-status-round-<R>.json \
+       -prev-actions <runDir>/prev-actions.json
+     ```
+     Capture stdout. The output is a single JSON object:
+     ```json
+     {
+       "round": 1,
+       "review_verdict": "approve|changes_requested|comment",
+       "convergence": "approve|rebut_to_ship|continue|escalate",
+       "actions": [...],
+       "coercions_log": [...],
+       "escalate_reason": "..."
+     }
+     ```
+
+STEP 14 — Act on the triage based on `convergence`:
+
+**`approve`:** Reviewer was clean (and CI was green). Post a final
+comment to the PR and mark it ready:
+
+    gh pr comment <PRNUM> --repo <owner>/<repo> --body "$(cat <<'EOF'
+    ## 🟢 Auto-review converged at round <R>
+
+    Reviewer verdict: approve. CI: green. No findings to address.
+
+    PR is ready for human review.
+    EOF
+    )"
+    gh pr ready <PRNUM> --repo <owner>/<repo>
+
+Done. BREAK loop.
+
+**`rebut_to_ship`:** All findings have Sketch-grounded rebuttals (no
+fix needed). For each `action: rebut`, post the rebuttal as a PR
+comment with its `sketch_citation` (audit trail):
+
+    gh pr comment <PRNUM> --repo <owner>/<repo> --body "$(cat <<'EOF'
+    ## ↩️ Round <R> rebuttal: finding <id>
+
+    **Reviewer finding:** <finding>
+
+    **aidev's rebuttal:** <rebut_text>
+
+    **Grounded in Sketch <N>:** > <sketch_citation>
+    EOF
+    )"
+
+Then post the convergence comment + mark ready:
+
+    gh pr comment <PRNUM> --repo <owner>/<repo> --body "$(cat <<'EOF'
+    ## 🟢 Auto-review converged at round <R> (rebut_to_ship)
+
+    All <N> Reviewer findings rebutted with Sketch-grounded rationale.
+    See the per-finding comments above for the audit trail.
+    EOF
+    )"
+    gh pr ready <PRNUM> --repo <owner>/<repo>
+
+Done. BREAK loop.
+
+**`continue`:** At least one `fix_now` (or `defer_to_followup`)
+action. For each:
+
+  a. **`action: fix_now`** — apply the fix natively using Edit/Write/Bash
+     based on `fix_plan`. Append a one-line entry to the in-memory
+     decisions journal: "Round <R> fix (id=<id>): <fix_plan one-liner>".
+
+  b. **`action: defer_to_followup`** — file a child issue:
+     ```
+     gh issue create --repo <owner>/<repo> \
+       --title "[follow-up #<ISSUE>] <one-line summary>" \
+       --label aidev:followup \
+       --body "<finding>\n\n_Filed automatically by aidev review-loop round <R>. Parent: #<ISSUE>, PR: #<PRNUM>._"
+     ```
+     Capture the new issue number. Post a back-link in the PR.
+
+After applying all `fix_now` actions, **run the test suite** (same
+detection as STEP 9). If tests fail:
+  - `git -C <PATH> checkout -- <files-modified-this-round>` to revert.
+  - Append the failure to the decisions journal.
+  - Convert this round's `fix_now` actions into synthetic `escalate`
+    actions and treat as `escalate` convergence (jump to escalate
+    handler below).
+  - Do NOT commit the broken fix.
+
+If tests pass:
+  - `git -C <PATH> add <files-modified-this-round>`
+  - `git -C <PATH> commit -m "fix: address review round <R> - <one-line summary>"`
+  - `git -C <PATH> push origin <branch-name>`
+  - Update `prevActions` in memory: append `{id, action}` for every
+    finding processed this round (so round R+1's cycle protection
+    recognises them).
+
+Post the round audit comment to the PR:
+
+    gh pr comment <PRNUM> --repo <owner>/<repo> --body "$(cat <<'EOF'
+    ## 🔁 Auto-review round <R>: continue
+
+    **Reviewer verdict:** <review_verdict>
+    **Triage convergence:** continue
+    **Findings:** <N> total
+
+    | # | Source | Severity | Action | Notes |
+    |---|--------|----------|--------|-------|
+    | f1 | reviewer | blocker | fix_now | Applied edit to src/foo.ts:42 |
+    | ci-1 | ci (CodeQL) | blocker | fix_now | Replaced .includes() with URL constructor |
+    | f2 | reviewer | suggestion | rebut | Sketch §"Outlier handling" |
+    | f3 | reviewer | followup | defer_to_followup | Filed #<NEW> |
+
+    Fixes pushed in commit `<short-sha>`. Re-running review next round.
+    EOF
+    )"
+
+Increment `round`. If `round > max_rounds`, treat as `escalate` (jump
+to escalate handler). Otherwise GOTO STEP 13.
+
+**`escalate`:** Stop the loop. Post the escalation comment, add the
+`aidev:needs-human-review` label, leave the PR as draft:
+
+    gh pr comment <PRNUM> --repo <owner>/<repo> --body "$(cat <<'EOF'
+    ## 🚨 Auto-review escalated at round <R>
+
+    **Why:** <escalate_reason from the JSON>
+
+    Findings requiring human attention:
+    - **<id>** (<source>, <severity>): <finding>
+      - **Action:** escalate. <rationale>
+
+    [Repeat per escalate action]
+
+    The PR is left as draft. Working tree on `<branch-name>` is in
+    a known-good state (the last successful test pass). Resolve the
+    findings manually or re-run `/aidev-run <ISSUE> <PATH>` after
+    addressing them.
+    EOF
+    )"
+    gh pr edit <PRNUM> --repo <owner>/<repo> --add-label aidev:needs-human-review
+
+Done. BREAK loop.
+
+STEP 15 — Final summary. After the loop exits (any convergence),
+print a one-paragraph summary to the user:
+
+  - "Auto-review loop converged at round <R> with `<convergence>`."
+    OR
+  - "Auto-review loop escalated at round <R>. PR #<PRNUM> is draft;
+    `aidev:needs-human-review` label applied. See the escalation
+    comment for next steps."
+
+The decisions journal in PR body should be updated to include the
+loop's `## Auto-review trail` section listing each round's
+convergence + key actions. Use `gh pr edit <PRNUM> --body "..."` to
+overwrite the PR body, preserving the existing sections from STEP 10
+and appending the new section.
+
+Loop safety guards (enforced by aidev's Triage agent, not the slash
+command — but worth understanding):
+  - Rebuttals require literal Sketch citations; ungrounded rebuts
+    coerce to escalate.
+  - Security-tool CI failures (CodeQL, Snyk, Dependabot, Trivy,
+    Semgrep, npm audit) cannot be rebutted; coerce to fix_now or
+    escalate.
+  - Fixes touching protected paths (`review.protected_paths`) coerce
+    to escalate.
+  - The same finding ID with `fix_now` in two consecutive rounds
+    coerces to escalate (cycle protection).
+
+These coercions appear in the `coercions_log` field of the JSON
+verdict — surface them in the round audit comment when present so
+the human can see what aidev refused to do.
+
 Then summarise to the user: "Opened PR #<PRNUM>. Audit trail in
 issue #<ISSUE>." Done.
 

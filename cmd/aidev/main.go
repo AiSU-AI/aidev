@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -553,17 +554,33 @@ func runPluginSubcommand() {
 	}
 }
 
-// runReviewSubcommand handles `aidev review`. It loads a patch file
-// (default `<repo>/.aidev/proposed.patch`), fetches the issue context,
-// runs the Reviewer, and prints the structured review to stdout. If the
-// review contains follow-up proposals they're also written to
-// `<repo>/.aidev/followups.md` for manual triage.
+// runReviewSubcommand handles `aidev review`. It loads (or auto-discovers)
+// a patch, fetches the issue context, runs the Reviewer, and prints the
+// structured review to stdout. If the review contains follow-up proposals
+// they're also written to the runDir's followups.md for manual triage.
+//
+// Patch discovery (P6 §6a) — when -patch is empty, the subcommand
+// computes `git -C <repo> diff origin/<base>...HEAD` where <base>
+// resolves via the same chain as the slash command's STEP 7.5
+// (`<repo>/.aidev/aidev.yaml` pr.base_branch → `preview` if it exists
+// on origin → repo default branch via gh). Removes the manual
+// `.aidev/proposed.patch` staging step the slash command used to
+// require.
+//
+// Triage mode (P6 §6c) — when -triage is set, the subcommand runs the
+// Triage meta-judge after the Reviewer and emits a single JSON object
+// to stdout (no surrounding prose) so the slash command can parse it
+// directly. -round and -ci-status feed the Triage agent's input.
 func runReviewSubcommand() {
 	var (
-		issueURL  = flag.String("issue", "", "GitHub issue reference: full URL or a bare number (resolved against -repo's git remote)")
-		repoPath  = flag.String("repo", ".", "Path to the target repository")
-		patchPath = flag.String("patch", "", "Path to the patch file to review (default: <repo>/.aidev/proposed.patch)")
-		configDir = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		issueURL     = flag.String("issue", "", "GitHub issue reference: full URL or a bare number (resolved against -repo's git remote)")
+		repoPath     = flag.String("repo", ".", "Path to the target repository")
+		patchPath    = flag.String("patch", "", "Path to the patch file to review (default: auto-discovered via `git diff origin/<base>...HEAD`)")
+		configDir    = flag.String("config", "", "Path to aidev config directory (defaults to ./config or $AIDEV_CONFIG)")
+		triage       = flag.Bool("triage", false, "After the Reviewer runs, also run the Triage meta-judge and emit a single JSON object to stdout (P6 review→fix loop)")
+		round        = flag.Int("round", 1, "Review-loop round number (1-indexed). Used for cycle-protection in the Triage agent.")
+		ciStatusPath = flag.String("ci-status", "", "Path to a JSON file containing CI status (schema: agents.CIStatus). When set, fed to Triage as a peer signal alongside Reviewer findings.")
+		prevPath     = flag.String("prev-actions", "", "Path to a JSON file containing prior-round TriageActions for cycle protection.")
 	)
 	flag.Parse()
 	if *issueURL == "" {
@@ -591,23 +608,151 @@ func runReviewSubcommand() {
 		fatal(fmt.Sprintf("scan repo: %v", err))
 	}
 
-	pp := *patchPath
-	if pp == "" {
-		pp = filepath.Join(absRepo, ".aidev", "proposed.patch")
-	}
-	data, err := os.ReadFile(pp)
+	patchData, patchSource, err := loadOrDiscoverPatch(*patchPath, absRepo)
 	if err != nil {
-		fatal(fmt.Sprintf("read patch %s: %v", pp, err))
+		fatal(err.Error())
+	}
+	if !*triage {
+		// Human-readable mode: announce where the patch came from on
+		// stderr so users know whether they're reviewing an explicit
+		// file or the auto-discovered diff.
+		fmt.Fprintf(os.Stderr, "aidev review: patch source = %s (%d bytes)\n", patchSource, len(patchData))
 	}
 
-	for ev := range orch.ReviewPatch(ctx, string(data)) {
+	for ev := range orch.ReviewPatch(ctx, string(patchData)) {
 		if ev.Err != nil {
 			fatal(ev.Err.Error())
 		}
 	}
-	if rev := orch.Review(); rev != nil {
-		fmt.Println(rev.Markdown)
+	rev := orch.Review()
+	if rev == nil {
+		fatal("aidev review: no review produced")
 	}
+
+	if !*triage {
+		fmt.Println(rev.Markdown)
+		return
+	}
+
+	// Triage mode: run the meta-judge and emit JSON to stdout.
+	var ci *agents.CIStatus
+	if *ciStatusPath != "" {
+		raw, rerr := os.ReadFile(*ciStatusPath)
+		if rerr != nil {
+			fatal(fmt.Sprintf("read ci-status %s: %v", *ciStatusPath, rerr))
+		}
+		ci = &agents.CIStatus{}
+		if jerr := json.Unmarshal(raw, ci); jerr != nil {
+			fatal(fmt.Sprintf("parse ci-status %s: %v", *ciStatusPath, jerr))
+		}
+	}
+	var prev []agents.TriageAction
+	if *prevPath != "" {
+		raw, rerr := os.ReadFile(*prevPath)
+		if rerr != nil {
+			fatal(fmt.Sprintf("read prev-actions %s: %v", *prevPath, rerr))
+		}
+		if jerr := json.Unmarshal(raw, &prev); jerr != nil {
+			fatal(fmt.Sprintf("parse prev-actions %s: %v", *prevPath, jerr))
+		}
+	}
+	verdict, terr := orch.Triage(ctx, string(patchData), ci, *round, prev, nil /* protected paths default */)
+	if terr != nil {
+		fatal(fmt.Sprintf("triage: %v", terr))
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if jerr := enc.Encode(verdict); jerr != nil {
+		fatal(fmt.Sprintf("encode triage verdict: %v", jerr))
+	}
+}
+
+// loadOrDiscoverPatch returns the patch bytes plus a human-readable
+// source label. When patchPath is non-empty, reads from disk. Otherwise
+// resolves the base branch (P6 §6a) and computes the diff.
+func loadOrDiscoverPatch(patchPath, absRepo string) ([]byte, string, error) {
+	if patchPath != "" {
+		data, err := os.ReadFile(patchPath)
+		if err != nil {
+			return nil, "", fmt.Errorf("read patch %s: %v", patchPath, err)
+		}
+		return data, patchPath, nil
+	}
+	// Try the legacy `<repo>/.aidev/proposed.patch` path for back-compat
+	// with existing aidev review callers (the slash command's prior
+	// flow). When present, prefer it over the git-diff path.
+	legacy := filepath.Join(absRepo, ".aidev", "proposed.patch")
+	if data, err := os.ReadFile(legacy); err == nil {
+		return data, legacy, nil
+	}
+	// Auto-discover via git.
+	base, baseErr := resolveBaseBranch(absRepo)
+	if baseErr != nil {
+		return nil, "", fmt.Errorf("resolve base branch for auto-discovery: %v", baseErr)
+	}
+	// Best-effort fetch so the diff is against origin's actual tip.
+	// Failures here are warnings, not fatal — the diff falls back to
+	// whatever local refs we have.
+	if ferr := runGit(absRepo, "fetch", "origin", base); ferr != nil {
+		fmt.Fprintf(os.Stderr, "aidev review: warn: git fetch origin %s failed: %v\n", base, ferr)
+	}
+	out, derr := runGitOutput(absRepo, "diff", "origin/"+base+"...HEAD")
+	if derr != nil {
+		return nil, "", fmt.Errorf("git diff origin/%s...HEAD: %v", base, derr)
+	}
+	if len(strings.TrimSpace(string(out))) == 0 {
+		return nil, "", fmt.Errorf("auto-discovered patch is empty (origin/%s...HEAD has no diff)", base)
+	}
+	return out, fmt.Sprintf("git diff origin/%s...HEAD", base), nil
+}
+
+// resolveBaseBranch implements the P6 §6a base-resolution chain:
+//   1. <repo>/.aidev/aidev.yaml -> pr.base_branch
+//   2. `preview` if it exists on origin
+//   3. Repo default branch via `gh repo view`
+func resolveBaseBranch(absRepo string) (string, error) {
+	// 1. .aidev/aidev.yaml — minimal grep, no full YAML parser needed
+	//    (the file is small + we only want one key). Tolerates absent
+	//    files or absent keys.
+	if data, err := os.ReadFile(filepath.Join(absRepo, ".aidev", "aidev.yaml")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(t, "base_branch:") {
+				v := strings.TrimSpace(strings.TrimPrefix(t, "base_branch:"))
+				v = strings.Trim(v, `"'`)
+				if v != "" {
+					return v, nil
+				}
+			}
+		}
+	}
+	// 2. preview if it exists on origin
+	if out, err := runGitOutput(absRepo, "ls-remote", "--heads", "origin", "preview"); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return "preview", nil
+	}
+	// 3. Repo default branch
+	cmd := exec.Command("gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	cmd.Dir = absRepo
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh repo view: %v", err)
+	}
+	name := strings.TrimSpace(string(out))
+	if name == "" {
+		return "", fmt.Errorf("gh repo view returned empty default branch")
+	}
+	return name, nil
+}
+
+func runGit(absRepo string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"-C", absRepo}, args...)...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runGitOutput(absRepo string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", absRepo}, args...)...)
+	return cmd.Output()
 }
 
 // runTestSubcommand handles `aidev test`. It detects the project's

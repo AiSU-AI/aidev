@@ -64,6 +64,8 @@ const (
 	StateTestsFailed   State = "tests_failed"
 	StateReviewing     State = "reviewing"
 	StateReviewDone    State = "review_done"
+	StateTriaging      State = "triaging"
+	StateTriageDone    State = "triage_done"
 	StateDone          State = "done"
 	StateKilled        State = "killed"
 	StateError         State = "error"
@@ -95,6 +97,7 @@ type Orchestrator struct {
 	coordinator *agents.Coordinator
 	tester      *agents.Tester
 	reviewer    *agents.Reviewer
+	triage      *agents.Triage
 	critRpt     *agents.Report
 	patch       *agents.Patch
 	coordReview *agents.CoordinatorReview
@@ -241,6 +244,16 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Triage — autonomous review-loop meta-judge (P6). Same best-effort
+	// construction pattern as the Selector: when the routing fails we
+	// log and continue without a Triage agent. Callers detect the
+	// missing agent via Triage() returning nil and fall back to manual
+	// review handling.
+	triage, terr := agents.NewTriage(router)
+	if terr != nil {
+		fmt.Fprintf(os.Stderr, "aidev: build triage: %v (autonomous review loop disabled)\n", terr)
+		triage = nil
+	}
 	o.scout = scout
 	o.critic = critic
 	o.architect = architect
@@ -249,11 +262,43 @@ func New(cfg *config.Config, opts ...Option) (*Orchestrator, error) {
 	o.coordinator = coordinator
 	o.tester = tester
 	o.reviewer = reviewer
+	o.triage = triage
 	return o, nil
 }
 
 // Review returns the last Reviewer output, if any.
 func (o *Orchestrator) Review() *agents.Review { return o.review }
+
+// Triage runs the meta-judgment step (P6) on the most recent Reviewer
+// output. Caller supplies the patch under review, optional CI status,
+// the round number (1-indexed), prior-round actions for cycle
+// protection, and any per-repo protected-path overrides. Returns the
+// structured verdict the slash command consumes; nil if Triage is
+// unavailable (no router routing for RoleTriage and no Critic
+// fallback) or if Review() has not been called.
+func (o *Orchestrator) Triage(ctx context.Context, patch string, ci *agents.CIStatus, round int, prev []agents.TriageAction, protectedPaths []string) (*agents.TriageVerdict, error) {
+	if o.triage == nil {
+		return nil, errors.New("orchestrator: triage agent not constructed")
+	}
+	if o.review == nil {
+		return nil, errors.New("orchestrator: no review available — call ReviewPatch first")
+	}
+	o.state = StateTriaging
+	v, err := o.triage.Run(llm.WithGate(ctx, "triage"), o.ctx, agents.TriageInput{
+		Review:         o.review,
+		Patch:          patch,
+		CI:             ci,
+		Round:          round,
+		PrevActions:    prev,
+		ProtectedPaths: protectedPaths,
+	})
+	if err != nil {
+		o.state = StateError
+		return nil, err
+	}
+	o.state = StateTriageDone
+	return v, nil
+}
 
 // ReviewPatch runs the Reviewer against the given patch string and
 // emits reviewing → review_done. Proposed follow-ups are written to

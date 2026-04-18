@@ -63,6 +63,16 @@ const (
 	// not explicitly routed, since Selector is a judgment task that
 	// wants the same model the Architect already trusts.
 	RoleSelector Role = "selector"
+	// RoleTriage is the meta-judgment step in the autonomous review→fix
+	// loop (P6). After the Reviewer agent produces findings and CI
+	// reports check status, Triage decides — per finding — whether to
+	// fix_now (apply a code change), rebut (the finding contradicts the
+	// chosen Sketch's documented decisions), defer_to_followup (file as
+	// a separate issue), or escalate (human required). Falls back to
+	// RoleCritic when not explicitly routed because Triage demands the
+	// same Critic-tier judgment quality, and rebuttals must be grounded
+	// in literal Sketch citations rather than the LLM's confidence.
+	RoleTriage Role = "triage"
 )
 
 // Message is a single turn in a conversation. Role is "user" or "assistant".
