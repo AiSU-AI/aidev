@@ -44,7 +44,13 @@ The rest of the pipeline is designed around the same principle: **propose, never
 
 ## Install
 
-`AiSU-AI/aidev` is currently a private repo, so the canonical install path is **clone + `./install.sh`**. You'll need Go 1.24+ on your machine for the from-source build.
+**Quick install** (downloads the latest pre-built binary, no Go required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AiSU-AI/aidev/main/install.sh | bash -s -- --from-release
+```
+
+**From source** (requires Go 1.24+, useful for contributors or if you want to track `main`):
 
 ```sh
 gh repo clone AiSU-AI/aidev ~/code/personal/aidev    # or: git clone git@github.com:AiSU-AI/aidev.git ~/code/personal/aidev
