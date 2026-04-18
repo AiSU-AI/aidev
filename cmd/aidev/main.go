@@ -1035,6 +1035,34 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		fmt.Println()
 	}
 
+	// Write the sketches + full context to architect-output.md so Claude
+	// Code (or any downstream agent) can read them without parsing the
+	// headless report. This is the handoff point: aidev is the decision
+	// layer, Claude Code is the implementation layer. Prefer the runDir
+	// (P1 artifact relocation, out of the target repo); fall back to
+	// `<repo>/.aidev/` if runDir resolution failed.
+	//
+	// IMPORTANT: write BEFORE the StateNeedsRefinement return below.
+	// On the refinement path the orchestrator did produce sketches but
+	// the Selector refused to pick — we still want a fresh on-disk
+	// audit trail of THIS run's Architect output, otherwise the runDir
+	// keeps showing the previous successful run's architect-output.md
+	// (stale, misleading state). The Selector verdict block at the top
+	// of the file will already show "No sketch was chosen" because
+	// writeArchitectOutput reads c.Selector.ChosenNumber.
+	if agentCtx.Snapshot != nil && len(sketches) > 0 {
+		dir := orch.RunDir()
+		if dir == "" {
+			dir = filepath.Join(absRepo, ".aidev")
+		}
+		if outPath, err := writeArchitectOutput(agentCtx, sketches, dir); err != nil {
+			fmt.Fprintf(os.Stderr, "aidev: write architect output: %v\n", err)
+		} else {
+			fmt.Println()
+			fmt.Printf("_Architect output written to %s — hand off to Claude Code for implementation._\n", outPath)
+		}
+	}
+
 	// P5: if the orchestrator transitioned to StateNeedsRefinement
 	// (Selector returned no pick), print a clear marker so the slash
 	// command can detect "stop, do not implement" without parsing
@@ -1056,25 +1084,6 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 			fmt.Println()
 		}
 		fmt.Println(s.Markdown)
-	}
-
-	// Write the sketches + full context to architect-output.md so Claude
-	// Code (or any downstream agent) can read them without parsing the
-	// headless report. This is the handoff point: aidev is the decision
-	// layer, Claude Code is the implementation layer. Prefer the runDir
-	// (P1 artifact relocation, out of the target repo); fall back to
-	// `<repo>/.aidev/` if runDir resolution failed.
-	if agentCtx.Snapshot != nil && len(sketches) > 0 {
-		dir := orch.RunDir()
-		if dir == "" {
-			dir = filepath.Join(absRepo, ".aidev")
-		}
-		if outPath, err := writeArchitectOutput(agentCtx, sketches, dir); err != nil {
-			fmt.Fprintf(os.Stderr, "aidev: write architect output: %v\n", err)
-		} else {
-			fmt.Println()
-			fmt.Printf("_Architect output written to %s — hand off to Claude Code for implementation._\n", outPath)
-		}
 	}
 }
 

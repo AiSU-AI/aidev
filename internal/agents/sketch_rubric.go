@@ -86,8 +86,17 @@ type IssueTypeOverride struct {
 //     files is suspicious); feature type is neutral on scope.
 //   - tie_breaker_epsilon=1.0 means a 0.99-point gap goes to the LLM,
 //     a 1.01-point gap is decided deterministically.
-//   - min_implementable_score=1.0 means at least net-positive
-//     alignment is required; anything below triggers refinement.
+//   - min_implementable_score=0.0 means at least net-neutral alignment
+//     is required (more aligned bullets than tensions, after the risk
+//     penalty). The Critic already gated "should we build this?" — a
+//     `build` verdict shouldn't routinely flip to refinement just
+//     because the Architect produced borderline sketches. Anything
+//     net-negative (more tensions than alignments) still triggers
+//     refinement, since a sketch the Architect itself flagged as more
+//     tense than aligned is genuinely not implementable. Tightened
+//     from 1.0 → 0.0 on 2026-04-18 after observing same-issue runs
+//     swing 4.5 → 0.5 between Architect calls and incorrectly hit
+//     refinement on the low side.
 //   - critical_principles list is short on purpose. Adding more here
 //     makes the Selector less willing to pick anything; the user can
 //     extend per-repo via .aidev/sketch-rubric.yaml.
@@ -114,7 +123,7 @@ issue_type_overrides:
     scope_files_penalty: 0.05
     scope_files_threshold: 10
 tie_breaker_epsilon: 1.0
-min_implementable_score: 1.0
+min_implementable_score: 0.0
 `
 
 // LoadDefaultRubric parses the bundled default rubric. Errors here

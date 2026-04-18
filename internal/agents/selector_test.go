@@ -296,10 +296,14 @@ func TestSelectorRunFallsBackOnTieBreakerError(t *testing.T) {
 
 func TestSelectorRunRefusesPickBelowMinImplementableScore(t *testing.T) {
 	rubric := mustRubric(t)
-	// Best sketch has only 1 net score — but min is 1.0, so this
-	// should pass; let's go below by adding tension to push <1.
+	// Min implementable score is 0.0 (relaxed from 1.0 on 2026-04-18:
+	// the Critic's `build` verdict already gated "should we build?",
+	// so the Selector only refuses when a sketch is genuinely
+	// net-negative — more tensions than alignments). To exercise the
+	// floor we need score < 0.0: 1 aligned (+1.0) + 2 tensions (-2.0)
+	// = -1.0, which is below 0.0 and should trigger refinement.
 	sk := makeSketch(1, "weak",
-		"- KISS: aligned — fine\n- YAGNI: tension — bad",
+		"- KISS: aligned — fine\n- YAGNI: tension — bad\n- DRY: tension — bad",
 		"", "3 files.")
 
 	prov := &fixedReplyProvider{}
