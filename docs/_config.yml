@@ -1,0 +1,38 @@
+# Jekyll config for GitHub Pages.
+#
+# GitHub Pages auto-renders markdown in docs/ when Pages is enabled on
+# `main` / `/docs` via Settings → Pages. The cayman theme is the same
+# one Anthropic uses for their OSS tooling docs — clean, readable, zero
+# build overhead.
+
+title: aidev
+description: >-
+  A multi-agent coding pipeline for Claude Code that argues with you before
+  writing code, ships the approved work autonomously, and keeps an auditable
+  GitHub-issue trail of every architectural decision.
+
+remote_theme: pages-themes/cayman@v0.2.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# Nav surfaced at the top of every page. Order matches the user journey:
+# install → usage → architecture → review loop → configuration → troubleshooting → roadmap.
+header_pages:
+  - install.md
+  - usage.md
+  - architecture.md
+  - review-loop.md
+  - configuration.md
+  - troubleshooting.md
+  - roadmap.md
+
+# Pretty URLs (e.g. /install/ instead of /install.html).
+permalink: pretty
+
+# Don't publish the older v0.2f-era ollama enhancements doc in the site
+# until it's been refreshed. Still in the repo for git history.
+exclude:
+  - ollama-enhancements.md
+  - CODEMAPS/  # if we ever add generated codemaps, don't publish them by default
