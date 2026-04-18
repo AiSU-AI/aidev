@@ -1,6 +1,10 @@
-# aidev Architecture
+---
+title: Architecture
+---
 
-A one-page tour of what aidev actually does under the hood, and why it's structured the way it is. Complements the [README](../README.md) (value prop + install + usage) with the internal shape.
+# Architecture
+
+A one-page tour of what aidev actually does under the hood, and why it's structured the way it is. Complements the [README](../README.md) (value prop + install + first-run) with the internal shape.
 
 ## The big picture
 
