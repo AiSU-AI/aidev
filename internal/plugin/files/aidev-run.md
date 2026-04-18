@@ -1,10 +1,19 @@
 ---
-description: Run the full aidev agent pipeline on a GitHub issue
+description: Run the aidev decision pipeline (Scout/Critic/Architect) on a GitHub issue, then implement the chosen sketch natively
 argument-hint: <issue-number-or-url> [repo-path]
-allowed-tools: Bash(aidev:*), Read, Grep, Glob, Write, AskUserQuestion
+allowed-tools: Bash(aidev:*), Bash, Read, Grep, Glob, Edit, Write, AskUserQuestion
 ---
 
-You are driving `aidev`, the multi-agent coding tool.
+You are driving `aidev`, the multi-agent decision tool, and then
+implementing the chosen sketch yourself using your own native tools.
+
+aidev is the **decision layer**: Scout (repo brief) → Critic
+(adversarial build/defer/kill) → Architect (N divergent sketches).
+It writes a self-contained handoff doc to
+`<repo>/.aidev/architect-output.md` and exits. **You** are the
+**implementation layer** — after aidev exits, you read the handoff
+doc, the user picks a sketch, and you implement it with Edit/Write/
+Bash inside the same Claude Code session.
 
 STEP 1 — Parse `$ARGUMENTS` into tokens. The first token is the issue
 reference (either a full GitHub URL or a bare issue number). The
@@ -28,11 +37,15 @@ export a PAT) and retry.
 STEP 2 — Use the Bash tool to run ONE aidev command with the parsed
 values interpolated at the Claude layer (not as shell variables):
 
-    aidev -headless -auto -sketch 1 -issue <ISSUE> -repo <PATH>
+    aidev -headless -auto -n 3 -issue <ISSUE> -repo <PATH>
 
 Where `<ISSUE>` is the literal first token from `$ARGUMENTS` and
 `<PATH>` is the literal second token (or `.` if unset). Expand `~`
 to `$HOME`. Wrap the path in double quotes if it contains spaces.
+
+aidev does NOT take a `-sketch` flag — implementation is your job
+after aidev exits. `-n 3` asks the Architect for 3 divergent
+sketches; the user picks one in STEP 7.
 
 STEP 3 — Read the Critic verdict from the output.
 
@@ -117,7 +130,7 @@ ask the user ONE final question via `AskUserQuestion`:
 Options: "Force build" / "Stop here". On "Force build", re-invoke
 aidev one more time with the additional flag:
 
-    aidev -headless -auto -sketch 1 -force-verdict build -issue <ISSUE> -repo <PATH>
+    aidev -headless -auto -n 3 -force-verdict build -issue <ISSUE> -repo <PATH>
 
 This is a hard escape hatch. It logs loudly in aidev's output so
 the override is always visible in the run history. Do NOT reach for
@@ -126,13 +139,40 @@ of the Critic. Use it only when you're confident the Critic is
 spinning on questions the human has already resolved.
 
 STEP 6 — Once the Critic says **build** (or the user has forced
-build) and the Architect + Implementer have run, summarise the
-final state for the user:
+build) and the Architect has produced sketches, READ
+`<repo>/.aidev/architect-output.md` in full. This is aidev's
+handoff doc: it contains the Scout brief, the Critic report, the
+N sketches, and the chosen-sketch placeholder. Summarise for the
+user:
   - what the Critic recommended (and whether it was overridden)
-  - how many sketches the Architect produced
-  - whether the Implementer wrote a patch at
-    `<repo>/.aidev/proposed.patch`
-  - any doctor warnings
+  - the title of each Architect sketch (one line per sketch)
+  - any Critic concerns flagged as worth addressing during
+    implementation (non-blocking, but worth surfacing)
+
+STEP 7 — Use `AskUserQuestion` to ask which sketch to implement.
+Options: "Sketch 1: <title>", "Sketch 2: <title>", ..., "Stop —
+I'll pick later". Quote the titles verbatim from the handoff doc
+so the user can match them against the file.
+
+STEP 8 — On a sketch selection, implement the chosen sketch using
+your native Edit/Write/Bash tools. The Architect's sketch is the
+contract — it lists files, scope, principles, and risks. The
+sketch's "Approach" + "Key decisions" + "Rough scope" sections
+are authoritative. Do not deviate without explicit user permission.
+
+If the sketch's `Risks` section flags a question that needs human
+judgment (e.g., "verify the visual context of the contactSales
+call site"), STOP before that step and ask the user via
+`AskUserQuestion`. Do not silently make a copy/UX call on the
+human's behalf.
+
+STEP 9 — When the implementation is done:
+  - run any test suite the project has (`pnpm verify`, `go test`,
+    `cargo test`, etc. — figure it out from the repo)
+  - summarise files changed, lines added/removed, tests run, any
+    issues you couldn't resolve
+  - if there are uncommitted changes, ask the user whether to
+    commit them or leave the working tree dirty for review
 
 Never push the user to override a `kill` verdict; that is the entire
 point of the tool. A `defer` or `unclear` verdict, however, is an
