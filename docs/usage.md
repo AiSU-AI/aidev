@@ -14,11 +14,14 @@ Once `aidev plugin install` (part of the installer) has dropped the slash comman
 |---|---|
 | `/aidev-run <issue> <repo-path>` | Full autonomous pipeline — Scout → Critic → Architect → Selector → implement → test → PR → review loop |
 | `/aidev-review <issue> <repo-path> [--loop]` | Boy Scout pass on the current PR; `--loop` drives the autonomous review→fix cycle against an existing PR |
+| `/aidev-triage [repo-path]` | Bulk Critic pass over every un-triaged open issue, applying verdict labels (`aidev:approved` / `deferred` / `killed` / `needs-refinement`) |
+| `/aidev-release <milestone> [repo-path]` | Assemble / inspect a release bundle around a GitHub milestone — pick from `aidev:approved` candidates |
+| `/aidev-implement-bundle <milestone> [repo-path]` | Run the full autonomous `/aidev-run` pipeline against every open issue in a milestone, producing one PR per issue |
 | `/aidev-doctor` | Environment audit |
 | `/aidev-charter <repo-path>` | 5-question interview to produce `.aidev/charter.md` |
 | `/aidev-test <repo-path>` | Run detected test suite, summarise failures |
 
-`<issue>` accepts either a bare issue number (resolved against the repo's `origin` remote) or a full GitHub URL. `<repo-path>` is a local filesystem path; [URL-as-repo support](https://github.com/AiSU-AI/aidev/issues) is on the roadmap.
+`<issue>` accepts either a bare issue number (resolved against the repo's `origin` remote) or a full GitHub URL. `<repo-path>` is a local filesystem path; [URL-as-repo support](https://github.com/AiSU-AI/aidev/issues/45) is on the roadmap.
 
 ### Example — full autonomous run
 
@@ -27,6 +30,24 @@ Once `aidev plugin install` (part of the installer) has dropped the slash comman
 ```
 
 From `~/code/your-repo` this runs the whole pipeline. The Critic either argues against the issue (you'll see the case, with sharp questions on `unclear`), the Architect drafts 3 sketches, the Selector picks one via the [rubric](configuration.md#sketch-rubric), Claude Code cuts the feature branch via `gh issue develop`, implements the sketch natively, runs your test suite, opens the PR, waits for CI, and runs the [review loop](review-loop.md) until it converges or escalates.
+
+### Local issue-management workflow (no CI, no API keys)
+
+For maintainers who want to manage a repo's backlog locally using their Claude Code subscription — no `ANTHROPIC_API_KEY` in GitHub Actions, no CI budget risk:
+
+```
+/aidev-triage .                         # Critic every un-labeled open issue
+/aidev-release v0.4.0 .                 # assemble a release bundle from approved issues
+/aidev-implement-bundle v0.4.0 .        # run the full pipeline on every milestone issue
+```
+
+The flow:
+
+1. **Triage** — `/aidev-triage` finds open issues without any `aidev:*` label, runs Scout + Critic on each, applies `aidev:approved` / `aidev:deferred` / `aidev:killed` / `aidev:needs-refinement` based on the Critic's verdict. Cap of 20 issues per run; total run time roughly `N × 60s`.
+2. **Release bundling** — `/aidev-release <milestone>` shows you `aidev:approved` issues not yet assigned to a milestone, plus whatever's already in the milestone. Interactive: you pick which candidates to add to the milestone. Creates the milestone if it doesn't exist.
+3. **Bundle implementation** — `/aidev-implement-bundle <milestone>` runs the full `/aidev-run` pipeline (Scout → Critic → Architect → Selector → Claude Code → tests → PR → review loop) against every open issue in the milestone, sequentially. One PR per issue, all branched from `origin/<base>`. You merge in whatever order you prefer.
+
+Each step is human-gated at the decision points — `/aidev-triage` surfaces the candidate list before running, `/aidev-release` asks you to confirm each addition, `/aidev-implement-bundle` offers a "stop after the first issue for sanity check" option. The autonomy is opt-in per step, not blanket.
 
 ## Headless / CI-friendly
 
