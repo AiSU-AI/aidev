@@ -221,23 +221,39 @@ disposable branch and the user's previous branch is untouched.
      OR on origin (`git ls-remote --heads origin <name>` non-empty),
      append `-2`, `-3`, etc. until unique.
 
-  4. Cut the branch from the **resolved base's tip on origin**, NOT
-     from whatever the user happened to be on:
+  4. Cut the branch via `gh issue develop` so GitHub formally links
+     the branch ↔ issue ↔ (eventual) PR. Run from inside `<PATH>`:
 
-         git -C <PATH> fetch origin <base-branch>
-         git -C <PATH> checkout -b <branch-name> origin/<base-branch>
+         cd <PATH>
+         gh issue develop <ISSUE> --name <branch-name> --base <base-branch> --checkout
 
-     Cutting from `origin/<base-branch>` (not the local copy)
-     guarantees the feature branch is rooted at the integration
-     target's actual tip, so the eventual PR is a clean diff with
-     no accidental drift from a stale local branch.
+     What this does:
+       - Creates `<branch-name>` on origin, rooted at
+         `origin/<base-branch>` (its actual tip — not the local copy).
+       - Registers the branch as a "linked branch" on issue
+         `<ISSUE>` in the GitHub Development panel.
+       - Fetches and checks out the branch locally.
+
+     Why `gh issue develop` instead of raw `git checkout -b`:
+     GitHub's `Closes #N` keyword in PR bodies ONLY auto-populates
+     the formal "Linked issues" sidebar when the PR targets the
+     repo's default branch. For PRs targeting `preview` (or any
+     non-default integration branch), the keyword is treated as
+     cosmetic text and the bidirectional issue↔PR link does NOT
+     form. Using `gh issue develop` creates the link explicitly via
+     the Development panel, so the linkage shows up on both the
+     issue and the PR regardless of base branch.
 
   5. Tell the user: "Cut feature branch `<branch-name>` from
-     `origin/<base-branch>`. Implementing Sketch <N> here."
+     `origin/<base-branch>` and linked to issue #<ISSUE>.
+     Implementing Sketch <N> here."
 
-  6. If `git fetch` fails (offline, auth, network), STOP and surface
-     the error to the user. Do not silently fall back to the local
-     branch — a stale base would produce a misleading PR diff.
+  6. If `gh issue develop` fails (offline, auth, network, or the
+     branch couldn't be linked), STOP and surface the error. Do
+     NOT silently fall back to raw `git checkout -b` — that would
+     create the branch without the issue link, defeating the
+     purpose of this step. Diagnose and retry, or have the user
+     fix the underlying issue (e.g. `gh auth status`, network).
 
 Stash the resolved `<branch-name>` and `<base-branch>` for STEP 10
 to reuse — they don't need to be re-resolved.
