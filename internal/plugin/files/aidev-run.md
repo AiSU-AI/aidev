@@ -186,7 +186,18 @@ MinImplementableScore), STOP. Do not implement anything. Tell the
 user the Selector escalated for refinement and link the
 architect-output.md path so they can read the rationale.
 
-STEP 7 — Implement the **Selector's chosen sketch** using your
+STEP 7 — Pre-implementation safety check. Before touching ANY file,
+verify the working tree is clean:
+
+    git -C <PATH> status --porcelain
+
+If the output is non-empty, STOP. Tell the user "your working tree
+has uncommitted changes — commit, stash, or discard them, then re-run
+`/aidev-run`". Do not auto-stash; the user's in-progress work is
+sacred. (No-op when the only "untracked" file is `.aidev/` artifacts
+the user already gitignores.)
+
+STEP 8 — Implement the **Selector's chosen sketch** using your
 native Edit/Write/Bash tools. The Architect's sketch is the
 contract — it lists files, scope, principles, and risks. The
 sketch's "Approach" + "Key decisions" + "Rough scope" sections
@@ -204,13 +215,114 @@ call site"), STOP before that step and ask the user via
 `AskUserQuestion`. The Selector picks the SKETCH; humans still own
 copy/UX/policy calls inside the implementation.
 
-STEP 8 — When the implementation is done:
-  - run any test suite the project has (`pnpm verify`, `go test`,
-    `cargo test`, etc. — figure it out from the repo)
-  - summarise files changed, lines added/removed, tests run, any
-    issues you couldn't resolve
-  - if there are uncommitted changes, ask the user whether to
-    commit them or leave the working tree dirty for review
+**Maintain an implementation decisions journal in memory.** As you
+implement, every time you make a non-trivial choice that ISN'T in
+the sketch — picking an existing helper over writing new code,
+discovering the repo uses Vitest not Jest, deciding to skip an
+edge case the sketch hand-waved — append a one-line bullet to the
+journal. Keep entries short ("Used existing helper formatI18nKey
+in src/lib/i18n/format.ts"). The journal lands in the PR body and
+the final issue comment.
+
+STEP 9 — Run the project's test suite. Detect by reading the repo:
+  - `package.json` → look for `scripts.verify` / `scripts.test` /
+    `scripts.lint`. Prefer `pnpm verify` if it exists.
+  - `Makefile` → look for `make test` / `make check`.
+  - `Cargo.toml` → `cargo test`.
+  - `go.mod` → `go test ./...`.
+  - Else: skip and note "no test command detected" in the PR body.
+
+If tests fail, STOP before opening the PR. Post the failure to the
+GH issue as a comment via `gh issue comment <ISSUE> --body "..."`
+("aidev tried to implement Sketch N but tests failed — see the
+attached output"). The user reviews and decides whether to override.
+Do not commit or push when tests fail.
+
+STEP 10 — Open the PR. Resolve the base branch in this priority:
+
+  1. `<PATH>/.aidev/aidev.yaml` → `pr.base_branch` if present
+     (read with `cat | yq` or grep — keep it simple)
+  2. `preview` if it exists on origin (`git ls-remote --heads
+     origin preview`)
+  3. The repo's default branch (`gh repo view --json
+     defaultBranchRef --jq '.defaultBranchRef.name'`)
+
+Branch name: `aidev/issue-<ISSUE>-<slug>` where `<slug>` is the
+issue title lowercased, non-alphanum collapsed to `-`, capped at
+40 chars. If the branch already exists locally OR on origin,
+append `-2`, `-3`, etc. until unique.
+
+Commit message format (per the user's global rules in
+~/.claude/CLAUDE.md): single-line `<type>: <description>`, no body,
+no trailers, no `Co-Authored-By`. Type from the chosen sketch:
+
+  - bug-class issues → `fix`
+  - new feature → `feat`
+  - cleanup / consolidation → `refactor`
+  - docs only → `docs`
+
+PR title matches the commit message verbatim. PR body uses HEREDOC
+(per user's global rules):
+
+```
+## Summary
+<one-line restatement of the issue>
+
+Implements aidev Sketch <N>: <title>
+
+## Selector verdict
+<paste the rationale from the architect-output.md verdict block>
+
+**Score:** <X.X> · **Rubric version:** <v> · **Tie-breaker:** <yes|no>
+
+## Implementation decisions
+<bulleted journal you maintained in STEP 8>
+
+## Test plan
+- [ ] <list from the chosen sketch's "Rough scope" section>
+- [ ] <project test command> passes
+
+Closes #<ISSUE>
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```
+
+Then:
+
+  1. `git -C <PATH> checkout -b <branch-name>`
+  2. `git -C <PATH> add <files-touched>` (specific files, not `-A`)
+  3. `git -C <PATH> commit -m "<type>: <description>"`
+  4. `git -C <PATH> push -u origin <branch-name>`
+  5. `gh pr create --base <base-branch> --head <branch-name>
+     --title "<title>" --body "$(cat <<'EOF'
+     ...
+     EOF
+     )"`
+
+NEVER force-push. Always create a fresh branch. If anything in this
+sequence fails (push rejected, gh auth missing, etc.), surface the
+error to the user and STOP.
+
+STEP 11 — Post the PR URL back to the original GH issue:
+
+    gh issue comment <ISSUE> --body "$(cat <<'EOF'
+    ## ✅ aidev opened #<PRNUM> for review
+
+    Implementation of Sketch <N> from the Selector's pick. Tests
+    passed locally before push.
+
+    ## Implementation decisions
+
+    <same journal that's in the PR body>
+
+    Branch: \`<branch-name>\` → \`<base-branch>\`
+
+    🤖 aidev autonomous run
+    EOF
+    )"
+
+Then summarise to the user: "Opened PR #<PRNUM>. Audit trail in
+issue #<ISSUE>." Done.
 
 Never push the user to override a `kill` verdict; that is the entire
 point of the tool. A `defer` or `unclear` verdict, however, is an
