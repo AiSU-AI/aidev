@@ -197,6 +197,51 @@ has uncommitted changes — commit, stash, or discard them, then re-run
 sacred. (No-op when the only "untracked" file is `.aidev/` artifacts
 the user already gitignores.)
 
+STEP 7.5 — Cut the feature branch BEFORE writing any code. Every
+implementation edit must land on the issue's own branch from the
+first file write — never on the user's current branch (which is
+often `main`/`preview`/`staging`). This isolates the work so that
+if anything stops mid-implementation, the half-done state is on a
+disposable branch and the user's previous branch is untouched.
+
+  1. Resolve the base branch in this priority order:
+     a. `<PATH>/.aidev/aidev.yaml` → `pr.base_branch` if present
+        (read with `cat | yq` or `grep` — keep it simple)
+     b. `preview` if it exists on origin
+        (`git ls-remote --heads origin preview` returns non-empty)
+     c. The repo's default branch
+        (`gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`)
+
+  2. Compute the branch name: `aidev/issue-<ISSUE>-<slug>` where
+     `<slug>` is the issue title lowercased, non-alphanum collapsed
+     to `-`, capped at 40 chars.
+
+  3. Collision check: if the branch already exists locally
+     (`git -C <PATH> show-ref --verify --quiet refs/heads/<name>`)
+     OR on origin (`git ls-remote --heads origin <name>` non-empty),
+     append `-2`, `-3`, etc. until unique.
+
+  4. Cut the branch from the **resolved base's tip on origin**, NOT
+     from whatever the user happened to be on:
+
+         git -C <PATH> fetch origin <base-branch>
+         git -C <PATH> checkout -b <branch-name> origin/<base-branch>
+
+     Cutting from `origin/<base-branch>` (not the local copy)
+     guarantees the feature branch is rooted at the integration
+     target's actual tip, so the eventual PR is a clean diff with
+     no accidental drift from a stale local branch.
+
+  5. Tell the user: "Cut feature branch `<branch-name>` from
+     `origin/<base-branch>`. Implementing Sketch <N> here."
+
+  6. If `git fetch` fails (offline, auth, network), STOP and surface
+     the error to the user. Do not silently fall back to the local
+     branch — a stale base would produce a misleading PR diff.
+
+Stash the resolved `<branch-name>` and `<base-branch>` for STEP 10
+to reuse — they don't need to be re-resolved.
+
 STEP 8 — Implement the **Selector's chosen sketch** using your
 native Edit/Write/Bash tools. The Architect's sketch is the
 contract — it lists files, scope, principles, and risks. The
@@ -238,19 +283,9 @@ GH issue as a comment via `gh issue comment <ISSUE> --body "..."`
 attached output"). The user reviews and decides whether to override.
 Do not commit or push when tests fail.
 
-STEP 10 — Open the PR. Resolve the base branch in this priority:
-
-  1. `<PATH>/.aidev/aidev.yaml` → `pr.base_branch` if present
-     (read with `cat | yq` or grep — keep it simple)
-  2. `preview` if it exists on origin (`git ls-remote --heads
-     origin preview`)
-  3. The repo's default branch (`gh repo view --json
-     defaultBranchRef --jq '.defaultBranchRef.name'`)
-
-Branch name: `aidev/issue-<ISSUE>-<slug>` where `<slug>` is the
-issue title lowercased, non-alphanum collapsed to `-`, capped at
-40 chars. If the branch already exists locally OR on origin,
-append `-2`, `-3`, etc. until unique.
+STEP 10 — Open the PR. The branch (`<branch-name>`) and base
+(`<base-branch>`) were already resolved and the branch was already
+cut in STEP 7.5 — reuse those values; do NOT re-resolve them.
 
 Commit message format (per the user's global rules in
 ~/.claude/CLAUDE.md): single-line `<type>: <description>`, no body,
@@ -287,19 +322,20 @@ Closes #<ISSUE>
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
 
-Then:
+Then (you are already on `<branch-name>` from STEP 7.5):
 
-  1. `git -C <PATH> checkout -b <branch-name>`
-  2. `git -C <PATH> add <files-touched>` (specific files, not `-A`)
-  3. `git -C <PATH> commit -m "<type>: <description>"`
-  4. `git -C <PATH> push -u origin <branch-name>`
-  5. `gh pr create --base <base-branch> --head <branch-name>
+  1. `git -C <PATH> add <files-touched>` (specific files, not `-A`)
+  2. `git -C <PATH> commit -m "<type>: <description>"`
+  3. `git -C <PATH> push -u origin <branch-name>`
+  4. `gh pr create --base <base-branch> --head <branch-name>
      --title "<title>" --body "$(cat <<'EOF'
      ...
      EOF
      )"`
 
-NEVER force-push. Always create a fresh branch. If anything in this
+NEVER force-push. The branch was created fresh in STEP 7.5 from
+`origin/<base-branch>`, so the push is always a clean fast-forward
+to a new remote ref. If anything in this
 sequence fails (push rejected, gh auth missing, etc.), surface the
 error to the user and STOP.
 
