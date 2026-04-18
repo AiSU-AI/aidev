@@ -45,6 +45,7 @@ The rest of the pipeline is built around the same principle: every decision has 
 
 ## Source
 
-- Repo: [github.com/AiSU-AI/aidev](https://github.com/AiSU-AI/aidev)
-- License: [MIT](https://github.com/AiSU-AI/aidev/blob/main/LICENSE)
-- Issues: [github.com/AiSU-AI/aidev/issues](https://github.com/AiSU-AI/aidev/issues)
+- [Repository](https://github.com/AiSU-AI/aidev)
+- [License (MIT)](license.md)
+- [Issues](https://github.com/AiSU-AI/aidev/issues)
+- [Releases](https://github.com/AiSU-AI/aidev/releases)
