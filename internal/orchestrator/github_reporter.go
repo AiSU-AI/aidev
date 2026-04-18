@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -105,8 +106,28 @@ func (r *GitHubReporter) OnEvent(ctx context.Context, ev Event) error {
 			if err := r.postSketches(ctx, agCtx.Sketches); err != nil {
 				fmt.Fprintf(r.log, "aidev reporter: post sketches: %v\n", err)
 			}
+			// Selector verdict: posted as its own comment so the
+			// architectural decision is permanently auditable on
+			// the issue. When the Selector wasn't run (older
+			// configs, tests) or returned no pick, skip — the
+			// pinned status still reflects the state.
+			if agCtx.Selector != nil {
+				if err := r.postSelectorVerdict(ctx, agCtx.Selector); err != nil {
+					fmt.Fprintf(r.log, "aidev reporter: post selector verdict: %v\n", err)
+				}
+			}
 		}
-		return r.transition(ctx, "sketches-ready", "✅ Sketches ready — review and pick one", ev.Message)
+		// Selector swaps the label from architecting → selected when
+		// it picked a sketch; falls back to "sketches-ready" when no
+		// pick was made (the slash command treats this as the
+		// "needs refinement" signal — see P5).
+		phase := "sketches-ready"
+		headline := "✅ Sketches ready — review and pick one"
+		if agCtx := contextFromEvent(ev); agCtx != nil && agCtx.Selector != nil && agCtx.Selector.ChosenNumber > 0 {
+			phase = "selected"
+			headline = fmt.Sprintf("🧭 Selector chose Sketch %d (score %.2f) — handing off to implementation", agCtx.Selector.ChosenNumber, agCtx.Selector.Score)
+		}
+		return r.transition(ctx, phase, headline, ev.Message)
 	case StateImplementing:
 		return r.transition(ctx, "implementing", "🔨 Implementer generating patch...", ev.Message)
 	case StatePatchReady:
@@ -121,6 +142,16 @@ func (r *GitHubReporter) OnEvent(ctx context.Context, ev Event) error {
 		return r.transition(ctx, "reviewing", "👀 Reviewer auditing patch...", ev.Message)
 	case StateReviewDone:
 		return r.transition(ctx, "review-done", "📝 Review complete", ev.Message)
+	case StateNeedsRefinement:
+		// P5: aidev refused to proceed autonomously. Post a
+		// structured "needs refinement" comment with the rationale
+		// and actionable next steps so the human knows what to do.
+		if agCtx := contextFromEvent(ev); agCtx != nil {
+			if err := r.postNeedsRefinement(ctx, agCtx, ev.Message); err != nil {
+				fmt.Fprintf(r.log, "aidev reporter: post needs-refinement: %v\n", err)
+			}
+		}
+		return r.transition(ctx, "needs-refinement", "🤔 Needs refinement before implementing — see the latest comment for next steps", ev.Message)
 	case StateKilled:
 		return r.transition(ctx, "killed", "🛑 Killed", ev.Message)
 	case StateError:
@@ -189,6 +220,197 @@ func (r *GitHubReporter) postArtifact(ctx context.Context, title, body string) e
 
 </details>
 `, title, time.Now().UTC().Format(time.RFC3339), body)
+	_, err := r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, wrapped)
+	return err
+}
+
+// postSelectorVerdict posts the Selector's autonomous pick as a
+// standalone audit-trail comment. This is the durable architectural
+// decision record: anyone reviewing the issue six months later sees
+// "aidev's Selector chose Sketch N because X" without having to dig
+// through transient artifact files. The all-scores table is in a
+// <details> block so the issue thread stays scannable.
+func (r *GitHubReporter) postSelectorVerdict(ctx context.Context, v *agents.SelectorVerdict) error {
+	if v == nil {
+		return nil
+	}
+	var b strings.Builder
+	if v.ChosenNumber == 0 {
+		// No pick — the orchestrator + slash command will treat this
+		// as "needs refinement". Post the rationale so the human
+		// reviewer sees WHY no sketch was implementable.
+		b.WriteString("## 🧭 Selector: no sketch chosen — needs refinement\n\n")
+		fmt.Fprintf(&b, "**Rubric version:** %s\n\n", v.RubricVersion)
+		fmt.Fprintf(&b, "**Rationale:** %s\n\n", v.Rationale)
+	} else {
+		fmt.Fprintf(&b, "## 🧭 Selector chose Sketch %d\n\n", v.ChosenNumber)
+		fmt.Fprintf(&b, "**Score:** %.2f  •  **Rubric version:** %s  •  **Tie-breaker invoked:** %t\n\n", v.Score, v.RubricVersion, v.TieBreakerUsed)
+		fmt.Fprintf(&b, "**Rationale:** %s\n\n", v.Rationale)
+	}
+	if len(v.Breakdowns) > 0 {
+		b.WriteString("<details><summary>All sketch scores</summary>\n\n")
+		b.WriteString("| # | Title | Score | Aligned | Tension | Violation | Risks | Notes |\n")
+		b.WriteString("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n")
+		for _, bd := range v.Breakdowns {
+			notes := ""
+			if bd.DisqualifyReason != "" {
+				notes = "DISQUALIFIED: " + bd.DisqualifyReason
+			} else if bd.SketchNumber == v.ChosenNumber {
+				notes = "**CHOSEN**"
+			}
+			scoreCell := fmt.Sprintf("%.2f", bd.Score)
+			if bd.DisqualifyReason != "" {
+				scoreCell = "−∞"
+			}
+			fmt.Fprintf(&b, "| %d | %s | %s | %d | %d | %d | %d | %s |\n",
+				bd.SketchNumber, bd.Title, scoreCell, bd.Aligned, bd.Tension, bd.Violation, bd.Risks, notes)
+		}
+		b.WriteString("\n</details>\n\n")
+	}
+	fmt.Fprintf(&b, "_Posted by aidev at %s_\n", time.Now().UTC().Format(time.RFC3339))
+	_, err := r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, b.String())
+	return err
+}
+
+// postNeedsRefinement composes and posts the structured refinement
+// comment when aidev declines to proceed autonomously. Triggers
+// covered today: the Selector returned ChosenNumber=0 (all sketches
+// disqualified, OR best score below MinImplementableScore). Future
+// triggers (Critic stuck on `unclear` after the Clarifier loop maxed
+// out, Architect produced no viable sketches) wire through the same
+// state and method.
+//
+// The comment is deliberately structured: a one-line "why it stopped",
+// a bullet list of observations, a checklist of what the human can do
+// to unblock, and a note that no PR was created. This format matches
+// what the slash command tells the user to look for in STEP 6.
+func (r *GitHubReporter) postNeedsRefinement(ctx context.Context, c *agents.Context, fallbackReason string) error {
+	var b strings.Builder
+	b.WriteString("## 🤔 aidev needs refinement before implementing\n\n")
+
+	reason := fallbackReason
+	if c.Selector != nil && c.Selector.Rationale != "" {
+		reason = c.Selector.Rationale
+	}
+	if reason == "" {
+		reason = "The pipeline could not find an implementable sketch."
+	}
+	fmt.Fprintf(&b, "**Why it stopped:** %s\n\n", reason)
+
+	b.WriteString("**What aidev observed:**\n")
+	if c.ScoutReport != "" {
+		b.WriteString("- Scout produced a brief; check it for any architecture drift the issue body assumes wrong.\n")
+	}
+	if c.CriticReport != "" {
+		b.WriteString("- Critic raised sharp questions worth addressing; see the Critic comment above.\n")
+	}
+	if c.Selector != nil && len(c.Selector.Disqualified) > 0 {
+		fmt.Fprintf(&b, "- Selector disqualified %d of %d sketches against the rubric (see the Selector comment above for the per-sketch breakdown).\n",
+			len(c.Selector.Disqualified), len(c.Selector.Breakdowns))
+	}
+
+	b.WriteString("\n**What it needs from a human:**\n")
+	b.WriteString("- [ ] **Decompose into smaller issues** if the scope mixes multiple concerns\n")
+	b.WriteString("- [ ] **Add acceptance criteria** if the issue body is too vague (\"what does done look like?\")\n")
+	b.WriteString("- [ ] **Choose between approaches** if Architect sketches reveal an irreconcilable trade-off\n")
+	b.WriteString("- [ ] **Provide examples / fixtures / screenshots** if verification needs a concrete reference\n")
+	b.WriteString("- [ ] **Other** — see the Critic's sharp questions above\n\n")
+
+	b.WriteString("**Suggested next actions:**\n")
+	b.WriteString("- Edit the issue body to address the gaps above, then re-run `/aidev-run <num>`.\n")
+	b.WriteString("- (Future) `/aidev-research <num>` for deeper repo + web research.\n")
+	b.WriteString("- (Future) `/aidev-plan <num>` to flesh out a multi-step plan with checkpoints.\n")
+	b.WriteString("- (Future) `/aidev-decompose <num>` to propose child issues with human approval before filing.\n")
+	b.WriteString("- Manually file child issues if decomposition is needed.\n")
+	b.WriteString("- Close the issue if it's no longer relevant.\n\n")
+
+	b.WriteString("_The pipeline stopped before implementation. Working tree is clean. No PR was created._\n")
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "_Posted by aidev at %s_\n", time.Now().UTC().Format(time.RFC3339))
+
+	_, err := r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, b.String())
+	return err
+}
+
+// PostForceVerdictOverride posts a loud, audit-trail comment when the
+// user passed `-force-verdict` to override the Critic's recommendation.
+// The override is also logged to stderr at the call site, but the GH
+// comment is what survives in the issue history. Called from main.go
+// when the override fires; safe to call from outside OnEvent because
+// the override is a CLI-flag concern, not a state-machine transition.
+func (r *GitHubReporter) PostForceVerdictOverride(ctx context.Context, originalVerdict, forcedVerdict string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	body := fmt.Sprintf(`## 🚨 Human override: Critic verdict forced
+
+Critic recommended **%s**.
+User passed `+"`-force-verdict %s`"+`. Proceeding as if the Critic had said `+"`%s`"+`.
+
+The Critic's report above is the audit trail; this override is the user's call and responsibility. The pipeline will continue to the Architect with the forced verdict.
+
+_Posted by aidev at %s_
+`, originalVerdict, forcedVerdict, forcedVerdict, time.Now().UTC().Format(time.RFC3339))
+	_, err := r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, body)
+	return err
+}
+
+// PostClarifierSession reads the on-disk clarifier markdown and posts
+// it as an audit-trail comment so the Critic's sharp questions and
+// the answers (whether from the human or evidence-based by Claude
+// Code) are durable on the issue. Called from main.go after a
+// successful WriteClarifierMarkdown. Returns nil when the file is
+// missing — clarifier sessions are optional in the pipeline.
+func (r *GitHubReporter) PostClarifierSession(ctx context.Context, clarifierPath string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	data, err := os.ReadFile(clarifierPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read clarifier %s: %w", clarifierPath, err)
+	}
+	body := fmt.Sprintf(`## ❓ Clarifier session
+
+The Critic asked sharp questions; here are the answers that aidev re-evaluated against.
+
+<details><summary><strong>Clarifier Q&A</strong> <sub>(aidev, %s)</sub></summary>
+
+%s
+
+</details>
+`, time.Now().UTC().Format(time.RFC3339), string(data))
+	_, err = r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, body)
+	return err
+}
+
+// PostCoordinatorNote posts a standalone audit-trail comment for a
+// Coordinator concern at warn or concern severity. info severity stays
+// in the pinned status only — promoting every info to a comment would
+// flood the issue thread. Called from the orchestrator's runAdvisoryGate
+// when the note's severity is at or above the threshold.
+func (r *GitHubReporter) PostCoordinatorNote(ctx context.Context, gateName, severity, body string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	emoji := "⚠️"
+	if severity == "concern" {
+		emoji = "🚨"
+	}
+	wrapped := fmt.Sprintf(`## %s Coordinator %s at %s
+
+%s
+
+_(This is advisory; the pipeline continued. Review whether this affects downstream decisions. Posted by aidev at %s.)_
+`, emoji, severity, gateName, body, time.Now().UTC().Format(time.RFC3339))
 	_, err := r.client.PostComment(ctx, r.issue.Owner, r.issue.Repo, r.issue.Number, wrapped)
 	return err
 }

@@ -156,6 +156,7 @@ func main() {
 		headless     = flag.Bool("headless", false, "Run the full pipeline once and print the report to stdout without the TUI")
 		sketchN      = flag.Int("n", agents.DefaultSketchCount, "Number of Architect sketches to produce when the Critic recommends 'build'")
 		autoRun      = flag.Bool("auto", false, "Headless only: automatically run the Architect when the Critic recommends 'build' (otherwise stop at Critic)")
+		interactive  = flag.Bool("interactive", false, "Headless only: skip the Selector's autonomous pick and ask the user which sketch to implement instead. Default false; the Selector chooses autonomously.")
 		forceVerdict = flag.String("force-verdict", "", "Headless only: ESCAPE HATCH. After running Scout+Critic (and any interview rounds), override the Critic's verdict with this value: build|defer|kill. Use ONLY when you have answered the Critic's questions and the Critic is still hedging. Always logged loudly so you can see when the override fired.")
 		skipDoctor   = flag.Bool("skip-doctor", false, "Skip the startup precondition check (not recommended)")
 		noAuditTrail = flag.Bool("no-audit-trail", false, "Disable posting aidev progress + artifacts to the GitHub issue")
@@ -243,7 +244,7 @@ func main() {
 		default:
 			fatal(fmt.Sprintf("invalid -force-verdict %q (must be build, defer, or kill)", *forceVerdict))
 		}
-		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *forceVerdict)
+		runHeadless(ctx, orch, cfg, absRepo, *autoRun, *interactive, *forceVerdict)
 		return
 	}
 
@@ -919,7 +920,16 @@ func printStartupBanner(cfg *config.Config) {
 // When non-empty it overrides the Critic's recommendation AFTER the
 // normal pipeline (and any interview rounds) have run, and the
 // override is logged loudly so the user always sees it fired.
-func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto bool, forceVerdict string) {
+func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *config.Config, absRepo string, auto, interactive bool, forceVerdict string) {
+	// interactive flips the autonomous-Selector default off. The
+	// Selector still runs internally (for the audit trail); main.go
+	// just prints "interactive mode" so the slash command knows to
+	// ask the user which sketch to implement instead of trusting the
+	// Selector's pick. No Go-side branching needed today — the
+	// downstream consumers (slash command, future TUI) read the flag
+	// from environment or rerun with awareness. Kept here so the CLI
+	// surface is stable across future iterations.
+	_ = interactive
 	// Emit a per-gate telemetry table at the end of every run. defer
 	// covers normal returns; bail() below handles the fatal-exit path
 	// (os.Exit bypasses defers, so we render just before exiting).
@@ -981,6 +991,14 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 			forceVerdict, forceVerdict)
 		fmt.Println()
 		fmt.Println("This is the escape hatch. The Critic's report above is the audit trail; the override is your call and your responsibility.")
+		// Post the override to the GH issue too — stderr/stdout
+		// don't survive the run, but a comment lives forever.
+		// Best-effort; failures don't block the pipeline.
+		if gr, ok := orch.Reporter().(*orchestrator.GitHubReporter); ok {
+			if perr := gr.PostForceVerdictOverride(ctx, rpt.Recommendation, forceVerdict); perr != nil {
+				fmt.Fprintf(os.Stderr, "aidev: post force-verdict comment: %v\n", perr)
+			}
+		}
 		rpt.Recommendation = forceVerdict
 	}
 
@@ -999,6 +1017,38 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		}
 	}
 	sketches := orch.AgentContext().Sketches
+
+	// Selector verdict at the top of the sketches block, so a CI
+	// reader sees the chosen sketch before scrolling through the
+	// alternatives. Falls through to "no Selector" message when the
+	// Selector was disabled or all sketches were disqualified.
+	if v := orch.AgentContext().Selector; v != nil {
+		fmt.Println()
+		fmt.Println("## Selector Verdict")
+		fmt.Println()
+		if v.ChosenNumber == 0 {
+			fmt.Printf("**No sketch was chosen.** %s\n", v.Rationale)
+		} else {
+			fmt.Printf("**Chosen:** Sketch %d  •  **Score:** %.2f  •  **Rubric:** %s  •  **Tie-breaker:** %t\n", v.ChosenNumber, v.Score, v.RubricVersion, v.TieBreakerUsed)
+			fmt.Printf("**Rationale:** %s\n", v.Rationale)
+		}
+		fmt.Println()
+	}
+
+	// P5: if the orchestrator transitioned to StateNeedsRefinement
+	// (Selector returned no pick), print a clear marker so the slash
+	// command can detect "stop, do not implement" without parsing
+	// the full report. The marker is grep-friendly and stable.
+	if orch.State() == orchestrator.StateNeedsRefinement {
+		fmt.Println()
+		fmt.Println("## ⚠ aidev needs refinement before implementing")
+		fmt.Println()
+		fmt.Println("The pipeline stopped before producing a chosen sketch. See the GH issue for the structured refinement comment with actionable next steps. The slash command should NOT proceed to implementation.")
+		fmt.Println()
+		fmt.Println("AIDEV_NEEDS_REFINEMENT=1")
+		return
+	}
+
 	for i, s := range sketches {
 		if i > 0 {
 			fmt.Println()
@@ -1047,6 +1097,46 @@ func writeArchitectOutput(c *agents.Context, sketches []agents.Sketch, dir strin
 	if c.Issue != nil {
 		fmt.Fprintf(&b, "**Issue:** %s/%s#%d — %s\n\n", c.Issue.Owner, c.Issue.Repo, c.Issue.Number, c.Issue.Title)
 	}
+
+	// Selector verdict goes FIRST so a downstream agent (Claude Code
+	// reading the handoff doc) sees the chosen sketch immediately and
+	// doesn't have to scroll through all N to learn which one to
+	// implement. The full sketch bodies follow for context, in case
+	// the implementer wants to compare alternatives.
+	if c.Selector != nil {
+		b.WriteString("## 🧭 Selector Verdict\n\n")
+		if c.Selector.ChosenNumber == 0 {
+			b.WriteString("**No sketch was chosen.** ")
+			b.WriteString(c.Selector.Rationale)
+			b.WriteString("\n\nThis run needs human refinement before implementation. Do NOT proceed to implement any sketch below — they were all disqualified or scored below the minimum.\n\n")
+		} else {
+			fmt.Fprintf(&b, "**Chosen:** Sketch %d\n", c.Selector.ChosenNumber)
+			fmt.Fprintf(&b, "**Score:** %.2f  •  **Rubric version:** %s  •  **Tie-breaker invoked:** %t\n\n", c.Selector.Score, c.Selector.RubricVersion, c.Selector.TieBreakerUsed)
+			fmt.Fprintf(&b, "**Rationale:** %s\n\n", c.Selector.Rationale)
+			if len(c.Selector.Breakdowns) > 0 {
+				b.WriteString("<details><summary>All sketch scores</summary>\n\n")
+				b.WriteString("| # | Title | Score | Aligned | Tension | Violation | Risks | Notes |\n")
+				b.WriteString("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n")
+				for _, bd := range c.Selector.Breakdowns {
+					notes := ""
+					if bd.DisqualifyReason != "" {
+						notes = "DISQUALIFIED: " + bd.DisqualifyReason
+					} else if bd.SketchNumber == c.Selector.ChosenNumber {
+						notes = "**CHOSEN**"
+					}
+					scoreCell := fmt.Sprintf("%.2f", bd.Score)
+					if bd.DisqualifyReason != "" {
+						scoreCell = "−∞"
+					}
+					fmt.Fprintf(&b, "| %d | %s | %s | %d | %d | %d | %d | %s |\n",
+						bd.SketchNumber, bd.Title, scoreCell, bd.Aligned, bd.Tension, bd.Violation, bd.Risks, notes)
+				}
+				b.WriteString("\n</details>\n\n")
+			}
+		}
+		b.WriteString("---\n\n")
+	}
+
 	b.WriteString("## Scout Brief\n\n")
 	b.WriteString(c.ScoutReport)
 	b.WriteString("\n\n## Critic Report\n\n")
@@ -1062,7 +1152,11 @@ func writeArchitectOutput(c *agents.Context, sketches []agents.Sketch, dir strin
 	}
 
 	b.WriteString("\n---\n\n")
-	b.WriteString("_To implement: pick a sketch number and run Claude Code against this repo with the sketch context above._\n")
+	if c.Selector != nil && c.Selector.ChosenNumber > 0 {
+		fmt.Fprintf(&b, "_To implement: read the chosen sketch above (Sketch %d) and run Claude Code against this repo with the sketch context._\n", c.Selector.ChosenNumber)
+	} else {
+		b.WriteString("_The Selector did not pick a sketch. See the Selector Verdict block above for why._\n")
+	}
 
 	if err := os.WriteFile(outPath, []byte(b.String()), 0o644); err != nil {
 		return "", err
@@ -1210,6 +1304,15 @@ func runInterviewLoop(
 			fatal(fmt.Sprintf("write clarifier: %v", err))
 		}
 		fmt.Fprintf(os.Stderr, "aidev: wrote clarifier session to %s\n", path)
+
+		// Audit trail: post the clarifier Q&A to the GH issue
+		// so the human's authoritative answers (or Claude Code's
+		// evidence-based answers) are durable. Best-effort.
+		if gr, ok := orch.Reporter().(*orchestrator.GitHubReporter); ok {
+			if perr := gr.PostClarifierSession(ctx, path); perr != nil {
+				fmt.Fprintf(os.Stderr, "aidev: post clarifier comment: %v\n", perr)
+			}
+		}
 
 		orch.AgentContext().ClarifierNotes = formatClarifierNotes(graph, answers)
 

@@ -92,7 +92,15 @@ prior pass. Treat those answers as AUTHORITATIVE GROUND TRUTH:
     Re-emitting 'unclear' or 'defer' after the user has answered is a
     failure mode: it means the loop made no progress and the user is
     stuck. Avoid it unless the answers literally created NEW
-    ambiguity.`
+    ambiguity.
+
+If this issue has a label matching the pattern 'aidev:decomposed-from-#<N>',
+the issue is already a child of a prior decomposition. Decomposition is
+allowed at most one level deep. Choose between 'build', 'defer', 'kill',
+or 'unclear' based only on the current issue's content; do NOT recommend
+further decomposition. (The 'decompose' verdict is not currently in the
+allowed list — this language anchors the cycle protection for future
+work.)`
 
 	// Marshal the principles into a compact, quotable block.
 	var principles strings.Builder

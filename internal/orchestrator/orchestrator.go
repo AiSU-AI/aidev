@@ -46,9 +46,17 @@ const (
 	StateScouting      State = "scouting"
 	StateCritiquing    State = "critiquing"
 	StateAwaitUser     State = "await_user"
-	StateArchitecting  State = "architecting"
-	StateSelecting     State = "selecting"
-	StateSketchesReady State = "sketches_ready"
+	StateArchitecting    State = "architecting"
+	StateSelecting       State = "selecting"
+	StateSketchesReady   State = "sketches_ready"
+	// StateNeedsRefinement is the terminal state when aidev refuses
+	// to proceed autonomously: Critic's last verdict is unclear/defer
+	// after the Clarifier loop maxed out, the Architect produced no
+	// viable sketches, OR the Selector found no implementable sketch.
+	// The slash command (/aidev-run) detects this state and stops
+	// without filing a PR; the reporter posts a "needs refinement"
+	// comment with actionable next steps for the human.
+	StateNeedsRefinement State = "needs_refinement"
 	StateImplementing  State = "implementing"
 	StatePatchReady    State = "patch_ready"
 	StateTesting       State = "testing"
@@ -569,6 +577,13 @@ func (o *Orchestrator) LoadIssue(ctx context.Context, url string) error {
 // and decide what to do.
 func (o *Orchestrator) RunDir() string { return o.runDir }
 
+// Reporter returns the active Reporter. Callers (main.go's interview
+// loop and force-verdict path) use this to post one-shot audit-trail
+// comments that aren't part of the state-machine event stream.
+// Returns nil if SetReporter explicitly cleared it; callers must
+// nil-check (or type-assert via the helper below).
+func (o *Orchestrator) Reporter() Reporter { return o.reporter }
+
 // LoadRepo scans a target directory and seeds the agent context with the
 // snapshot plus any repo-local principles, merged on top of the global set.
 //
@@ -711,6 +726,19 @@ func (o *Orchestrator) runAdvisoryGate(ctx context.Context, out chan<- Event, ga
 				State:   o.state,
 				Message: fmt.Sprintf("Coordinator [%s/%s]: %s", n.Gate, n.Severity, n.Body),
 			})
+			// Promote warn/concern severity to a standalone GH
+			// comment so the audit trail captures the Coordinator's
+			// observation alongside the Critic/Architect/Selector
+			// decisions. The pinned status only shows the latest
+			// transition; this gives every warning durable presence
+			// on the issue thread. Failures are non-fatal — the
+			// pipeline continued past the gate, the reporter post
+			// is best-effort.
+			if gr, ok := o.reporter.(*GitHubReporter); ok {
+				if perr := gr.PostCoordinatorNote(ctx, gateName, n.Severity, n.Body); perr != nil {
+					fmt.Fprintf(o.reporterLog, "aidev reporter: post coordinator note: %v\n", perr)
+				}
+			}
 		}
 	}
 }
@@ -852,6 +880,20 @@ func (o *Orchestrator) Continue(ctx context.Context) <-chan Event {
 				}
 				o.emit(ctx, out, Event{State: o.state, Message: msg})
 			}
+		}
+
+		// Refinement detection (P5): if the Selector ran and refused
+		// to pick (chosen=0), the pipeline cannot proceed
+		// autonomously. Transition to StateNeedsRefinement so the
+		// reporter posts the structured "needs refinement" comment
+		// and the slash command stops without filing a PR.
+		if o.ctx.Selector != nil && o.ctx.Selector.ChosenNumber == 0 {
+			o.state = StateNeedsRefinement
+			o.emit(ctx, out, Event{
+				State:   o.state,
+				Message: o.ctx.Selector.Rationale,
+			})
+			return
 		}
 
 		o.state = StateSketchesReady

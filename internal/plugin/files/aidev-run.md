@@ -139,34 +139,72 @@ of the Critic. Use it only when you're confident the Critic is
 spinning on questions the human has already resolved.
 
 STEP 6 — Once the Critic says **build** (or the user has forced
-build) and the Architect has produced sketches, READ
-`<repo>/.aidev/architect-output.md` in full. This is aidev's
-handoff doc: it contains the Scout brief, the Critic report, the
-N sketches, and the chosen-sketch placeholder. Summarise for the
-user:
+build) and the Architect + Selector have run, BEFORE reading the
+handoff doc, check the aidev stdout for the marker
+`AIDEV_NEEDS_REFINEMENT=1`. If present:
+
+  - The Selector refused to pick (all sketches disqualified, or no
+    sketch met the rubric's minimum implementable score).
+  - aidev posted a structured "🤔 needs refinement" comment to the
+    GH issue with checklist + suggested next actions.
+  - STOP. Do not implement, do not create a branch, do not file a
+    PR. Tell the user "aidev needs refinement — see the GH issue
+    comment" and link the issue URL.
+  - This is the autonomous escape hatch: when the issue isn't ready,
+    the human gets explicit hand-off instructions instead of a
+    half-baked PR.
+
+Otherwise (no refinement marker), find and READ the handoff doc.
+Its location:
+
+    $XDG_DATA_HOME/aidev/runs/<owner>-<repo>-<issue>/architect-output.md
+
+(or `~/.local/share/aidev/runs/...` when XDG_DATA_HOME is unset).
+Use the `<ISSUE>` and the repo's `<owner>/<repo>` from `gh repo view
+--json owner,name --jq '.owner.login + "/" + .name'` to construct the
+full path. The orchestrator also prints the path in its stdout when
+it writes the file — capture it from the Bash output if you have it.
+
+The handoff doc contains, in order:
+  1. The Selector verdict (chosen sketch, score, rationale, all-scores
+     table) — at the top
+  2. Scout brief
+  3. Critic report
+  4. All N Architect sketches in full
+
+The Selector has ALREADY chosen a sketch. Surface for the user:
   - what the Critic recommended (and whether it was overridden)
-  - the title of each Architect sketch (one line per sketch)
-  - any Critic concerns flagged as worth addressing during
-    implementation (non-blocking, but worth surfacing)
+  - the Selector's chosen sketch number and title
+  - the Selector's rationale (1-3 sentences from the verdict block)
+  - any Critic concerns worth addressing during implementation
+    (non-blocking, but worth surfacing)
 
-STEP 7 — Use `AskUserQuestion` to ask which sketch to implement.
-Options: "Sketch 1: <title>", "Sketch 2: <title>", ..., "Stop —
-I'll pick later". Quote the titles verbatim from the handoff doc
-so the user can match them against the file.
+If the Selector verdict shows **No sketch was chosen** (i.e.
+`ChosenNumber: 0` — happens when all sketches were disqualified by a
+critical-principle veto, or every sketch fell below the rubric's
+MinImplementableScore), STOP. Do not implement anything. Tell the
+user the Selector escalated for refinement and link the
+architect-output.md path so they can read the rationale.
 
-STEP 8 — On a sketch selection, implement the chosen sketch using
-your native Edit/Write/Bash tools. The Architect's sketch is the
+STEP 7 — Implement the **Selector's chosen sketch** using your
+native Edit/Write/Bash tools. The Architect's sketch is the
 contract — it lists files, scope, principles, and risks. The
 sketch's "Approach" + "Key decisions" + "Rough scope" sections
 are authoritative. Do not deviate without explicit user permission.
 
-If the sketch's `Risks` section flags a question that needs human
-judgment (e.g., "verify the visual context of the contactSales
-call site"), STOP before that step and ask the user via
-`AskUserQuestion`. Do not silently make a copy/UX call on the
-human's behalf.
+The Selector chose autonomously by design. Do NOT use
+`AskUserQuestion` to second-guess the pick — the user opted into
+autonomy by running `/aidev-run`. If they wanted a manual pick
+they would have re-run aidev with `-interactive` (which the slash
+command does NOT pass by default).
 
-STEP 9 — When the implementation is done:
+If the chosen sketch's `Risks` section flags a question that needs
+human judgment (e.g., "verify the visual context of the contactSales
+call site"), STOP before that step and ask the user via
+`AskUserQuestion`. The Selector picks the SKETCH; humans still own
+copy/UX/policy calls inside the implementation.
+
+STEP 8 — When the implementation is done:
   - run any test suite the project has (`pnpm verify`, `go test`,
     `cargo test`, etc. — figure it out from the repo)
   - summarise files changed, lines added/removed, tests run, any
