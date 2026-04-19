@@ -2,8 +2,11 @@ package agents
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/aisu-ai/aidev/internal/llm"
@@ -128,6 +131,16 @@ func (a *Architect) Run(ctx context.Context, cc *Context) ([]Sketch, error) {
 			Messages: []llm.Message{
 				{Role: "user", Content: userMsg},
 			},
+			// Temperature=0 is aspirational intent for determinism
+			// (issue #38). Honored by the anthropic provider but
+			// currently a no-op via claude-cli, which does not forward
+			// per-call temperature to the subprocess. Setting it here
+			// encodes the goal so deterministic behaviour follows
+			// automatically once claude-cli exposes --temperature or
+			// when a user routes the Architect tier through the
+			// anthropic provider. The stable-hash sort below is the
+			// actual deterministic-ordering guarantee today.
+			Temperature: 0,
 		})
 		if err != nil {
 			// Accumulate the error but keep going — partial success is
@@ -155,11 +168,68 @@ func (a *Architect) Run(ctx context.Context, cc *Context) ([]Sketch, error) {
 	if len(sketches) == 0 {
 		return nil, fmt.Errorf("architect: produced no parseable sketches after %d calls. First error: %w", a.N, firstOrNil(callErrors))
 	}
+	// Deterministic ordering (issue #38). The N sequential LLM calls
+	// can produce the same 3 "ideas" in different emission orders
+	// across runs (e.g. a small prompt-sampling nudge picks idea-X
+	// first on one run and idea-Y first on the next, then the
+	// priorTitles steer the subsequent calls differently). Sorting by
+	// a stable hash of the sketch body gives the user a consistent
+	// `-sketch N` mapping: same sketch content → same ordinal slot,
+	// regardless of the order the LLM happened to emit them.
+	//
+	// The sort key is intentionally opaque (sha256 of markdown) — no
+	// semantic ordering (smallest-diff-first, lowest-risk-first) is
+	// promised. A future refinement can introduce semantic ordering
+	// if it proves valuable; for now "stable but arbitrary" is the
+	// contract.
+	sortSketchesDeterministic(sketches)
+	// Reassign 1-based Number and renumber the header after the sort
+	// so the new ordinal slot is reflected in both the struct field
+	// and the embedded markdown header.
+	for i := range sketches {
+		sketches[i].Number = i + 1
+		sketches[i].Markdown = renumberSketch(sketches[i].Markdown, i+1)
+	}
 	// Partial success path — log the missing ones via the returned
 	// sketches slice (caller sees len(sketches) < N) but do not fail.
 	// The headless reporter already prints "Architect produced X
 	// sketches" which will naturally reflect any shortfall.
 	return sketches, nil
+}
+
+// sortSketchesDeterministic orders sketches by a stable SHA-256 hash
+// of their markdown body. Pure function; deterministic given the same
+// input slice regardless of the order the LLM produced them in. The
+// hash is truncated to 16 hex chars for comparison — 64 bits of
+// collision space, more than enough for typical N=3..9 sketch
+// counts.
+//
+// Isolated in its own function so unit tests can drive arbitrary
+// permutations of the same sketches and assert the output order is
+// invariant.
+func sortSketchesDeterministic(sketches []Sketch) {
+	sort.SliceStable(sketches, func(i, j int) bool {
+		return sketchSortKey(sketches[i]) < sketchSortKey(sketches[j])
+	})
+}
+
+// sketchSortKey returns the stable hash-based key for a single
+// Sketch. It hashes the Title plus the markdown body with the
+// `## Sketch N:` header stripped — the number in that header is the
+// loop index (emission order), which is exactly what we're trying to
+// make irrelevant. Including it in the hash would defeat the sort:
+// same content emitted in different orders would produce different
+// keys (because the number would differ), and the sort would be
+// stable-but-pointless.
+//
+// Hashing (Title + body-without-header) gives same-content-same-key
+// across runs regardless of emission order — which is the `-sketch N`
+// invariant issue #38 is built around.
+func sketchSortKey(s Sketch) string {
+	body := sketchHeaderRe.ReplaceAllString(s.Markdown, "")
+	input := s.Title + "\n" + body
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:8])
 }
 
 // buildUserMessage assembles the per-run user message the Architect sees
