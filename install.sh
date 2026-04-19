@@ -28,6 +28,7 @@
 #   --version <ver>   specific release tag to download (default: latest)
 #   --force           overwrite existing binary / config / plugin files
 #   --no-doctor       skip the final `aidev doctor` smoke test
+#   --no-init         skip the interactive `aidev init` walkthrough at the end
 #   --no-prereqs      skip the "suggest installing missing prereqs" section
 #   -h, --help        print this help
 
@@ -46,6 +47,7 @@ die() { printf "\033[1;31m!!\033[0m %s\n" "$*" >&2; exit 1; }
 # --------------------------------------------------------------------
 FORCE=0
 RUN_DOCTOR=1
+RUN_INIT=1
 CHECK_PREREQS=1
 BIN_DIR=""
 MODE="auto"
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --version)      VERSION_TAG="$2"; shift 2 ;;
     --force)        FORCE=1; shift ;;
     --no-doctor)    RUN_DOCTOR=0; shift ;;
+    --no-init)      RUN_INIT=0; shift ;;
     --no-prereqs)   CHECK_PREREQS=0; shift ;;
     -h|--help)
       sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
@@ -262,18 +265,45 @@ fi
 FORCE_FLAG=""
 [[ "$FORCE" -eq 1 ]] && FORCE_FLAG="--force"
 
-say "Installing default config"
-"$INSTALLED_BIN" install $FORCE_FLAG
-ok "config installed"
+# Decide whether to run the interactive `aidev init` walkthrough or
+# fall back to the non-interactive install-config + doctor path.
+#
+# Criteria for init:
+#   - --no-init was NOT passed
+#   - stdin is a TTY (so a `curl | bash` pipeline falls back gracefully)
+#
+# When init runs, it REPLACES the `aidev install` + `aidev doctor`
+# steps below — init lays down the config AND runs doctor itself.
+RUN_INIT_EFFECTIVE=0
+if [[ "$RUN_INIT" -eq 1 ]] && [[ -t 0 ]]; then
+  RUN_INIT_EFFECTIVE=1
+fi
+
+if [[ "$RUN_INIT_EFFECTIVE" -eq 1 ]]; then
+  say "Starting aidev init (interactive setup)"
+  INIT_FLAGS=()
+  [[ "$FORCE" -eq 1 ]] && INIT_FLAGS+=("--force")
+  if "$INSTALLED_BIN" init "${INIT_FLAGS[@]}"; then
+    ok "init complete"
+  else
+    warn "aidev init did not complete cleanly — see output above"
+    warn "rerun: $INSTALLED_BIN init"
+  fi
+else
+  say "Installing default config"
+  "$INSTALLED_BIN" install $FORCE_FLAG
+  ok "config installed"
+fi
 
 say "Installing Claude Code slash commands"
 "$INSTALLED_BIN" plugin install $FORCE_FLAG
 ok "plugin commands installed"
 
 # --------------------------------------------------------------------
-# Smoke test.
+# Smoke test. Skipped when init ran, because init already ran doctor
+# itself as its final verification gate.
 # --------------------------------------------------------------------
-if [[ "$RUN_DOCTOR" -eq 1 ]]; then
+if [[ "$RUN_DOCTOR" -eq 1 ]] && [[ "$RUN_INIT_EFFECTIVE" -eq 0 ]]; then
   say "Running aidev doctor"
   if "$INSTALLED_BIN" doctor; then
     ok "doctor passed"
@@ -299,9 +329,10 @@ cat <<EOF
   Next steps:
     1. Verify: aidev doctor
     2. (Optional) claude /login if you haven't authenticated Claude Code
-    3. Run on a real issue:
+    3. Configure (if skipped): aidev init
+    4. Run on a real issue:
          aidev -issue https://github.com/your-org/your-repo/issues/42 -repo ~/code/your-repo
-    4. Or from inside Claude Code:
+    5. Or from inside Claude Code:
          /aidev-run <issue-url> <repo-path>
 
   Uninstall:

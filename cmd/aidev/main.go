@@ -96,6 +96,17 @@ func main() {
 		runInstallSubcommand()
 		return
 	}
+	// Intercept the `init` subcommand. Guided first-run onboarding:
+	// checks prereqs, lets the user pick a profile (or pass
+	// --profile), optionally installs Ollama, writes the config, and
+	// runs `aidev doctor` as a final verification gate. Distinct
+	// from `aidev install`: init asks questions and respects user
+	// choices; install reinstalls the shipped defaults verbatim.
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runInitSubcommand()
+		return
+	}
 	// Intercept the `followups` subcommand. Reads .aidev/followups.md,
 	// parses the Reviewer's proposals, and files them as real GitHub
 	// issues (when --file-issues is passed).
