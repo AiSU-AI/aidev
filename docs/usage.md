@@ -81,8 +81,24 @@ aidev followups -repo <path>                          # dry-run review of propos
 aidev followups -repo <path> --file-issues --target owner/repo  # actually file them
 aidev plugin install                                  # install Claude Code slash commands
 aidev install                                         # (re)install default config to ~/.config/aidev
+aidev init                                            # interactive first-run: pick a profile + verify prereqs
+aidev init --profile cloud-only --yes                 # non-interactive: pick profile, skip prompts (CI)
 aidev --version                                       # print the embedded build version
 ```
+
+### `aidev init` — guided first-run setup
+
+`aidev init` is the recommended entry point after installing the binary. It:
+
+1. Checks prerequisites: `claude` CLI on `PATH`, Ollama on `PATH`, `GITHUB_TOKEN` resolvable via env or `gh auth token`.
+2. Prompts you to pick a profile — **cloud-only** (no Ollama, pure Claude Code), **default** (local Ollama + Claude Code hybrid), **high-vram**, **low-vram**, or **offline**.
+3. If the picked profile needs Ollama and it's missing, offers to install via `brew install ollama` (macOS with Homebrew) or `curl | sh` (Linux). You can decline and fall back to cloud-only.
+4. Writes `~/.config/aidev/models.yaml` with the chosen profile active.
+5. Runs `aidev doctor` as a hard gate. If doctor fails, init exits non-zero and points you at the fix.
+
+For scripted callers (CI, Docker builds): `aidev init --profile cloud-only --yes` skips every prompt, fails loudly if prereqs are missing (no install side effects), and exits 0 on success.
+
+Re-running `aidev init` against an existing `~/.config/aidev/models.yaml` refuses to overwrite unless `--force` is passed — this protects hand-edited customizations. Use `aidev config profile use <name>` to switch profiles without rewriting the file.
 
 ## Interactive TUI (manual mode)
 

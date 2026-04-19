@@ -26,12 +26,31 @@ cd ~/code/personal/aidev
 
 1. Builds or downloads the binary.
 2. Copies it to `~/.local/bin/aidev` (or `~/bin`, `/usr/local/bin` — first writable dir on your `PATH`).
-3. Writes default config to `~/.config/aidev/{models,principles}.yaml`.
+3. Runs `aidev init` — interactive walkthrough that checks prerequisites (Claude Code, Ollama, `GITHUB_TOKEN`), offers a profile choice, and writes `~/.config/aidev/{models,principles}.yaml`. When `stdin` isn't a TTY (e.g. `curl | bash`), `init` is skipped and the installer falls back to `aidev install` + `aidev doctor`.
 4. Installs Claude Code slash commands to `~/.claude/commands/aidev-*.md`.
-5. Runs `aidev doctor` to smoke-test the environment.
-6. Prints next steps.
+5. Prints next steps.
 
 If the install dir isn't already on your `PATH`, the script prints the exact `export PATH=...` line to add to `~/.zshrc` or `~/.bashrc`.
+
+### Running `aidev init` later
+
+If you skipped the walkthrough (piped `curl | bash`, passed `--no-init`, or just want to re-do it), run:
+
+```sh
+aidev init                        # interactive — recommended
+aidev init --profile cloud-only --yes   # non-interactive (CI, scripted)
+aidev init --force                # overwrite an existing models.yaml
+```
+
+`aidev init` picks a shipped profile based on what's installed:
+
+- **cloud-only** — every agent through Claude Code. No Ollama required. Recommended when Ollama isn't installed.
+- **default** — local Ollama for Scout/Tester/Implementer/Reviewer, Claude Code for Critic/Architect/Coordinator. Needs Ollama (~5GB VRAM for the 14B coder model).
+- **high-vram** — bigger local models (32B Implementer). Needs Ollama + ~24GB VRAM.
+- **low-vram** — every Ollama tier on a 7B model. Needs Ollama with ~5GB VRAM total.
+- **offline** — every agent on a local Ollama model, zero cloud calls.
+
+After init finishes, `aidev doctor` runs automatically as a final verification gate. If doctor fails, init exits non-zero and points you at the fix.
 
 ## Installer flags
 
@@ -42,6 +61,7 @@ If the install dir isn't already on your `PATH`, the script prints the exact `ex
 ./install.sh --version v0.3.0     # pin a specific release tag (release mode only)
 ./install.sh --force              # overwrite existing binary / config / plugin files
 ./install.sh --no-doctor          # skip the post-install smoke test
+./install.sh --no-init            # skip the interactive aidev init walkthrough
 ./install.sh --no-prereqs         # skip the 'suggest installing ollama' check
 ```
 
