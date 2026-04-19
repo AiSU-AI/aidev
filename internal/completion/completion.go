@@ -435,11 +435,12 @@ _aidev() {
                         '--help[Show help]'
                     ;;
                 plugin)
-                    _arguments \
-                        '1:plugin_action:(install uninstall)' \
-                        '--force[Force overwrite existing files]' \
-                        '--dir[Target directory]:directory:_directories' \
-                        '--help[Show help]'
+                    local -a plugin_commands
+                    plugin_commands=(
+                        'install:Install Claude Code slash commands'
+                        'uninstall:Remove Claude Code slash commands'
+                    )
+                    _describe 'plugin command' plugin_commands
                     ;;
                 followups)
                     _arguments \
@@ -471,10 +472,13 @@ _aidev() {
                     _describe 'ollama command' ollama_commands
                     ;;
                 completion)
-                    _arguments \
-                        '1:completion_action:(install bash zsh)' \
-                        '--script[Output the script instead of installing]' \
-                        '--help[Show help]'
+                    local -a completion_commands
+                    completion_commands=(
+                        'install:Install completions for detected shell'
+                        'bash:Install bash completion'
+                        'zsh:Install zsh completion'
+                    )
+                    _describe 'completion command' completion_commands
                     ;;
             esac
             ;;
