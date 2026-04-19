@@ -636,6 +636,27 @@ func runReviewSubcommand() {
 	}
 
 	// Triage mode: run the meta-judge and emit JSON to stdout.
+	//
+	// Issue #53: Triage needs the Selector verdict + chosen Sketch to
+	// function — without them it refuses with "no chosen sketch
+	// required". The prior /aidev-run persisted a triage-state sidecar
+	// at <runDir>/triage-state.json; hydrate the orchestrator's
+	// context from it here so Triage has what it needs. Fall through
+	// to the existing "no chosen sketch" error from orch.Triage if the
+	// sidecar is missing or unparseable — that error is loud and the
+	// user knows to re-run /aidev-run to regenerate the state.
+	if runDir := orch.RunDir(); runDir != "" {
+		if err := orch.LoadTriageState(runDir); err != nil {
+			// Missing sidecar is not fatal at this layer — the later
+			// orch.Triage call will surface a clearer "no chosen
+			// sketch" error if hydration actually mattered for this
+			// run. Malformed / partial sidecars fail loudly here
+			// because the all-or-nothing contract is safer than
+			// silently running Triage against a corrupted state.
+			fmt.Fprintf(os.Stderr, "aidev review: hydrate triage state: %v\n", err)
+		}
+	}
+
 	var ci *agents.CIStatus
 	if *ciStatusPath != "" {
 		raw, rerr := os.ReadFile(*ciStatusPath)
@@ -1237,6 +1258,17 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		} else {
 			fmt.Println()
 			fmt.Printf("_Architect output written to %s — hand off to Claude Code for implementation._\n", outPath)
+		}
+		// Issue #53: also persist a machine-readable sidecar of the
+		// Triage-relevant state (Selector verdict + sketches + reports)
+		// so a later `aidev review -triage` invocation — which runs in
+		// a fresh process — can hydrate the orchestrator context
+		// without re-running Scout/Critic/Architect/Selector. Without
+		// this, Triage refuses with "no chosen sketch — Selector
+		// verdict required" and the autonomous review loop stalls.
+		// Best-effort: failures are logged, pipeline continues.
+		if err := orch.SaveTriageState(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "aidev: save triage state: %v\n", err)
 		}
 	}
 
