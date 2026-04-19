@@ -20,7 +20,7 @@
 #
 # ---
 #
-# Shipped profiles (this PR ships four):
+# Shipped profiles (this PR ships five):
 #
 #   default    Local Ollama for the agents (Implementer/Reviewer
 #              with native tool use, Critic/Architect on Claude
@@ -28,6 +28,13 @@
 #              the Coordinator monitoring every agent transition.
 #              Recommended for users with both local hardware and
 #              a Claude Code subscription.
+#
+#   cloud-only No local Ollama required. Every agent routes through
+#              Claude Code (claude-cli). Best for users without
+#              Ollama installed, or CI/sandboxed environments
+#              where local model hosting isn't feasible. The
+#              recommended profile for the `aidev init` onboarding
+#              when Ollama is absent.
 #
 #   offline    Fully offline. Every role on a local Ollama model.
 #              Zero cloud calls. Use when air-gapped, on a plane,
@@ -111,6 +118,57 @@ profiles:
         provider: ollama
         model: qwen2.5-coder:14b
         endpoint: http://localhost:11434
+        max_tokens: 8192
+        temperature: 0.2
+      cloud_large:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+      oversight:
+        provider: claude-cli
+        model: ""
+        max_tokens: 8192
+        temperature: 0.3
+    routing:
+      scout: small
+      tester: small
+      implementer: medium
+      reviewer: medium
+      critic: cloud_large
+      architect: cloud_large
+      charter: cloud_large
+      coordinator: oversight
+
+  cloud-only:
+    description: |
+      No local Ollama required. Every agent routes through Claude
+      Code (claude-cli). Best for users without Ollama installed,
+      or CI/sandboxed environments where local model hosting
+      isn't feasible. This is the recommended profile for
+      `aidev init` onboarding when Ollama isn't present.
+
+      Cost vs. `default`: marginal. The expensive roles
+      (critic, architect, coordinator) were already cloud-routed
+      in default; cloud-only just redirects the cheap local roles
+      (scout, tester, implementer, reviewer) to the same cloud
+      tier. Scout and Tester are short prompts; Implementer and
+      Reviewer loops can be chattier but still bounded.
+
+      Note: the Implementer loses native tool use (read_file,
+      glob, grep, list_dir) when routed through claude-cli, per
+      the comment at the top of this file. The legacy picker +
+      NEED_FILES path still works; it's just slower on multi-file
+      changes than the tool-use path.
+    tiers:
+      small:
+        provider: claude-cli
+        model: ""
+        max_tokens: 2048
+        temperature: 0.2
+      medium:
+        provider: claude-cli
+        model: ""
         max_tokens: 8192
         temperature: 0.2
       cloud_large:
