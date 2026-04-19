@@ -837,6 +837,46 @@ func (o *Orchestrator) Recritique(ctx context.Context) <-chan Event {
 	return out
 }
 
+// MarkNeedsRefinement transitions the orchestrator into
+// StateNeedsRefinement with the supplied reason. It exists so the
+// headless auto-run path in `cmd/aidev` can emit the structured
+// "🤔 needs refinement" audit comment when the Critic returns unclear
+// in an environment where the Clarifier interview couldn't resolve it
+// (no TTY, or the interview ran and the verdict stayed unclear).
+//
+// This is the missing transition that issue #46 tracks: today, that
+// codepath returns silently and the reporter applies the vague
+// `aidev:awaiting-decision` label instead of the structured refinement
+// comment + `aidev:needs-refinement` label the Selector-refusal path
+// already produces. Reusing the existing StateNeedsRefinement
+// emission keeps the contract (label, comment template, stdout marker
+// via the caller) in one place.
+//
+// Valid from StateAwaitUser (the natural resting place after the
+// first Run() pass when the Critic verdict didn't auto-advance the
+// pipeline). Any other state is a misuse — we surface a StateError
+// rather than corrupt the audit trail.
+func (o *Orchestrator) MarkNeedsRefinement(ctx context.Context, reason string) <-chan Event {
+	out := make(chan Event, 2)
+	go func() {
+		defer close(out)
+		if o.state != StateAwaitUser {
+			o.emit(ctx, out, Event{
+				State: StateError,
+				Err:   fmt.Errorf("orchestrator: MarkNeedsRefinement called from state %q, expected await_user", o.state),
+			})
+			o.state = StateError
+			return
+		}
+		o.state = StateNeedsRefinement
+		o.emit(ctx, out, Event{
+			State:   o.state,
+			Message: reason,
+		})
+	}()
+	return out
+}
+
 // emit fans an event out to both the TUI channel and the Reporter. It
 // stamps the event with a pointer to the current agents.Context so the
 // Reporter can read downstream artifacts (ScoutReport, CriticReport,
