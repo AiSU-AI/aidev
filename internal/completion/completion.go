@@ -497,4 +497,9 @@ _github_repos() {
     _describe 'GitHub repository' repos
 }
 
-_aidev "$@"`
+# The '#compdef aidev' directive at the top of this file registers
+# _aidev as the completion function for the aidev command; zsh will
+# invoke it on tab automatically. Do NOT call _aidev directly here
+# — it runs _arguments, which errors outside a completion context
+# (e.g. when the file is sourced by "omz reload").
+compdef _aidev aidev`
