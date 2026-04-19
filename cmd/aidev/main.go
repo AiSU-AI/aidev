@@ -1147,6 +1147,37 @@ func runHeadless(ctx context.Context, orch *orchestrator.Orchestrator, cfg *conf
 		rpt.Recommendation = forceVerdict
 	}
 
+	// Issue #46: when auto-run ends with Critic=unclear and we didn't
+	// resolve it (either no TTY so no interview ran, or the interview
+	// ran but couldn't drive the verdict to build), emit the structured
+	// needs-refinement audit trail instead of silently landing on
+	// StateAwaitUser with the vague aidev:awaiting-decision label.
+	// The slash command's STEP 6 depends on grep'ing
+	// AIDEV_NEEDS_REFINEMENT=1 — without this emission that grep
+	// silently fails and the slash command barrels past a state the
+	// user should have been told about.
+	if auto && rpt != nil && rpt.Recommendation == "unclear" {
+		// The full Critic report with its sharp questions is already
+		// posted to the issue by the Critic's own reporter path;
+		// postNeedsRefinement points the reader at it via
+		// "see the Critic comment above", so we don't need to parse
+		// the sharp-questions block out of the Critic markdown here.
+		// A short static reason is enough to anchor the audit comment.
+		reason := "Critic verdict: unclear. The Clarifier couldn't resolve the ambiguity (no TTY for an interactive interview, or the interview ran but the verdict stayed unclear). See the Critic report above for the sharp questions that need human answers before aidev can proceed."
+		for ev := range orch.MarkNeedsRefinement(ctx, reason) {
+			if ev.Err != nil {
+				fmt.Fprintf(os.Stderr, "aidev: mark needs-refinement: %v\n", ev.Err)
+			}
+		}
+		fmt.Println()
+		fmt.Println("## ⚠ aidev needs refinement before implementing")
+		fmt.Println()
+		fmt.Println("The Critic couldn't reach a decisive verdict. See the GH issue for the structured refinement comment with actionable next steps. The slash command should NOT proceed to implementation.")
+		fmt.Println()
+		fmt.Println("AIDEV_NEEDS_REFINEMENT=1")
+		return
+	}
+
 	if !auto || rpt == nil || rpt.Recommendation != "build" {
 		return
 	}
