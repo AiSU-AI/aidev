@@ -439,7 +439,10 @@ _aidev() {
                     # (1-based). For "aidev plugin <TAB>" it's 3 —
                     # we're picking the sub-verb. For
                     # "aidev plugin install <TAB>" it's 4+ — we're
-                    # past the sub-verb and want flags.
+                    # past the sub-verb and want flags. _arguments
+                    # doesn't cleanly nest inside the outer state
+                    # dispatch, so we use _describe for the
+                    # subcommands and compadd for the flags.
                     if (( CURRENT == 3 )); then
                         local -a plugin_commands
                         plugin_commands=(
@@ -448,10 +451,13 @@ _aidev() {
                         )
                         _describe 'plugin command' plugin_commands
                     else
-                        _arguments \
-                            '--force[Force overwrite existing files]' \
-                            '--dir[Target directory]:directory:_directories' \
-                            '--help[Show help]'
+                        local -a plugin_flags
+                        plugin_flags=(
+                            '--force:Force overwrite existing files'
+                            '--dir:Target directory'
+                            '--help:Show help'
+                        )
+                        _describe 'plugin flag' plugin_flags
                     fi
                     ;;
                 followups)
@@ -493,9 +499,12 @@ _aidev() {
                         )
                         _describe 'completion command' completion_commands
                     else
-                        _arguments \
-                            '--script[Output the script instead of installing]' \
-                            '--help[Show help]'
+                        local -a completion_flags
+                        completion_flags=(
+                            '--script:Output the script instead of installing'
+                            '--help:Show help'
+                        )
+                        _describe 'completion flag' completion_flags
                     fi
                     ;;
             esac
