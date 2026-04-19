@@ -435,12 +435,24 @@ _aidev() {
                         '--help[Show help]'
                     ;;
                 plugin)
-                    local -a plugin_commands
-                    plugin_commands=(
-                        'install:Install Claude Code slash commands'
-                        'uninstall:Remove Claude Code slash commands'
-                    )
-                    _describe 'plugin command' plugin_commands
+                    # CURRENT is the word index the cursor sits on
+                    # (1-based). For "aidev plugin <TAB>" it's 3 —
+                    # we're picking the sub-verb. For
+                    # "aidev plugin install <TAB>" it's 4+ — we're
+                    # past the sub-verb and want flags.
+                    if (( CURRENT == 3 )); then
+                        local -a plugin_commands
+                        plugin_commands=(
+                            'install:Install Claude Code slash commands'
+                            'uninstall:Remove Claude Code slash commands'
+                        )
+                        _describe 'plugin command' plugin_commands
+                    else
+                        _arguments \
+                            '--force[Force overwrite existing files]' \
+                            '--dir[Target directory]:directory:_directories' \
+                            '--help[Show help]'
+                    fi
                     ;;
                 followups)
                     _arguments \
@@ -472,13 +484,19 @@ _aidev() {
                     _describe 'ollama command' ollama_commands
                     ;;
                 completion)
-                    local -a completion_commands
-                    completion_commands=(
-                        'install:Install completions for detected shell'
-                        'bash:Install bash completion'
-                        'zsh:Install zsh completion'
-                    )
-                    _describe 'completion command' completion_commands
+                    if (( CURRENT == 3 )); then
+                        local -a completion_commands
+                        completion_commands=(
+                            'install:Install completions for detected shell'
+                            'bash:Install bash completion'
+                            'zsh:Install zsh completion'
+                        )
+                        _describe 'completion command' completion_commands
+                    else
+                        _arguments \
+                            '--script[Output the script instead of installing]' \
+                            '--help[Show help]'
+                    fi
                     ;;
             esac
             ;;
