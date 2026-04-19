@@ -260,7 +260,7 @@ _aidev_completion() {
 
     case "${prev}" in
         aidev)
-            COMPREPLY=($(compgen -W "--version --help -issue -repo -config -headless -auto -n -sketch -force-verdict doctor charter test review plugin install followups clarify config ollama" -- "${cur}"))
+            COMPREPLY=($(compgen -W "--version --help -issue -repo -config -headless -auto -n -sketch -interactive -force-verdict -skip-doctor -no-audit-trail doctor charter test review plugin install init followups clarify config ollama completion" -- "${cur}"))
             ;;
         -issue)
             if [[ "${cur}" == https://* ]]; then
@@ -269,17 +269,34 @@ _aidev_completion() {
                 COMPREPLY=($(compgen -W "https://github.com" -- "${cur}"))
             fi
             ;;
-        -repo|-config)
+        -repo|-config|--dir|-dir)
             COMPREPLY=($(compgen -d -- "${cur}"))
             ;;
-        -n|-sketch)
+        -n|-sketch|-round)
             COMPREPLY=($(compgen -W "1 2 3 4 5 6 7 8 9" -- "${cur}"))
             ;;
         -force-verdict)
             COMPREPLY=($(compgen -W "build defer kill" -- "${cur}"))
             ;;
-        doctor|charter|test|review|install|clarify)
+        --profile)
+            # The five shipped profiles — keep in sync with
+            # cmd/aidev/init_subcommand.go shippedInitProfiles.
+            COMPREPLY=($(compgen -W "cloud-only default high-vram low-vram offline" -- "${cur}"))
+            ;;
+        doctor)
+            COMPREPLY=($(compgen -W "-config --no-spawn --help" -- "${cur}"))
+            ;;
+        charter|test|clarify)
             COMPREPLY=($(compgen -W "-repo -config --help" -- "${cur}"))
+            ;;
+        review)
+            COMPREPLY=($(compgen -W "-issue -repo -config -patch -triage -round -ci-status -prev-actions --help" -- "${cur}"))
+            ;;
+        install)
+            COMPREPLY=($(compgen -W "--force --dir --help" -- "${cur}"))
+            ;;
+        init)
+            COMPREPLY=($(compgen -W "--profile --yes --force --dir --skip-doctor --help" -- "${cur}"))
             ;;
         plugin)
             COMPREPLY=($(compgen -W "install uninstall --help" -- "${cur}"))
@@ -292,6 +309,9 @@ _aidev_completion() {
             ;;
         ollama)
             COMPREPLY=($(compgen -W "list recommend validate health profile --help" -- "${cur}"))
+            ;;
+        completion)
+            COMPREPLY=($(compgen -W "install bash zsh --script --help" -- "${cur}"))
             ;;
         profile)
             if [[ "${words[*]}" == *"config profile"* ]]; then
@@ -315,9 +335,9 @@ _aidev_completion() {
             ;;
         *)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=($(compgen -W "--version --help -issue -repo -config -headless -auto -n -sketch -force-verdict" -- "${cur}"))
+                COMPREPLY=($(compgen -W "--version --help -issue -repo -config -headless -auto -n -sketch -interactive -force-verdict -skip-doctor -no-audit-trail" -- "${cur}"))
             else
-                COMPREPLY=($(compgen -W "doctor charter test review plugin install followups clarify config ollama" -- "${cur}"))
+                COMPREPLY=($(compgen -W "doctor charter test review plugin install init followups clarify config ollama completion" -- "${cur}"))
             fi
             ;;
     esac
@@ -336,10 +356,12 @@ _aidev() {
         'review:Review generated patches'
         'plugin:Manage Claude Code plugins'
         'install:Install default configuration'
+        'init:Guided first-run onboarding (profile pick + doctor gate)'
         'followups:Manage follow-up issues'
         'clarify:Clarify ambiguous requirements'
         'config:Manage configuration'
         'ollama:Manage Ollama models'
+        'completion:Install shell tab completion'
     )
 
     local -a main_options
@@ -351,9 +373,12 @@ _aidev() {
         '-config[Config directory]:directory:_directories'
         '-headless[Run without TUI]'
         '-auto[Auto-run architect when critic recommends build]'
+        '-interactive[Pause at Architect for manual sketch pick]'
         '-n[Number of architect sketches]:number:(1 2 3 4 5 6 7 8 9)'
         '-sketch[Auto-select sketch number]:number:(1 2 3 4 5 6 7 8 9)'
         '-force-verdict[Force critic verdict]:verdict:(build defer kill)'
+        '-skip-doctor[Skip the startup precondition audit]'
+        '-no-audit-trail[Disable posting progress to the GitHub issue]'
     )
 
     local context state line
@@ -370,10 +395,43 @@ _aidev() {
             ;;
         args)
             case $line[1] in
-                doctor|charter|test|review|install|clarify)
+                charter|test|clarify)
                     _arguments \
                         '-repo[Repository path]:directory:_directories' \
                         '-config[Config directory]:directory:_directories' \
+                        '--help[Show help]'
+                    ;;
+                doctor)
+                    _arguments \
+                        '-config[Config directory]:directory:_directories' \
+                        '--no-spawn[Disable auto-spawn of ollama serve]' \
+                        '--help[Show help]'
+                    ;;
+                review)
+                    _arguments \
+                        '-issue[GitHub issue URL]:issue:_urls' \
+                        '-repo[Repository path]:directory:_directories' \
+                        '-config[Config directory]:directory:_directories' \
+                        '-patch[Path to patch file]:patch:_files' \
+                        '-triage[Emit JSON for review->fix loop]' \
+                        '-round[Review-loop round number]:round:(1 2 3 4 5)' \
+                        '-ci-status[Path to CI status JSON]:ci-status:_files' \
+                        '-prev-actions[Path to prior-round TriageActions JSON]:prev-actions:_files' \
+                        '--help[Show help]'
+                    ;;
+                install)
+                    _arguments \
+                        '--force[Overwrite existing config files]' \
+                        '--dir[Target directory]:directory:_directories' \
+                        '--help[Show help]'
+                    ;;
+                init)
+                    _arguments \
+                        '--profile[Activate profile without prompting]:profile:(cloud-only default high-vram low-vram offline)' \
+                        '--yes[Non-interactive mode, assume yes]' \
+                        '--force[Overwrite existing models.yaml]' \
+                        '--dir[Target config directory]:directory:_directories' \
+                        '--skip-doctor[Skip the final doctor verification]' \
                         '--help[Show help]'
                     ;;
                 plugin)
@@ -411,6 +469,12 @@ _aidev() {
                         'profile:Show usage profile'
                     )
                     _describe 'ollama command' ollama_commands
+                    ;;
+                completion)
+                    _arguments \
+                        '1:completion_action:(install bash zsh)' \
+                        '--script[Output the script instead of installing]' \
+                        '--help[Show help]'
                     ;;
             esac
             ;;
