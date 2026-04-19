@@ -38,6 +38,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/plugin"
+	"github.com/aisu-ai/aidev/internal/repo"
 	"github.com/aisu-ai/aidev/internal/tui"
 	"github.com/aisu-ai/aidev/internal/version"
 )
@@ -197,7 +198,7 @@ func main() {
 	// it to turn a bare issue number into a full URL via git remote
 	// inference. Repo-less bare numbers fail loudly instead of silently
 	// running against the wrong target.
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo path: %v", err))
 	}
@@ -282,7 +283,7 @@ func runClarifySubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("orchestrator: %v", err))
 	}
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
 	}
@@ -388,7 +389,7 @@ func runFollowUpsSubcommand() {
 
 	_ = mustLoadConfig(*configDir) // validate config even though we don't use it directly
 
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
 	}
@@ -592,7 +593,7 @@ func runReviewSubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("orchestrator: %v", err))
 	}
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
 	}
@@ -786,7 +787,7 @@ func runTestSubcommand() {
 		tester.SetSandbox(*image, *writable)
 	}
 
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo: %v", err))
 	}
@@ -859,7 +860,7 @@ func runCharterSubcommand() {
 	if err != nil {
 		fatal(fmt.Sprintf("charter: %v", err))
 	}
-	absRepo, err := filepath.Abs(*repoPath)
+	absRepo, err := repo.ResolveLocalPath(*repoPath)
 	if err != nil {
 		fatal(fmt.Sprintf("resolve repo path: %v", err))
 	}
