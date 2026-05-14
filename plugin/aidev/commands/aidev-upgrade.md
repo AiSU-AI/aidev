@@ -6,13 +6,7 @@ allowed-tools: Bash(aidev:*)
 Run aidev's self-update. With no argument, installs the latest published
 release. With a tag argument, pins that version.
 
-If `$ARGUMENTS` is empty:
-
-!`aidev upgrade --yes`
-
-Otherwise:
-
-!`aidev upgrade --version "$ARGUMENTS" --yes`
+!`if [ -z "$ARGUMENTS" ]; then aidev upgrade --yes; else aidev upgrade --version "$ARGUMENTS" --yes; fi`
 
 After the swap completes, the running Claude Code session is still using
 the old binary in memory — but the next `aidev` invocation (any new
