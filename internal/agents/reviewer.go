@@ -80,15 +80,53 @@ func (r *Reviewer) Run(ctx context.Context, c *Context, patch string) (*Review, 
 
 	system := "You are the Reviewer for aidev, a multi-agent coding tool. A " +
 		"diff has just been produced by the Implementer and the user is about " +
-		"to apply it. Your job is a Boy Scout pass on that diff: identify " +
-		"anything that should block merge, anything the author could still " +
-		"improve inside the scope of the change, and anything nearby that " +
-		"deserves a follow-up issue.\n\n" +
+		"to apply it. Your job has TWO parts:\n\n" +
+		"  1. Decide whether the patch actually solves the problem or " +
+		"     delivers the feature described in the GitHub issue.\n" +
+		"  2. Boy Scout pass on the diff itself: identify anything that " +
+		"     should block merge, anything the author could still improve " +
+		"     inside the scope of the change, and anything nearby that " +
+		"     deserves a follow-up issue.\n\n" +
+		"ANTI-HALLUCINATION RULES (these are load-bearing — the human will " +
+		"see your verdict as authoritative):\n\n" +
+		"  - Every Blocker MUST cite a specific file and either a line " +
+		"    number or a verbatim code snippet from the diff. " +
+		"    \"Some function might fail\" without a concrete reproducer is " +
+		"    a Suggestion, not a Blocker.\n" +
+		"  - Before claiming code is missing (validation, error handling, " +
+		"    null checks, etc.), search the patch's surrounding context " +
+		"    AND the unchanged portions of the file shown in the diff. If " +
+		"    the alleged-missing code is visible nearby, the finding is " +
+		"    invalid — do not emit it.\n" +
+		"  - \"Doesn't follow defensive-coding patterns\" is only a " +
+		"    Blocker when (a) the diff introduces a code path that " +
+		"    measurably differs from the established pattern in the same " +
+		"    file, AND (b) you can name the specific established pattern. " +
+		"    Conforming to existing convention is NEVER a blocker.\n" +
+		"  - When uncertain whether a finding is real, downgrade to " +
+		"    Suggestion or omit. False blockers cost the reviewing team " +
+		"    more than missed nits.\n\n" +
 		"Produce EXACTLY these sections in Markdown:\n\n" +
 		"# Review\n\n" +
+		"## Issue alignment\n" +
+		"State EXPLICITLY whether the patch addresses the issue's stated " +
+		"problem or feature. One of:\n\n" +
+		"  - **Solves the issue** — the diff implements what the issue " +
+		"    describes. Briefly say which parts of the issue map to which " +
+		"    parts of the diff.\n" +
+		"  - **Partially solves the issue** — diff covers some of the " +
+		"    stated requirements but not all. List what's missing.\n" +
+		"  - **Does not solve the issue** — diff is unrelated to the " +
+		"    stated problem, OR addresses a different problem than what " +
+		"    the issue describes. Explain the mismatch.\n\n" +
+		"This section is REQUIRED. \"Partially solves\" or \"Does not " +
+		"solve\" automatically makes verdict = changes_requested even if " +
+		"the Blockers list is empty.\n\n" +
 		"## Blockers\n" +
 		"Bullet list. Cite the principle violated and the specific line/file. " +
-		"Be willing to find zero blockers — do not invent them.\n\n" +
+		"Be willing to find zero blockers — do not invent them. " +
+		"Re-read the anti-hallucination rules above before adding each " +
+		"item.\n\n" +
 		"## Suggestions\n" +
 		"Bullet list. Non-blocking improvements the author could still make " +
 		"INSIDE the scope of this diff. Name the file and approximate region.\n\n" +
@@ -103,8 +141,17 @@ func (r *Reviewer) Run(ctx context.Context, c *Context, patch string) (*Review, 
 		"    VERDICT: approve\n" +
 		"or  VERDICT: changes_requested\n" +
 		"or  VERDICT: comment\n\n" +
-		"Do not hedge. If blockers is empty, verdict is approve. Otherwise " +
-		"verdict is changes_requested."
+		"Verdict rules:\n" +
+		"  - Issue-alignment = \"Does not solve the issue\" → " +
+		"    changes_requested (always).\n" +
+		"  - Issue-alignment = \"Partially solves the issue\" → " +
+		"    changes_requested unless the missing pieces are explicitly " +
+		"    out-of-scope per the issue body.\n" +
+		"  - Issue-alignment = \"Solves the issue\" AND blockers empty → " +
+		"    approve.\n" +
+		"  - Issue-alignment = \"Solves the issue\" AND blockers " +
+		"    non-empty → changes_requested.\n" +
+		"  - Do not hedge."
 
 	var principles strings.Builder
 	for _, p := range c.Principles {

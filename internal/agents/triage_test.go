@@ -275,6 +275,78 @@ func TestSketchContainsCitation(t *testing.T) {
 	}
 }
 
+// TestTriageBoyScoutModeNoSketchRunsCleanly locks in the Boy-Scout
+// soft gate: when a PR is reviewed without an Architect Sketch (e.g.
+// `aidev review` was invoked outside the `/aidev-run` flow), Triage
+// must not error — it must run the LLM, parse the verdict, and return
+// fix_now actions normally.
+func TestTriageBoyScoutModeNoSketchRunsCleanly(t *testing.T) {
+	c := &Context{
+		Issue: &github.Issue{Owner: "AiSU-AI", Repo: "Company-Site", Number: 770, Title: "test", Body: ""},
+		// Selector deliberately nil — no Architect Sketch chosen.
+	}
+	llm := `{"actions": [
+		{"id":"f1","source":"reviewer","severity":"blocker","finding":"Missing test for X",
+		 "action":"fix_now","rationale":"Add the missing test","fix_plan":"Add test/x.spec.ts"}
+	]}`
+	in := TriageInput{Review: triageReview("changes_requested", []string{"Missing test"}), Patch: "diff", Round: 1}
+	v := runTriageWithLLM(t, llm, in, c)
+	if v.Convergence != "continue" {
+		t.Errorf("expected convergence=continue, got %q", v.Convergence)
+	}
+	if len(v.Actions) != 1 || v.Actions[0].Action != "fix_now" {
+		t.Errorf("expected one fix_now action preserved, got %+v", v.Actions)
+	}
+	if len(v.CoercionsLog) != 0 {
+		t.Errorf("no coercions expected, got %v", v.CoercionsLog)
+	}
+}
+
+// TestTriageBoyScoutModeRebutCoercedToEscalate locks in the safety net:
+// in Boy-Scout mode the LLM might still attempt rebut, but with no
+// Sketch markdown to cite from, the existing citation coercion must
+// downgrade every rebut to escalate.
+func TestTriageBoyScoutModeRebutCoercedToEscalate(t *testing.T) {
+	c := &Context{
+		Issue: &github.Issue{Owner: "AiSU-AI", Repo: "Company-Site", Number: 770, Title: "test", Body: ""},
+	}
+	llm := `{"actions": [
+		{"id":"f1","source":"reviewer","severity":"blocker",
+		 "finding":"Validation missing","action":"rebut",
+		 "rationale":"Looks valid to me","rebut_text":"The validation is present.",
+		 "sketch_citation":"any text the LLM invented goes here"}
+	]}`
+	in := TriageInput{Review: triageReview("changes_requested", []string{"Validation missing"}), Patch: "diff", Round: 1}
+	v := runTriageWithLLM(t, llm, in, c)
+	if v.Actions[0].Action != "escalate" {
+		t.Errorf("Boy-Scout-mode rebut must coerce to escalate, got %q", v.Actions[0].Action)
+	}
+	if v.Convergence != "escalate" {
+		t.Errorf("expected convergence=escalate, got %q", v.Convergence)
+	}
+	if len(v.CoercionsLog) == 0 {
+		t.Errorf("expected coercion log entry for ungrounded rebut, got %v", v.CoercionsLog)
+	}
+}
+
+// TestTriageBoyScoutModePromptMentionsRebutDisabled verifies the LLM
+// prompt clearly tells the model that rebut is unavailable. Without
+// this, the model will waste tokens crafting rebuts that the Go safety
+// net then escalates anyway.
+func TestTriageBoyScoutModePromptMentionsRebutDisabled(t *testing.T) {
+	c := &Context{
+		Issue: &github.Issue{Owner: "AiSU-AI", Repo: "Company-Site", Number: 770, Title: "test", Body: ""},
+	}
+	in := TriageInput{Review: triageReview("changes_requested", nil), Patch: "diff", Round: 1}
+	prompt := buildTriagePrompt(c, Sketch{}, in)
+	if !strings.Contains(prompt, "Boy-Scout review") {
+		t.Errorf("Boy-Scout-mode prompt should announce the mode, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "`rebut` action is UNAVAILABLE") {
+		t.Errorf("Boy-Scout-mode prompt should tell LLM rebut is unavailable, got:\n%s", prompt)
+	}
+}
+
 func TestIsSecurityCheck(t *testing.T) {
 	yes := []string{"CodeQL", "Snyk", "Dependabot Alerts", "Trivy scan", "Semgrep", "npm audit", "ossf scorecard"}
 	no := []string{"build", "test", "lint", "type-check", "unit-tests"}

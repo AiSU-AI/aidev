@@ -1,10 +1,13 @@
 package agents
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aisu-ai/aidev/internal/github"
 )
 
 const sampleReview = `# Review
@@ -142,5 +145,79 @@ func TestReviewWriteFollowUpsReturnsEmptyWhenNoFollowUps(t *testing.T) {
 	}
 	if path != "" {
 		t.Errorf("path should be empty when no follow-ups, got %q", path)
+	}
+}
+
+// runReviewer drives Reviewer.Run with a canned LLM reply and returns
+// the prompt that was sent to the LLM. Used to assert the system prompt
+// contains the anti-hallucination + Issue-alignment instructions.
+// Reuses capturingProvider declared in critic_test.go.
+func runReviewer(t *testing.T, reply string) string {
+	t.Helper()
+	prov := &capturingProvider{reply: reply}
+	r := &Reviewer{Provider: prov}
+	c := &Context{
+		Issue: &github.Issue{Owner: "AiSU-AI", Repo: "test", Number: 1, Title: "x", Body: "y"},
+	}
+	if _, err := r.Run(context.Background(), c, "diff --git a/x b/x"); err != nil {
+		t.Fatalf("Reviewer.Run: %v", err)
+	}
+	return prov.req.System
+}
+
+// TestReviewerPromptHasIssueAlignmentSection locks in the explicit
+// "does this patch solve the GH issue?" check. Without this section
+// the Reviewer judges code quality in isolation and approves patches
+// that don't address the issue.
+func TestReviewerPromptHasIssueAlignmentSection(t *testing.T) {
+	system := runReviewer(t, "## Issue alignment\nSolves the issue\n\n## Blockers\n\n## Suggestions\n\n## Follow-up issues\n\n## Verdict\n\nVERDICT: approve\n")
+	want := []string{
+		"## Issue alignment",
+		"Solves the issue",
+		"Partially solves the issue",
+		"Does not solve the issue",
+	}
+	for _, phrase := range want {
+		if !strings.Contains(system, phrase) {
+			t.Errorf("Reviewer system prompt missing %q", phrase)
+		}
+	}
+}
+
+// TestReviewerPromptHasAntiHallucinationRules locks in the rules that
+// stop the Reviewer from inventing blockers (the bug that prompted
+// this whole feature: PR #770 was flagged for missing response.ok
+// validation that was clearly present in the file).
+func TestReviewerPromptHasAntiHallucinationRules(t *testing.T) {
+	system := runReviewer(t, "## Issue alignment\nSolves\n\n## Blockers\n\n## Suggestions\n\n## Follow-up issues\n\n## Verdict\n\nVERDICT: approve\n")
+	wantPhrases := []string{
+		"ANTI-HALLUCINATION",
+		"specific file and either a line",
+		"search the patch's surrounding context",
+		"Conforming to existing convention is NEVER a blocker",
+		"downgrade to",
+	}
+	for _, phrase := range wantPhrases {
+		if !strings.Contains(system, phrase) {
+			t.Errorf("Reviewer system prompt missing anti-hallucination phrase %q", phrase)
+		}
+	}
+}
+
+// TestReviewerPromptVerdictRulesCoverIssueAlignment locks in the
+// verdict-decision rules that connect Issue alignment to the final
+// verdict. Without these the LLM may approve a patch that "Does not
+// solve the issue" because no Blockers were found.
+func TestReviewerPromptVerdictRulesCoverIssueAlignment(t *testing.T) {
+	system := runReviewer(t, "## Issue alignment\nSolves\n\n## Blockers\n\n## Suggestions\n\n## Follow-up issues\n\n## Verdict\n\nVERDICT: approve\n")
+	want := []string{
+		"\"Does not solve the issue\" →",
+		"\"Partially solves the issue\" →",
+		"\"Solves the issue\" AND blockers empty",
+	}
+	for _, phrase := range want {
+		if !strings.Contains(system, phrase) {
+			t.Errorf("Reviewer verdict rules missing %q", phrase)
+		}
 	}
 }
