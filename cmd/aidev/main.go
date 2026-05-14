@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/aisu-ai/aidev/internal/llm"
 	"github.com/aisu-ai/aidev/internal/orchestrator"
 	"github.com/aisu-ai/aidev/internal/plugin"
+	"github.com/aisu-ai/aidev/internal/release"
 	"github.com/aisu-ai/aidev/internal/repo"
 	"github.com/aisu-ai/aidev/internal/tui"
 	"github.com/aisu-ai/aidev/internal/version"
@@ -159,6 +161,23 @@ func main() {
 		}
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		runCompletionSubcommand()
+		return
+	}
+	// Intercept the `upgrade` subcommand. Self-update: downloads the
+	// latest (or pinned) release tarball, extracts the binary, and
+	// atomically swaps the on-disk copy. Replaces the manual
+	// `install.sh --version vX.Y.Z --force` step.
+	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runUpgradeSubcommand()
+		return
+	}
+	// Intercept the `ls` subcommand. Read-only catalog: prints the
+	// installed version + N most recent published releases so the
+	// user can see what's available before running `aidev upgrade`.
+	if len(os.Args) > 1 && (os.Args[1] == "ls" || os.Args[1] == "list") {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		runLsSubcommand()
 		return
 	}
 
@@ -1722,4 +1741,213 @@ func runCompletionSubcommand() {
 func fatal(msg string) {
 	fmt.Fprintf(os.Stderr, "aidev: %s\n", msg)
 	os.Exit(1)
+}
+
+// runUpgradeSubcommand self-updates the running binary by downloading
+// a release tarball, extracting the embedded binary, and atomically
+// swapping the on-disk copy. The running process is unaffected — Unix
+// keeps the open inode alive — but the NEXT `aidev` invocation gets
+// the new version.
+//
+// Flags:
+//
+//	--version <tag>   pin a specific release (default: latest)
+//	--bin     <path>  override the binary path (default: os.Executable())
+//	--yes             skip the confirmation prompt
+func runUpgradeSubcommand() {
+	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: aidev upgrade [--version <tag>] [--bin <path>] [--yes]\n\n")
+		fmt.Fprintf(os.Stderr, "Download a release tarball and replace the installed binary in place.\n")
+		fmt.Fprintf(os.Stderr, "Default target is the latest release for your platform.\n\n")
+		fs.PrintDefaults()
+	}
+	tag := fs.String("version", "", "specific release tag to install (default: latest)")
+	binOverride := fs.String("bin", "", "override the binary path to replace (default: detected from os.Executable)")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fatal(fmt.Sprintf("parse flags: %v", err))
+	}
+
+	// Resolve the binary path. os.Executable returns the path that
+	// invoked this process — usually `/.../.local/bin/aidev`. The user
+	// can override for testing or to upgrade a sibling install.
+	destPath := *binOverride
+	if destPath == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			fatal(fmt.Sprintf("locate current binary: %v (pass --bin <path>)", err))
+		}
+		// Resolve symlinks so we swap the real file, not the link.
+		real, err := filepath.EvalSymlinks(exe)
+		if err == nil {
+			destPath = real
+		} else {
+			destPath = exe
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	rel, err := resolveTargetRelease(ctx, *tag)
+	if err != nil {
+		fatal(err.Error())
+	}
+
+	asset, err := rel.CurrentPlatformAsset()
+	if err != nil {
+		fatal(err.Error())
+	}
+
+	if version.Version == rel.Tag {
+		fmt.Printf("aidev %s is already installed at %s — nothing to do.\n", rel.Tag, destPath)
+		fmt.Printf("Pass --version <other-tag> to switch to a different release.\n")
+		return
+	}
+
+	fmt.Printf("Current : aidev %s\n", version.Version)
+	fmt.Printf("Target  : aidev %s (%s, %s)\n", rel.Tag, asset.Name, humanBytes(asset.Size))
+	fmt.Printf("Binary  : %s\n", destPath)
+
+	if !*yes {
+		fmt.Printf("\nProceed with upgrade? [y/N] ")
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		ans := strings.ToLower(strings.TrimSpace(line))
+		if ans != "y" && ans != "yes" {
+			fmt.Println("aborted.")
+			return
+		}
+	}
+
+	fmt.Printf("\nDownloading %s ...\n", asset.Name)
+	tgz, err := release.Download(ctx, asset, nil)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer os.Remove(tgz)
+
+	fmt.Println("Extracting ...")
+	binSrc, err := release.Extract(tgz)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer os.RemoveAll(filepath.Dir(binSrc))
+
+	fmt.Printf("Swapping %s ...\n", destPath)
+	if err := release.SwapBinary(binSrc, destPath); err != nil {
+		fatal(err.Error())
+	}
+
+	fmt.Printf("\naidev %s installed at %s\n", rel.Tag, destPath)
+	fmt.Printf("Run `aidev --version` in a NEW shell to confirm.\n")
+}
+
+// resolveTargetRelease picks the release to install. Empty tag → the
+// repo's "Latest" release. Non-empty → that exact tag (404 if missing).
+func resolveTargetRelease(ctx context.Context, tag string) (*release.Release, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return release.FetchLatest(ctx, release.DefaultOwner, release.DefaultRepo, nil)
+	}
+	// Tolerate "0.6.0" passed without the v prefix — the release
+	// workflow always tags with v, but humans drop it constantly.
+	if !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
+	}
+	return release.FetchByTag(ctx, release.DefaultOwner, release.DefaultRepo, tag, nil)
+}
+
+// runLsSubcommand prints the installed version + most recent
+// published releases. Read-only; never modifies the on-disk binary.
+//
+// Flags:
+//
+//	--limit <n>  number of releases to list (default: 10)
+//	--all        include prereleases (default: hide them from the list)
+func runLsSubcommand() {
+	fs := flag.NewFlagSet("ls", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: aidev ls [--limit <n>] [--all]\n\n")
+		fmt.Fprintf(os.Stderr, "Print the installed version + recent published releases.\n\n")
+		fs.PrintDefaults()
+	}
+	limit := fs.Int("limit", 10, "number of releases to show")
+	includeAll := fs.Bool("all", false, "include prereleases in the listing")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fatal(fmt.Sprintf("parse flags: %v", err))
+	}
+
+	exe, _ := os.Executable()
+	fmt.Printf("Installed: aidev %s\n", version.Version)
+	if exe != "" {
+		fmt.Printf("Binary   : %s\n", exe)
+	}
+	fmt.Printf("Platform : %s-%s\n\n", runtime.GOOS, runtime.GOARCH)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	releases, err := release.FetchReleases(ctx, release.DefaultOwner, release.DefaultRepo, *limit, nil)
+	if err != nil {
+		fatal(err.Error())
+	}
+
+	if len(releases) == 0 {
+		fmt.Println("No published releases found.")
+		return
+	}
+
+	// Resolve which tag is "Latest" so we can mark it. Falls back to
+	// the newest non-prerelease if the call fails (rate limit, offline).
+	latest, _ := release.FetchLatest(ctx, release.DefaultOwner, release.DefaultRepo, nil)
+	latestTag := ""
+	if latest != nil {
+		latestTag = latest.Tag
+	}
+
+	fmt.Println("Available releases:")
+	shown := 0
+	for _, r := range releases {
+		if r.Prerelease && !*includeAll {
+			continue
+		}
+		marker := "  "
+		switch {
+		case r.Tag == version.Version:
+			marker = "* " // currently installed
+		case r.Tag == latestTag:
+			marker = "→ " // marked Latest on GitHub
+		}
+		tag := r.Tag
+		if r.Prerelease {
+			tag += " (prerelease)"
+		}
+		fmt.Printf("%s%-20s  %s\n", marker, tag, r.PublishedAt.UTC().Format("2006-01-02"))
+		shown++
+	}
+	if shown == 0 {
+		fmt.Println("  (no stable releases — pass --all to include prereleases)")
+	}
+	fmt.Println()
+	fmt.Println("Legend: * installed   → latest")
+	fmt.Println("Upgrade: aidev upgrade [--version <tag>]")
+}
+
+// humanBytes renders a byte count as a short human-readable string.
+// Used only in the upgrade-confirmation UI; exact precision doesn't
+// matter, so we cap at MB.
+func humanBytes(n int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+	)
+	switch {
+	case n >= MB:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(MB))
+	case n >= KB:
+		return fmt.Sprintf("%.1f KB", float64(n)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
