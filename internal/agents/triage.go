@@ -144,13 +144,22 @@ func (t *Triage) Run(ctx context.Context, c *Context, in TriageInput) (*TriageVe
 	if in.Review == nil {
 		return nil, errors.New("triage: missing review")
 	}
-	if c.Selector == nil || c.Selector.ChosenNumber == 0 {
-		return nil, errors.New("triage: no chosen sketch — Selector verdict required")
+	// Boy-Scout mode: when a Sketch is not available (e.g. /aidev-review
+	// invoked against a PR that wasn't built via /aidev-run), Triage runs
+	// against an empty Sketch. The rebut action becomes effectively
+	// disabled — the existing citation-coercion below will escalate any
+	// rebut whose sketch_citation doesn't appear in chosenSketch.Markdown,
+	// and an empty Markdown never contains a non-empty citation. The
+	// system prompt is also adapted (see buildTriagePrompt) so the LLM
+	// knows not to attempt rebut in this mode.
+	var chosenSketch Sketch
+	hasSketch := c.Selector != nil && c.Selector.ChosenNumber > 0
+	if hasSketch {
+		if c.Selector.ChosenNumber > len(c.Sketches) {
+			return nil, fmt.Errorf("triage: chosen sketch %d out of range (have %d)", c.Selector.ChosenNumber, len(c.Sketches))
+		}
+		chosenSketch = c.Sketches[c.Selector.ChosenNumber-1]
 	}
-	if c.Selector.ChosenNumber > len(c.Sketches) {
-		return nil, fmt.Errorf("triage: chosen sketch %d out of range (have %d)", c.Selector.ChosenNumber, len(c.Sketches))
-	}
-	chosenSketch := c.Sketches[c.Selector.ChosenNumber-1]
 
 	protected := in.ProtectedPaths
 	if len(protected) == 0 {
@@ -251,9 +260,19 @@ func buildTriagePrompt(c *Context, chosenSketch Sketch, in TriageInput) string {
 	fmt.Fprintf(&b, "## Issue\n\n%s/%s#%d — %s\n\n",
 		c.Issue.Owner, c.Issue.Repo, c.Issue.Number, c.Issue.Title)
 
-	b.WriteString("## Chosen Sketch (you may cite from this verbatim in sketch_citation)\n\n")
-	b.WriteString(chosenSketch.Markdown)
-	b.WriteString("\n\n")
+	if strings.TrimSpace(chosenSketch.Markdown) == "" {
+		// Boy-Scout mode: no Architect Sketch is available. The rebut
+		// action is effectively disabled — any rebut without a verbatim
+		// Sketch citation will be coerced to escalate by the Go-side
+		// safety net. Tell the LLM up-front so it doesn't waste tokens
+		// trying.
+		b.WriteString("## Mode: Boy-Scout review (no Sketch)\n\n")
+		b.WriteString("This PR was not built via /aidev-run, so there is no chosen Architect Sketch to ground rebuttals against. The `rebut` action is UNAVAILABLE in this mode — choose `fix_now`, `defer_to_followup`, or `escalate`. If a finding seems wrong but you cannot fix it via code edit either, escalate to a human.\n\n")
+	} else {
+		b.WriteString("## Chosen Sketch (you may cite from this verbatim in sketch_citation)\n\n")
+		b.WriteString(chosenSketch.Markdown)
+		b.WriteString("\n\n")
+	}
 
 	if c.CriticReport != "" {
 		b.WriteString("## Critic report (background)\n\n")
