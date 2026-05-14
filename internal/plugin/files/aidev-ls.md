@@ -6,13 +6,11 @@ allowed-tools: Bash(aidev:*)
 Show the user which aidev version is installed locally plus the most
 recent published releases on GitHub.
 
-With no argument:
+- No argument → list defaults.
+- Numeric argument → treat as `--limit N`.
+- Anything else (e.g. `--all`, `-all`) → pass through as flags.
 
-!`aidev ls`
-
-With a numeric argument (interpreted as a limit):
-
-!`aidev ls --limit "$ARGUMENTS"`
+!`if [ -z "$ARGUMENTS" ]; then aidev ls; elif printf '%s' "$ARGUMENTS" | grep -qE '^[0-9]+$'; then aidev ls --limit "$ARGUMENTS"; else aidev ls $ARGUMENTS; fi`
 
 The legend at the bottom of the output explains the markers:
 
